@@ -13,6 +13,9 @@ target = "targets/x86_64-qunix-kernel.json"
 rustflags = [
     "-Clink-arg=--image-base=0xffffffff80000000",
     "-Clink-arg=--entry=kmain",
+    # Panic backtraces walk the RBP chain, which only exists with frame
+    # pointers. Cargo has no profile key for this, so it lives here.
+    "-Cforce-frame-pointers=yes",
 ]
 runner = ["cargo", "run", "--quiet", "--package", "xtask",
           "--target", "x86_64-unknown-linux-musl", "--", "runner"]

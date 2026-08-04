@@ -10,9 +10,9 @@ extern crate alloc;
 mod boot;
 mod frames;
 mod heap;
+mod panic;
 mod testing;
 
-use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 use qunix_hal_x86_64::println;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -99,12 +99,6 @@ pub extern "C" fn kmain() -> ! {
     halt_forever();
 }
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    println!("FAILED\nqunix: PANIC: {info}");
-    testing::exit_qemu(testing::ExitCode::Failure);
-}
-
 fn halt_forever() -> ! {
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
@@ -113,6 +107,25 @@ fn halt_forever() -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test_case]
+    fn backtrace_walks_at_least_one_kernel_frame() {
+        #[inline(never)]
+        fn depth_two() -> usize {
+            let mut frames = 0;
+            crate::panic::walk_frames(|addr| {
+                // Kernel code is linked at -2 GiB; anything lower is bogus.
+                assert!(addr >= 0xffff_ffff_8000_0000, "implausible return address {addr:#x}");
+                frames += 1;
+            });
+            frames
+        }
+        #[inline(never)]
+        fn depth_one() -> usize {
+            depth_two()
+        }
+        assert!(depth_one() >= 2, "backtrace found fewer than two frames");
+    }
+
     #[test_case]
     fn harness_runs_at_all() {
         assert_eq!(1 + 1, 2);
