@@ -4,8 +4,11 @@
 #![test_runner(crate::testing::runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
 mod boot;
 mod frames;
+mod heap;
 mod testing;
 
 use core::panic::PanicInfo;
@@ -35,6 +38,9 @@ pub extern "C" fn kmain() -> ! {
         "qunix: {} MiB of frames available",
         frames::free_bytes() / (1024 * 1024)
     );
+
+    heap::init();
+    println!("qunix: kernel heap online");
 
     #[cfg(test)]
     test_main();
@@ -155,5 +161,25 @@ mod tests {
         assert!(space.translate(TEST_VA).is_none());
 
         unsafe { crate::frames::free(pa, 0) };
+    }
+
+    #[test_case]
+    fn kernel_heap_supports_box_and_vec() {
+        use alloc::boxed::Box;
+        use alloc::vec::Vec;
+
+        crate::frames::init();
+        crate::heap::init();
+
+        let boxed = Box::new(0xfeedu32);
+        assert_eq!(*boxed, 0xfeed);
+
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..2048 {
+            v.push(i);
+        }
+        assert_eq!(v.len(), 2048);
+        assert_eq!(v[2047], 2047);
+        assert_eq!(v.iter().sum::<u64>(), (0..2048u64).sum::<u64>());
     }
 }

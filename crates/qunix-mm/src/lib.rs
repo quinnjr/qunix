@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod buddy;
+pub mod slab;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ORDER: u8 = 10; // 4 KiB .. 4 MiB
