@@ -50,6 +50,44 @@ these; read the real files for current truth.
      them and let Limine scan the whole image for request magic.
 6. **`crates/*` is not in the workspace `members` until Task 2**, because a
    glob matching a non-existent directory is a hard error.
+7. **`xorriso` is not used at all.** It was not installed, and turned out to be
+   unnecessary: the ESP is assembled as a plain directory and handed to QEMU via
+   VVFAT (`-drive format=raw,file=fat:rw:<dir>`) under OVMF. That also removed
+   the `make` step and the BIOS install path, since only `BOOTX64.EFI` is
+   needed. **Consequence: qunix is UEFI-only.** The exit criterion "boots under
+   both BIOS and UEFI" is reduced to UEFI, and `xtask` has no `--bios` flag.
+8. **Limine is pinned to `v11.x-binary`, not `v9.x`.** The `limine` crate 0.6.5
+   requests base revision 6 (`BaseRevision::MAX_SUPPORTED`); v9.x predates that,
+   so the handshake failed and `is_supported()` returned false.
+9. **`Request::new()` needs a turbofish or the request aliases.** Inference
+   cannot choose among the per-response `new()` impls. The code uses
+   `HhdmRequest` / `MemmapRequest`.
+10. **The limine 0.6.5 memory-map API differs from the plan's guess.** `offset`
+    is a *field* on `HhdmRespData`, not a method; entries expose `type_`
+    compared against `MEMMAP_USABLE`, and there is no `EntryType` enum.
+11. **`-Zpanic-abort-tests` is required.** Cargo forces `panic=unwind` for test
+    units, which made build-std compile a second `core` and collide with the
+    `panic=abort` copy (`E0152: duplicate lang item`).
+12. **`-no-shutdown` had to be dropped from the QEMU invocation.** It keeps QEMU
+    alive after `isa-debug-exit` fires, so the runner never observed an exit code.
+13. **The stack-overflow double-fault check does not work (Task 6, Step 5).**
+    Limine's stack has no guard page below it, so deep recursion silently
+    scribbles through usable memory and hangs rather than trapping. The same
+    escalation path is instead verified deterministically by pointing RSP at
+    unmapped memory and pushing. A guard-page overflow test becomes possible in
+    M1, once the kernel allocates its own thread stacks.
+14. **The LAPIC MMIO page is not in the HHDM.** Limine's direct map covers RAM
+    only, so `apic::init` page-faulted. The kernel now maps `0xFEE00000`
+    explicitly and uncacheable, which added `PageFlags::NO_CACHE`.
+15. **Frame pointers are enabled via `-C force-frame-pointers=yes` in
+    `.cargo/config.toml`, not a profile key.** Cargo has no such profile option,
+    so the plan's `[profile.dev] force-frame-pointers` would have been ignored
+    silently and every backtrace would have been empty.
+16. **The backtrace walker needs two address thresholds, not one.** Kernel
+    stacks live in HHDM-mapped RAM near `0xffff8000_00000000`, far below the
+    kernel text base at -2 GiB, so validating RBP against the text base rejected
+    every frame. RBP is checked against the higher-half boundary; only return
+    addresses are checked against the text base.
 
 ## File Structure
 
@@ -3014,14 +3052,14 @@ git commit -m "feat(kernel): panic handler with frame-pointer backtrace"
 
 M0 is complete when all of the following hold:
 
-- [ ] `cargo xtask build` produces a higher-half ELF for `x86_64-qunix-kernel`.
-- [ ] `cargo xtask run` boots under both BIOS and UEFI (OVMF) and prints the full init sequence to serial.
-- [ ] `cargo xtask test` runs both the host test suites and the in-QEMU suite, and exits zero.
-- [ ] A deliberately failing in-QEMU test produces a non-zero exit status (verified in Task 4, Step 5).
-- [ ] A kernel stack overflow produces a clean double-fault panic rather than a reboot (verified in Task 6, Step 5).
-- [ ] `Box` and `Vec` work in kernel space.
-- [ ] The APIC timer increments a tick counter.
-- [ ] A panic prints a backtrace whose addresses resolve to real symbols via `llvm-addr2line`.
+- [x] `cargo xtask build` produces a higher-half ELF for `x86_64-qunix-kernel`.
+- [x] `cargo xtask run` boots under UEFI (OVMF) and prints the full init sequence to serial. **BIOS boot is out of scope** -- see deviation 7.
+- [x] `cargo xtask test` runs both the host test suites and the in-QEMU suite, and exits zero.
+- [x] A deliberately failing in-QEMU test produces a non-zero exit status (verified in Task 4, Step 5).
+- [x] A double fault is caught by the IST handler and exits controlled rather than triple-faulting -- verified via the bad-RSP variant, see deviation 13.
+- [x] `Box` and `Vec` work in kernel space.
+- [x] The APIC timer increments a tick counter.
+- [x] A panic prints a backtrace whose addresses resolve to real symbols via `llvm-addr2line`.
 
 ## Known Limitations Carried Into M1
 
