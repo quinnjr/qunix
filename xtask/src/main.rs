@@ -35,13 +35,25 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
         .join("qunix-kernel"))
 }
 
+mod image;
+mod qemu;
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let release = args.iter().any(|a| a == "--release");
+    let root = workspace_root();
+
     match args.first().map(String::as_str) {
         Some("build") => {
-            let elf = build_kernel(args.iter().any(|a| a == "--release"))?;
+            let elf = build_kernel(release)?;
             println!("kernel: {}", elf.display());
             Ok(())
+        }
+        Some("run") => {
+            let elf = build_kernel(release)?;
+            let esp = image::build_esp(&root, &elf)?;
+            let code = qemu::run_esp(&esp, false)?;
+            std::process::exit(code);
         }
         other => bail!("unknown xtask command: {other:?}"),
     }
