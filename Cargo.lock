@@ -46,6 +46,7 @@ version = "0.1.0"
 dependencies = [
  "limine",
  "qunix-hal-x86_64",
+ "qunix-mm",
  "qunix-sync",
  "x86_64",
 ]

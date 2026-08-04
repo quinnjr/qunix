@@ -17,3 +17,4 @@ limine.workspace = true
 qunix-hal-x86_64.workspace = true
 qunix-sync.workspace = true
 x86_64.workspace = true
+qunix-mm.workspace = true

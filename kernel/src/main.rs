@@ -5,6 +5,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 mod boot;
+mod frames;
 mod testing;
 
 use core::panic::PanicInfo;
@@ -27,6 +28,12 @@ pub extern "C" fn kmain() -> ! {
         "qunix: hhdm at {:#x}, {} MiB usable",
         boot::hhdm_offset(),
         usable / (1024 * 1024)
+    );
+
+    frames::init();
+    println!(
+        "qunix: {} MiB of frames available",
+        frames::free_bytes() / (1024 * 1024)
     );
 
     #[cfg(test)]
@@ -91,5 +98,25 @@ mod tests {
         assert!(regions > 0, "no usable memory regions reported");
         // QEMU is launched with 512 MiB; expect at least 256 MiB usable.
         assert!(total >= 256 * 1024 * 1024, "only {total} bytes usable");
+    }
+
+    #[test_case]
+    fn frame_allocator_hands_out_usable_physical_memory() {
+        crate::frames::init();
+        let before = crate::frames::free_bytes();
+        assert!(before > 64 * 1024 * 1024, "only {before} bytes of frames");
+
+        let pa = crate::frames::alloc(0).expect("frame allocation failed");
+        assert_eq!(pa % 4096, 0);
+
+        // The frame must be readable and writable through the HHDM.
+        let va = (crate::boot::hhdm_offset() + pa) as *mut u64;
+        unsafe {
+            va.write_volatile(0xdead_beef_cafe_f00d);
+            assert_eq!(va.read_volatile(), 0xdead_beef_cafe_f00d);
+        }
+
+        unsafe { crate::frames::free(pa, 0) };
+        assert_eq!(crate::frames::free_bytes(), before);
     }
 }
