@@ -22,6 +22,13 @@ pub extern "C" fn kmain() -> ! {
     qunix_hal_x86_64::idt::init();
     println!("qunix: idt installed");
 
+    let usable: u64 = boot::usable_regions().map(|r| r.len).sum();
+    println!(
+        "qunix: hhdm at {:#x}, {} MiB usable",
+        boot::hhdm_offset(),
+        usable / (1024 * 1024)
+    );
+
     #[cfg(test)]
     test_main();
 
@@ -63,5 +70,26 @@ mod tests {
         // Reaching this line at all is the assertion: a broken IDT would
         // triple-fault instead of returning here.
         assert!(true);
+    }
+
+    #[test_case]
+    fn hhdm_offset_is_in_the_higher_half() {
+        let offset = crate::boot::hhdm_offset();
+        assert!(offset >= 0xffff_8000_0000_0000, "hhdm offset {offset:#x} is not higher-half");
+    }
+
+    #[test_case]
+    fn memory_map_reports_usable_memory() {
+        let mut regions = 0usize;
+        let mut total = 0u64;
+        for region in crate::boot::usable_regions() {
+            regions += 1;
+            total += region.len;
+            assert!(region.usable);
+            assert!(region.len > 0);
+        }
+        assert!(regions > 0, "no usable memory regions reported");
+        // QEMU is launched with 512 MiB; expect at least 256 MiB usable.
+        assert!(total >= 256 * 1024 * 1024, "only {total} bytes usable");
     }
 }
