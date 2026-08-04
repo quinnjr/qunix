@@ -119,4 +119,41 @@ mod tests {
         unsafe { crate::frames::free(pa, 0) };
         assert_eq!(crate::frames::free_bytes(), before);
     }
+
+    #[test_case]
+    fn mapping_a_fresh_frame_makes_it_readable_and_writable() {
+        use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+
+        crate::frames::init();
+        let hhdm = crate::boot::hhdm_offset();
+        let mut space = unsafe { AddressSpace::active(hhdm) };
+
+        let pa = crate::frames::alloc(0).expect("frame allocation failed");
+        // A scratch virtual address in an unused part of the higher half.
+        const TEST_VA: u64 = 0xffff_9000_0000_0000;
+
+        assert!(space.translate(TEST_VA).is_none(), "test address already mapped");
+
+        unsafe {
+            space
+                .map(TEST_VA, pa, PageFlags::PRESENT | PageFlags::WRITABLE, &mut || {
+                    crate::frames::alloc(0)
+                })
+                .expect("map failed");
+        }
+
+        assert_eq!(space.translate(TEST_VA), Some(pa));
+
+        let ptr = TEST_VA as *mut u64;
+        unsafe {
+            ptr.write_volatile(0x1234_5678_9abc_def0);
+            assert_eq!(ptr.read_volatile(), 0x1234_5678_9abc_def0);
+        }
+
+        let unmapped = unsafe { space.unmap(TEST_VA).expect("unmap failed") };
+        assert_eq!(unmapped, pa);
+        assert!(space.translate(TEST_VA).is_none());
+
+        unsafe { crate::frames::free(pa, 0) };
+    }
 }
