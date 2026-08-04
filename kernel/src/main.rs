@@ -19,6 +19,9 @@ pub extern "C" fn kmain() -> ! {
     qunix_hal_x86_64::gdt::init();
     println!("qunix: gdt installed");
 
+    qunix_hal_x86_64::idt::init();
+    println!("qunix: idt installed");
+
     #[cfg(test)]
     test_main();
 
@@ -50,5 +53,15 @@ mod tests {
         qunix_hal_x86_64::gdt::init();
         // Entry 0 is the null descriptor, so kernel code lands at index 1 => 0x08.
         assert_eq!(CS::get_reg().0, 0x08);
+    }
+
+    #[test_case]
+    fn breakpoint_exception_returns_to_caller() {
+        qunix_hal_x86_64::gdt::init();
+        qunix_hal_x86_64::idt::init();
+        x86_64::instructions::interrupts::int3();
+        // Reaching this line at all is the assertion: a broken IDT would
+        // triple-fault instead of returning here.
+        assert!(true);
     }
 }
