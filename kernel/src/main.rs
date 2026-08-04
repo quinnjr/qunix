@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::testing::runner)]
 #![reexport_test_harness_main = "test_main"]
@@ -12,7 +13,50 @@ mod heap;
 mod testing;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 use qunix_hal_x86_64::println;
+use x86_64::structures::idt::InterruptStackFrame;
+
+pub static TICKS: AtomicU64 = AtomicU64::new(0);
+
+extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    qunix_hal_x86_64::apic::eoi();
+}
+
+/// Maps the local APIC's MMIO page into the HHDM range, uncacheable.
+///
+/// Limine's HHDM covers RAM only, so this page is absent until we add it.
+pub fn map_lapic() {
+    use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+    let hhdm = boot::hhdm_offset();
+    let phys = qunix_hal_x86_64::apic::phys_base();
+    let mut space = unsafe { AddressSpace::active(hhdm) };
+    if space.translate(hhdm + phys).is_some() {
+        return;
+    }
+    unsafe {
+        space
+            .map(
+                hhdm + phys,
+                phys,
+                PageFlags::PRESENT
+                    | PageFlags::WRITABLE
+                    | PageFlags::NO_CACHE
+                    | PageFlags::NO_EXECUTE,
+                &mut || frames::alloc(0),
+            )
+            .expect("failed to map the local APIC");
+    }
+}
+
+/// Registers the APIC timer handler. Separate from apic::init so tests can
+/// install the handler before enabling interrupts.
+pub fn install_timer() {
+    unsafe {
+        qunix_hal_x86_64::idt::set_handler(qunix_hal_x86_64::apic::TIMER_VECTOR, timer_handler)
+    };
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain() -> ! {
@@ -41,6 +85,13 @@ pub extern "C" fn kmain() -> ! {
 
     heap::init();
     println!("qunix: kernel heap online");
+
+    install_timer();
+    map_lapic();
+    qunix_hal_x86_64::apic::init(boot::hhdm_offset());
+    qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
+    x86_64::instructions::interrupts::enable();
+    println!("qunix: apic timer running");
 
     #[cfg(test)]
     test_main();
@@ -161,6 +212,34 @@ mod tests {
         assert!(space.translate(TEST_VA).is_none());
 
         unsafe { crate::frames::free(pa, 0) };
+    }
+
+    #[test_case]
+    fn apic_timer_fires_and_advances_the_tick_counter() {
+        use core::sync::atomic::Ordering;
+
+        crate::frames::init();
+        crate::heap::init();
+        qunix_hal_x86_64::gdt::init();
+        qunix_hal_x86_64::idt::init();
+        crate::install_timer();
+        crate::map_lapic();
+        qunix_hal_x86_64::apic::init(crate::boot::hhdm_offset());
+        qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
+
+        x86_64::instructions::interrupts::enable();
+        let start = crate::TICKS.load(Ordering::Relaxed);
+        // Spin until the timer proves it is firing, with a bounded budget so a
+        // dead timer fails the test rather than hanging the suite forever.
+        let mut budget = 500_000_000u64;
+        while crate::TICKS.load(Ordering::Relaxed) == start && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        x86_64::instructions::interrupts::disable();
+
+        assert!(budget > 0, "apic timer never fired");
+        assert!(crate::TICKS.load(Ordering::Relaxed) > start);
     }
 
     #[test_case]

@@ -13,6 +13,7 @@ impl PageFlags {
     pub const PRESENT: Self = Self(1 << 0);
     pub const WRITABLE: Self = Self(1 << 1);
     pub const USER: Self = Self(1 << 2);
+    pub const NO_CACHE: Self = Self(1 << 4);
     pub const NO_EXECUTE: Self = Self(1 << 63);
 
     fn to_x86(self) -> PageTableFlags {
@@ -25,6 +26,9 @@ impl PageFlags {
         }
         if self.0 & Self::USER.0 != 0 {
             flags |= PageTableFlags::USER_ACCESSIBLE;
+        }
+        if self.0 & Self::NO_CACHE.0 != 0 {
+            flags |= PageTableFlags::NO_CACHE;
         }
         if self.0 & Self::NO_EXECUTE.0 != 0 {
             flags |= PageTableFlags::NO_EXECUTE;
