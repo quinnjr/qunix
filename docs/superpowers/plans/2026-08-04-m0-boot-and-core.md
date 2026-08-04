@@ -21,6 +21,36 @@
 
 ---
 
+## Execution Deviations
+
+Recorded during execution. The code in Task 1's steps below is superseded by
+these; read the real files for current truth.
+
+1. **Toolchain pinned to `nightly-2026-08-02`**, not `-08-01`. That is the
+   nightly actually published and installed.
+2. **`-Z build-std` moved out of `.cargo/config.toml` into `xtask`.** It is a
+   *global* unstable flag, so in the config file it also applied to the
+   host-targeted `xtask`, which rebuilt `core` from source alongside the
+   precompiled `std` and failed with `E0152: duplicate lang item`.
+3. **`-Zjson-target-spec` is now required** for JSON target specs.
+4. **The target-spec JSON schema changed.** `target-pointer-width` is a number,
+   not a string; `rustc-abi` is `"softfloat"`, not `"x86-softfloat"`; and
+   `os`, `vendor`, `executables`, `target-c-int-width` are gone. The spec is now
+   derived from `rustc -Zunstable-options --target x86_64-unknown-none
+   --print target-spec-json`, changing only PIE and relocation model.
+5. **No GNU dependencies** (user request):
+   - Host crates target `x86_64-unknown-linux-musl`, not `-gnu`.
+   - Inspection uses `llvm-readobj` / `llvm-addr2line`, not GNU binutils.
+   - **`kernel/linker.ld` and `kernel/build.rs` do not exist.** The GNU ld
+     script is replaced by LLD flags in `.cargo/config.toml`:
+     `--image-base=0xffffffff80000000` and `--entry=kmain`.
+     Consequence: there is no `.requests` PHDR and no
+     `.requests_start_marker` / `.requests_end_marker` placement control.
+     Limine's markers are an optional scan optimisation, so Task 3 must omit
+     them and let Limine scan the whole image for request magic.
+6. **`crates/*` is not in the workspace `members` until Task 2**, because a
+   glob matching a non-existent directory is a hard error.
+
 ## File Structure
 
 | Path | Responsibility |
@@ -104,7 +134,7 @@ rm -rf src
 [toolchain]
 channel = "nightly-2026-08-01"
 components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-musl"]
 ```
 
 - [ ] **Step 4: Write the custom target specification**
@@ -147,13 +177,13 @@ build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-qunix-kernel]
 runner = ["cargo", "run", "--quiet", "--package", "xtask",
-          "--target", "x86_64-unknown-linux-gnu", "--", "runner"]
+          "--target", "x86_64-unknown-linux-musl", "--", "runner"]
 
 [alias]
-xtask = "run --quiet --package xtask --target x86_64-unknown-linux-gnu --"
+xtask = "run --quiet --package xtask --target x86_64-unknown-linux-musl --"
 ```
 
-The explicit `--target x86_64-unknown-linux-gnu` is required: `[build] target` would otherwise cross-compile `xtask` itself to the bare-metal target.
+The explicit `--target x86_64-unknown-linux-musl` is required: `[build] target` would otherwise cross-compile `xtask` itself to the bare-metal target.
 
 - [ ] **Step 6: Write the linker script**
 
@@ -306,7 +336,8 @@ fn main() -> Result<()> {
 Run:
 ```bash
 cargo xtask build
-readelf -h target/x86_64-qunix-kernel/debug/qunix-kernel | grep -E 'Class|Machine|Entry'
+"$(rustc --print sysroot)"/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-readobj \
+  --elf-output-style=GNU -h target/x86_64-qunix-kernel/debug/qunix-kernel
 ```
 Expected: `Class: ELF64`, `Machine: Advanced Micro Devices X86-64`, and an entry point of `0xffffffff80000000` or higher.
 
@@ -405,7 +436,7 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p qunix-sync --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-sync --features std --target x86_64-unknown-linux-musl`
 Expected: FAIL — `cannot find type SpinLock in this scope`.
 
 - [ ] **Step 4: Implement the lock**
@@ -478,7 +509,7 @@ impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p qunix-sync --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-sync --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 6: Add the interrupt-safe variant**
@@ -571,7 +602,7 @@ impl<T: ?Sized, I: IrqControl> Drop for IrqSpinLockGuard<'_, T, I> {
     }
 ```
 
-Run: `cargo test -p qunix-sync --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-sync --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 8: Commit**
@@ -825,7 +856,7 @@ qunix-sync.workspace = true
 
 - [ ] **Step 5: Verify the `limine` 0.6.5 response accessors compile**
 
-Run: `cargo doc -p limine --no-deps --target x86_64-unknown-linux-gnu && cargo build -p qunix-kernel`
+Run: `cargo doc -p limine --no-deps --target x86_64-unknown-linux-musl && cargo build -p qunix-kernel`
 Expected: build succeeds. `Request::<HhdmRespData>::new()` and `RequestsStartMarker::new()` are `const fn` in 0.6.5. If a constructor name differs, correct it from the generated docs at `target/doc/limine/request/index.html` before continuing — do not proceed with a non-compiling boot module.
 
 - [ ] **Step 6: Write the Limine bootloader config**
@@ -1147,7 +1178,7 @@ disabling the harness makes `test_main` undefined.
                 let mut host = Command::new(env!("CARGO"));
                 host.current_dir(&root);
                 host.args([
-                    "test", "--target", "x86_64-unknown-linux-gnu",
+                    "test", "--target", "x86_64-unknown-linux-musl",
                     "--package", package, "--features", "std",
                 ]);
                 if !host.status()?.success() {
@@ -1543,7 +1574,7 @@ pub fn usable_regions() -> impl Iterator<Item = MemoryRegion> {
 
 - [ ] **Step 4: Verify the accessor names against the generated docs**
 
-Run: `cargo doc -p limine --no-deps --target x86_64-unknown-linux-gnu`
+Run: `cargo doc -p limine --no-deps --target x86_64-unknown-linux-musl`
 Then open `target/doc/limine/request/struct.HhdmRespData.html` and `target/doc/limine/memmap/index.html`.
 
 Confirm the field and method names used above (`offset()`, `entries()`, `entry.base`, `entry.length`, `entry.entry_type`, `EntryType::USABLE`). Correct them in the code if 0.6.5 names them differently. Do not guess — the compiler error and the docs together give the exact names.
@@ -1730,7 +1761,7 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-musl`
 Expected: FAIL — `cannot find type BuddyAllocator`.
 
 - [ ] **Step 4: Implement the allocator**
@@ -1916,7 +1947,7 @@ impl<B: FrameBacking> BuddyAllocator<B> {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 8 tests.
 
 - [ ] **Step 6: Commit**
@@ -2406,7 +2437,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-musl`
 Expected: FAIL — `cannot find type SlabHeap`.
 
 - [ ] **Step 3: Implement the heap**
@@ -2532,7 +2563,7 @@ pub mod slab;
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-mm --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Write the failing kernel-side test**

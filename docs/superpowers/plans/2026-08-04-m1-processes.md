@@ -436,7 +436,7 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p qunix-sched --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-sched --features std --target x86_64-unknown-linux-musl`
 Expected: FAIL — `cannot find type RunQueue`.
 
 - [ ] **Step 4: Implement the run queue**
@@ -534,7 +534,7 @@ impl Default for RunQueue {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p qunix-sched --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-sched --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 9 tests.
 
 - [ ] **Step 6: Add the crate to xtask's host-test list**
@@ -1275,7 +1275,7 @@ pub static MP: Request<MpRespData> = Request::new();
 
 - [ ] **Step 5: Verify the MP response API against the generated docs**
 
-Run: `cargo doc -p limine --no-deps --target x86_64-unknown-linux-gnu`
+Run: `cargo doc -p limine --no-deps --target x86_64-unknown-linux-musl`
 Open `target/doc/limine/mp/index.html` and `target/doc/limine/request/struct.MpRespData.html`.
 
 Confirm the accessor used below — iterating CPUs and writing each one's `goto_address` to start it — matches 0.6.5's names. Correct the code from the docs before continuing rather than guessing.
@@ -1649,7 +1649,7 @@ mod tests {
 
 - [ ] **Step 2: Run the ABI tests**
 
-Run: `cargo test -p qunix-abi --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-abi --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 3 tests. Add `qunix-abi` to xtask's host-test package list.
 
 - [ ] **Step 3: Write the failing end-to-end test**
@@ -2036,7 +2036,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p qunix-elf --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-elf --features std --target x86_64-unknown-linux-musl`
 Expected: FAIL — `cannot find type Elf64`.
 
 - [ ] **Step 3: Implement the parser**
@@ -2172,7 +2172,7 @@ impl<'a> Elf64<'a> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p qunix-elf --features std --target x86_64-unknown-linux-gnu`
+Run: `cargo test -p qunix-elf --features std --target x86_64-unknown-linux-musl`
 Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Add the crate to xtask's host-test list**

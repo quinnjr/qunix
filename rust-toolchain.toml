@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly-2026-08-02"
+components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
+# Host-side crates (xtask) target musl, so nothing in the workspace links glibc.
+targets = ["x86_64-unknown-linux-musl"]

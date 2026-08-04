@@ -1,7 +1,23 @@
-[package]
-name = "qunix"
+[workspace]
+resolver = "3"
+members = ["kernel", "xtask"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+license = "MIT OR Apache-2.0"
 
-[dependencies]
+[workspace.dependencies]
+limine = "=0.6.5"
+x86_64 = "0.15"
+qunix-sync = { path = "crates/qunix-sync" }
+qunix-mm = { path = "crates/qunix-mm" }
+qunix-hal-x86_64 = { path = "crates/qunix-hal-x86_64" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

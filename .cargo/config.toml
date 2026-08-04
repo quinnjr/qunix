@@ -1,0 +1,21 @@
+[build]
+target = "targets/x86_64-qunix-kernel.json"
+
+# NOTE: `-Z build-std` is deliberately NOT set here. It is a global unstable
+# flag, so it would also apply to the host-targeted `xtask` crate, rebuilding
+# `core` from source alongside the precompiled `std` and producing a duplicate
+# lang item error. `xtask` passes it explicitly for kernel builds instead.
+
+[target.x86_64-qunix-kernel]
+# Layout is expressed as LLD flags rather than a GNU ld linker script:
+#   --image-base  puts the kernel in the higher half, where Limine expects it
+#   --entry       names the entry symbol, since there is no `_start`
+rustflags = [
+    "-Clink-arg=--image-base=0xffffffff80000000",
+    "-Clink-arg=--entry=kmain",
+]
+runner = ["cargo", "run", "--quiet", "--package", "xtask",
+          "--target", "x86_64-unknown-linux-musl", "--", "runner"]
+
+[alias]
+xtask = "run --quiet --package xtask --target x86_64-unknown-linux-musl --"
