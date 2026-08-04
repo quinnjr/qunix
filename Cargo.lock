@@ -51,6 +51,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qunix-mm"
+version = "0.1.0"
+dependencies = [
+ "qunix-sync",
+]
+
+[[package]]
 name = "qunix-sync"
 version = "0.1.0"
 

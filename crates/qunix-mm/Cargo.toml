@@ -1,0 +1,13 @@
+[package]
+name = "qunix-mm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qunix-sync.workspace = true
+
+[features]
+default = []
+std = []

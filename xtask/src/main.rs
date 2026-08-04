@@ -80,7 +80,7 @@ fn main() -> Result<()> {
             // Host-testable crates are listed explicitly: `--features` is not
             // accepted at the root of a virtual workspace, and the HAL crate
             // cannot build for the host at all.
-            for package in ["qunix-sync"] {
+            for package in ["qunix-sync", "qunix-mm"] {
                 let mut host = Command::new(env!("CARGO"));
                 host.current_dir(&root);
                 host.args([
