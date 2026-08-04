@@ -3066,7 +3066,7 @@ M0 is complete when all of the following hold:
 These are deliberate and must be addressed by later milestones rather than treated as bugs:
 
 1. **Single CPU.** `gdt::init` and `idt::init` use `static mut` and assume one CPU. M1's SMP work replaces both with per-CPU structures.
-2. **No oversized-block reclaim.** `SlabHeap::dealloc` does not recycle allocations larger than 2048 bytes; the bump region is oversized to compensate.
+2. **No reclaim above 4 MiB.** Extents beyond `LARGE_LISTS` are leaked.
 3. **Fixed 16 MiB heap.** The heap is mapped once at init and never grows.
 4. **No TLB shootdown.** `AddressSpace::unmap` flushes only the local CPU, which is correct while there is only one CPU and wrong the moment there is not.
 5. **Timer period is uncalibrated.** `start_timer` takes a raw count; no relationship to wall-clock time is established until M1 calibrates against the HPET or TSC.

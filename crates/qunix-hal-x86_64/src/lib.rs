@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![feature(abi_x86_interrupt)]
 
 pub mod apic;

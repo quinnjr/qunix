@@ -71,6 +71,12 @@ Userspace: `qdl` (driver domain launcher), `linux-shim` (in-domain `.ko` runtime
 tables; demand paging; copy-on-write `fork`; `mmap`. The kernel heap is a slab
 allocator over the buddy allocator, exposed through `GlobalAlloc`.
 
+> **As built in M0:** the heap is a segregated size-class allocator with a bump
+> fallback, not a true slab — no object caches, constructors, or per-CPU
+> magazines. The type is named `SlabHeap` for continuity; a real slab layer is
+> later work. Oversized and over-aligned allocations are recycled; only extents
+> above 4 MiB are leaked.
+
 **Scheduling.** Preemptive, per-CPU runqueues with work stealing. The thread is
 the scheduling unit; a process is an address space plus a file-descriptor table
 plus a thread group.

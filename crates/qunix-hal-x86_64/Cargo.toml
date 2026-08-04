@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 qunix-sync.workspace = true
 x86_64.workspace = true
+
+[features]
+default = []
+std = []

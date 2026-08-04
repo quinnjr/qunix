@@ -26,14 +26,31 @@ fn read_msr(msr: u32) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-fn reg(offset: usize) -> *mut u32 {
-    let base = APIC_BASE.load(Ordering::Acquire);
-    assert!(base != 0, "apic::init has not been called");
-    (base as usize + offset) as *mut u32
+/// Address of a local APIC register, or `None` before [`init`] has run.
+fn reg(offset: usize) -> Option<*mut u32> {
+    // MUST revisit this Relaxed load, paired with `init`'s Release store, when
+    // SMP lands in M1 -- under M0 the storing and loading CPU are the same one,
+    // so program order alone orders them, but an AP would need the acquire side
+    // to see the mapping `init` established before it sees the base.
+    //
+    // A branch rather than an `assert!`: `eoi` runs on every timer tick, and a
+    // runtime assert drags core::panicking plus a formatted message into the
+    // ISR's reachable code and icache footprint. This predicate is never taken
+    // once `init` has run, so it costs a perfectly predicted branch, while
+    // `debug_assert!` would compile out in release and leave a safe `eoi()`
+    // writing to the raw offset as an absolute address.
+    let base = APIC_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    Some((base as usize + offset) as *mut u32)
 }
 
+/// Writes a local APIC register, or does nothing if the APIC is not yet enabled.
 fn write(offset: usize, value: u32) {
-    unsafe { reg(offset).write_volatile(value) };
+    if let Some(reg) = reg(offset) {
+        unsafe { reg.write_volatile(value) };
+    }
 }
 
 /// Physical base address of this CPU's local APIC, from `IA32_APIC_BASE`.
@@ -41,16 +58,28 @@ fn write(offset: usize, value: u32) {
 /// Limine's HHDM covers RAM only, so this MMIO page must be mapped explicitly
 /// (and uncacheable) before `init` is called.
 pub fn phys_base() -> u64 {
-    read_msr(IA32_APIC_BASE_MSR) & 0xFFFF_F000
+    // The address field is bits 12..MAXPHYADDR, not 12..32. A 32-bit mask
+    // silently returns a wrong low address if firmware relocates the LAPIC
+    // above 4 GiB, and the caller then maps the wrong frame.
+    read_msr(IA32_APIC_BASE_MSR) & 0x000F_FFFF_FFFF_F000
 }
 
 /// Enables the local APIC on the current CPU.
 ///
+/// # Safety
+/// `hhdm_offset` must be the bootloader's higher-half direct map offset, and
+/// `hhdm_offset + phys_base()` must already be mapped present, writable and
+/// uncacheable. This function writes through that address immediately, so a
+/// wrong offset is an arbitrary MMIO write.
+///
 /// Reaches the APIC MMIO window at `hhdm_offset + phys_base()`. That page is
 /// device memory, which Limine's HHDM does not cover, so the caller must have
 /// mapped it uncacheable first.
-pub fn init(hhdm_offset: u64) {
-    APIC_BASE.store(hhdm_offset + phys_base(), Ordering::Release);
+pub unsafe fn init(hhdm_offset: u64) {
+    let base = hhdm_offset
+        .checked_add(phys_base())
+        .expect("hhdm offset + apic base overflows the address space");
+    APIC_BASE.store(base, Ordering::Release);
     // Setting the enable bit with a spurious vector is what actually turns the
     // APIC on; without it no LVT entry will ever deliver.
     write(REG_SPURIOUS, SPURIOUS_ENABLE | SPURIOUS_VECTOR);
@@ -59,6 +88,9 @@ pub fn init(hhdm_offset: u64) {
 /// Starts the local APIC timer in periodic mode.
 ///
 /// `divide` is the raw divide-configuration value (`0b1011` = divide by 1).
+///
+/// A no-op before [`init`] has run: with no APIC base there is nothing to
+/// program, and the timer cannot have been delivering anyway.
 pub fn start_timer(divide: u32, initial_count: u32) {
     write(REG_TIMER_DIVIDE, divide);
     write(REG_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
@@ -66,6 +98,9 @@ pub fn start_timer(divide: u32, initial_count: u32) {
 }
 
 /// Signals end-of-interrupt. Must be called from every APIC interrupt handler.
+///
+/// A no-op before [`init`] has run: no APIC interrupt can be in service, so
+/// there is no EOI owed.
 pub fn eoi() {
     write(REG_EOI, 0);
 }

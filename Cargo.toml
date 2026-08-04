@@ -7,17 +7,47 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
+publish = false
 
 [workspace.dependencies]
 limine = "=0.6.5"
 x86_64 = "0.15"
+qunix-abi = { path = "crates/qunix-abi" }
 qunix-sync = { path = "crates/qunix-sync" }
 qunix-mm = { path = "crates/qunix-mm" }
 qunix-hal-x86_64 = { path = "crates/qunix-hal-x86_64" }
 
 [profile.dev]
 panic = "abort"
+# opt-level 0 would also apply to the `build-std` copies of core/alloc/
+# compiler_builtins, and that unoptimised code is what every in-QEMU test
+# executes. debug-assertions and overflow-checks are independent keys and
+# remain on, so this stays behaviour-preserving.
+opt-level = 1
+
+# `"*"` matches dependencies and the build-std copies of core/alloc, but NOT
+# workspace members. Those keep debug-assertions and overflow-checks; core's
+# arithmetic and slice-index checks are not this kernel's to debug, and that
+# code is what the in-QEMU tests spend most of their cycles in.
+[profile.dev.package."*"]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+# Workspace members are not covered by `"*"`, so the allocator and HAL crates
+# would otherwise sit at opt-level 1 on the hot paths. Overflow checks stay on
+# here -- that is the point of the dev profile.
+[profile.dev.package.qunix-mm]
+opt-level = 2
+[profile.dev.package.qunix-sync]
+opt-level = 2
+[profile.dev.package.qunix-hal-x86_64]
+opt-level = 2
 
 [profile.release]
 panic = "abort"
-lto = true
+# Thin LTO gets most of fat LTO's benefit, parallelises, and does not force a
+# whole-program relink on every one-line change.
+lto = "thin"
+# Line tables only: no runtime cost, but release panics keep their locations.
+debug = 1

@@ -1,14 +1,11 @@
 use qunix_hal_x86_64::{print, println};
 
-#[derive(Clone, Copy)]
-#[repr(u32)]
-pub enum ExitCode {
-    Success = 0x10,
-    Failure = 0x11,
-}
+/// The verdict values and the host statuses xtask matches on live in
+/// `qunix-abi`, which both targets build, so there is one definition rather
+/// than two copies checked against each other.
+pub use qunix_abi::ExitCode;
 
-/// QEMU's isa-debug-exit device exits the process with `(value << 1) | 1`.
-/// Success therefore surfaces on the host as exit status 33, failure as 35.
+/// Signals the verdict to the host and halts.
 pub fn exit_qemu(code: ExitCode) -> ! {
     unsafe { qunix_hal_x86_64::port::outl(0xf4, code as u32) };
     loop {

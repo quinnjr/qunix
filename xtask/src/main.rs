@@ -1,9 +1,22 @@
 use anyhow::{Context, Result, bail};
+use qunix_abi::{HOST_STATUS_FAILURE, HOST_STATUS_SUCCESS};
 use std::path::PathBuf;
 use std::process::Command;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+
+/// Where cargo writes artifacts. `CARGO_TARGET_DIR` is common in CI and shared
+/// build caches, and ignoring it yields a path that simply does not exist.
+fn target_dir() -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        // `join` keeps an absolute value as-is. A relative one has to resolve
+        // against the workspace root, because that is the `current_dir` every
+        // cargo we spawn runs in -- xtask's own cwd is not necessarily the same.
+        Some(dir) => workspace_root().join(dir),
+        None => workspace_root().join("target"),
+    }
 }
 
 /// Flags that make the bare-metal target buildable. Passed per-invocation
@@ -29,13 +42,11 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
         bail!("kernel build failed");
     }
     let profile = if release { "release" } else { "debug" };
-    Ok(workspace_root()
-        .join("target/x86_64-qunix-kernel")
-        .join(profile)
-        .join("qunix-kernel"))
+    Ok(target_dir().join("x86_64-qunix-kernel").join(profile).join("qunix-kernel"))
 }
 
 mod image;
+mod licensing;
 mod qemu;
 
 fn main() -> Result<()> {
@@ -51,18 +62,36 @@ fn main() -> Result<()> {
         }
         Some("run") => {
             let elf = build_kernel(release)?;
-            let esp = image::build_esp(&root, &elf)?;
-            let code = qemu::run_esp(&esp, false)?;
-            std::process::exit(code);
+            let esp = image::build_esp(&root, &target_dir(), &elf)?;
+            match qemu::run_esp(&esp, false)? {
+                // A passing kernel exits QEMU with 33, which a shell would read
+                // as failure; translate the harness statuses back into the
+                // conventions a caller of `xtask run` actually expects.
+                qemu::Exit::Code(HOST_STATUS_SUCCESS) => std::process::exit(0),
+                qemu::Exit::Code(HOST_STATUS_FAILURE) => {
+                    eprintln!("the kernel signalled failure via isa-debug-exit");
+                    std::process::exit(1);
+                }
+                qemu::Exit::Code(code) => std::process::exit(code),
+                // Shells report signal deaths as 128 + signo; mirroring that is
+                // more useful than `exit(-1)`, which truncates to a bare 255.
+                qemu::Exit::Signal(signo) => {
+                    eprintln!("qemu was killed by signal {signo}");
+                    std::process::exit(128 + signo);
+                }
+            }
         }
         Some("runner") => {
             // Invoked by cargo as the custom-target runner, with the test ELF path.
             let elf = PathBuf::from(args.get(1).context("runner requires an ELF path")?);
-            let esp = image::build_esp(&root, &elf)?;
+            let esp = image::build_esp(&root, &target_dir(), &elf)?;
             match qemu::run_esp(&esp, true)? {
-                33 => Ok(()),                       // ExitCode::Success
-                35 => bail!("kernel tests failed"), // ExitCode::Failure
-                other => bail!("qemu exited with unexpected status {other}"),
+                qemu::Exit::Code(HOST_STATUS_SUCCESS) => Ok(()),
+                qemu::Exit::Code(HOST_STATUS_FAILURE) => bail!("kernel tests failed"),
+                qemu::Exit::Code(other) => bail!("qemu exited with unexpected status {other}"),
+                qemu::Exit::Signal(signo) => {
+                    bail!("qemu was killed by signal {signo} before reporting a test result")
+                }
             }
         }
         Some("test") => {
@@ -74,28 +103,45 @@ fn main() -> Result<()> {
             // makes build-std compile `core` a second time and collide with the
             // panic=abort copy (E0152: duplicate lang item).
             cmd.arg("-Zpanic-abort-tests");
+            // The profiles differ behaviourally (`lto = "thin"`, and overflow
+            // checks only in debug), so `--release` has to reach every child.
+            if release {
+                cmd.arg("--release");
+            }
             if !cmd.status()?.success() {
                 bail!("kernel tests failed");
             }
-            // Host-testable crates are listed explicitly: `--features` is not
-            // accepted at the root of a virtual workspace, and the HAL crate
-            // cannot build for the host at all.
-            for package in ["qunix-sync", "qunix-mm"] {
-                let mut host = Command::new(env!("CARGO"));
-                host.current_dir(&root);
-                host.args([
-                    "test",
-                    "--target",
-                    "x86_64-unknown-linux-musl",
-                    "--package",
-                    package,
-                    "--features",
-                    "std",
-                ]);
-                if !host.status()?.success() {
-                    bail!("host tests failed for {package}");
-                }
+            // One invocation for all host-testable crates: three separate
+            // cargo startups meant three dependency resolutions and no
+            // cross-crate rustc parallelism. `pkg/feature` syntax is what makes
+            // a multi-package selection able to enable per-package features.
+            let mut host = Command::new(env!("CARGO"));
+            host.current_dir(&root);
+            host.args([
+                "test",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "-p",
+                "qunix-sync",
+                "-p",
+                "qunix-mm",
+                "-p",
+                "qunix-hal-x86_64",
+                "-p",
+                "xtask",
+                "--features",
+                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std",
+            ]);
+            if release {
+                host.arg("--release");
             }
+            if !host.status()?.success() {
+                bail!("host tests failed");
+            }
+            // Cheap, and it is the only thing standing between a future
+            // Linux-compatibility crate and silently inheriting a permissive
+            // licence from the workspace.
+            licensing::check(&root)?;
             Ok(())
         }
         other => bail!("unknown xtask command: {other:?}"),
