@@ -10,7 +10,7 @@ const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
 /// Only `BOOTX64.EFI` is needed: qunix boots via UEFI from a VVFAT-backed ESP,
 /// so neither the host `limine` tool nor the BIOS install step is required.
 pub fn ensure_limine(root: &Path) -> Result<PathBuf> {
-    let dir = root.join("target/limine");
+    let dir = root.join(".limine");
     if !dir.join("BOOTX64.EFI").exists() {
         let status = Command::new("git")
             .args(["clone", "--depth", "1", "--branch", LIMINE_BRANCH, LIMINE_REPO])

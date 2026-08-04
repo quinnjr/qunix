@@ -55,6 +55,49 @@ fn main() -> Result<()> {
             let code = qemu::run_esp(&esp, false)?;
             std::process::exit(code);
         }
+        Some("runner") => {
+            // Invoked by cargo as the custom-target runner, with the test ELF path.
+            let elf = PathBuf::from(args.get(1).context("runner requires an ELF path")?);
+            let esp = image::build_esp(&root, &elf)?;
+            match qemu::run_esp(&esp, true)? {
+                33 => Ok(()),                       // ExitCode::Success
+                35 => bail!("kernel tests failed"), // ExitCode::Failure
+                other => bail!("qemu exited with unexpected status {other}"),
+            }
+        }
+        Some("test") => {
+            let mut cmd = Command::new(env!("CARGO"));
+            cmd.current_dir(&root);
+            cmd.args(["test", "--package", "qunix-kernel"]);
+            cmd.args(BUILD_STD);
+            // Without this, cargo forces `panic=unwind` for test units, which
+            // makes build-std compile `core` a second time and collide with the
+            // panic=abort copy (E0152: duplicate lang item).
+            cmd.arg("-Zpanic-abort-tests");
+            if !cmd.status()?.success() {
+                bail!("kernel tests failed");
+            }
+            // Host-testable crates are listed explicitly: `--features` is not
+            // accepted at the root of a virtual workspace, and the HAL crate
+            // cannot build for the host at all.
+            for package in ["qunix-sync"] {
+                let mut host = Command::new(env!("CARGO"));
+                host.current_dir(&root);
+                host.args([
+                    "test",
+                    "--target",
+                    "x86_64-unknown-linux-musl",
+                    "--package",
+                    package,
+                    "--features",
+                    "std",
+                ]);
+                if !host.status()?.success() {
+                    bail!("host tests failed for {package}");
+                }
+            }
+            Ok(())
+        }
         other => bail!("unknown xtask command: {other:?}"),
     }
 }

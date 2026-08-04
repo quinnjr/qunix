@@ -36,7 +36,9 @@ pub fn run_esp(esp: &Path, headless: bool) -> Result<i32> {
     // (xorriso, mtools, loop mounts) is needed to produce a bootable volume.
     cmd.arg("-drive");
     cmd.arg(format!("format=raw,file=fat:rw:{}", esp.display()));
-    cmd.args(["-serial", "stdio", "-no-reboot", "-no-shutdown"]);
+    // `-no-shutdown` is deliberately absent: it would keep QEMU alive after
+    // isa-debug-exit fires, so the harness could never observe an exit code.
+    cmd.args(["-serial", "stdio", "-no-reboot"]);
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     if headless {
         cmd.args(["-display", "none"]);

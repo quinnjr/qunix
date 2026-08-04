@@ -8,7 +8,9 @@ license.workspace = true
 [[bin]]
 name = "qunix-kernel"
 path = "src/main.rs"
-test = false
+# NOTE: do NOT set `harness = false`. `reexport_test_harness_main` renames
+# cargo's generated harness entry point, so that entry point must exist.
+test = true
 
 [dependencies]
 limine.workspace = true
