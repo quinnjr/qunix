@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod gdt;
 pub mod port;
 pub mod serial;
 

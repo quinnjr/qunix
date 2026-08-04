@@ -47,6 +47,7 @@ dependencies = [
  "limine",
  "qunix-hal-x86_64",
  "qunix-sync",
+ "x86_64",
 ]
 
 [[package]]

@@ -16,6 +16,9 @@ pub extern "C" fn kmain() -> ! {
     assert!(boot::base_revision_supported(), "limine base revision unsupported");
     println!("qunix: booted");
 
+    qunix_hal_x86_64::gdt::init();
+    println!("qunix: gdt installed");
+
     #[cfg(test)]
     test_main();
 
@@ -39,5 +42,13 @@ mod tests {
     #[test_case]
     fn harness_runs_at_all() {
         assert_eq!(1 + 1, 2);
+    }
+
+    #[test_case]
+    fn gdt_installs_expected_kernel_code_selector() {
+        use x86_64::instructions::segmentation::{CS, Segment};
+        qunix_hal_x86_64::gdt::init();
+        // Entry 0 is the null descriptor, so kernel code lands at index 1 => 0x08.
+        assert_eq!(CS::get_reg().0, 0x08);
     }
 }
