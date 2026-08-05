@@ -14,6 +14,9 @@ const OVMF_CANDIDATES: &[&str] = &[
     "/usr/share/edk2/x64/OVMF.fd",
     "/usr/share/edk2-ovmf/x64/OVMF.fd",
     "/usr/share/ovmf/x64/OVMF.fd",
+    // Debian and Ubuntu's `ovmf` package. Their OVMF_CODE_4M.fd is a split
+    // build and deliberately absent from this list.
+    "/usr/share/ovmf/OVMF.fd",
 ];
 
 /// Wall-clock budget for a single QEMU run, overridable with `QUNIX_QEMU_TIMEOUT`.

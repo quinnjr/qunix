@@ -34,7 +34,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf
-          echo "QUNIX_OVMF=/usr/share/OVMF/OVMF_CODE.fd" >> "$GITHUB_ENV"
+          # Must be a unified image. The split OVMF_CODE*.fd needs a companion
+          # writable VARS pflash that the harness does not attach, so pointing
+          # at one fails inside the firmware rather than here.
+          for candidate in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
+            if [ -f "$candidate" ]; then
+              echo "QUNIX_OVMF=$candidate" >> "$GITHUB_ENV"
+              echo "using $candidate"
+              exit 0
+            fi
+          done
+          echo "::error::no unified OVMF image found" >&2
+          ls -l /usr/share/ovmf /usr/share/OVMF 2>/dev/null >&2
+          exit 1
 
       - name: Test
         run: cargo xtask test
