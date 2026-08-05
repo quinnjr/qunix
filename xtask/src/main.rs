@@ -243,9 +243,11 @@ fn main() -> Result<()> {
                 "-p",
                 "qunix-hal-x86_64",
                 "-p",
+                "qunix-sched",
+                "-p",
                 "xtask",
                 "--features",
-                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std",
+                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std",
             ]);
             if release {
                 host.arg("--release");

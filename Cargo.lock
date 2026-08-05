@@ -406,6 +406,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "qunix-sched"
+version = "0.1.0"
+
+[[package]]
 name = "qunix-sync"
 version = "0.1.0"
 dependencies = [
