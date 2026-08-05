@@ -500,13 +500,47 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         if !pa.is_multiple_of(Self::block_size(order)) {
             refuse!()
         }
-        // One read `push` is about to do anyway. Without it a second `free` of
-        // the same block re-pushes it, `push` writes `next(pa) = pa` when `pa`
-        // is already the head, and two later `alloc`s return the same frame.
-        assert!(
-            self.word(pa, OFF_TAG) != Self::free_tag(pa, order),
-            "double free of {pa:#x} at order {order}"
-        );
+        // `pa` must not already lie inside memory that is on a free list.
+        //
+        // This used to be a single comparison against `free_tag(pa, order)`,
+        // which caught only the exact same (block, order) pair and let two
+        // strictly worse cases through, both of which hand out overlapping
+        // memory with every operation reporting success:
+        //
+        //   * `free(pa, 1)` then `free(pa, 0)` — the tag in `pa` is stamped for
+        //     order 1, so a comparison against the order-0 tag misses it, and
+        //     `pa` ends up on two free lists at once. `alloc(0)` and `alloc(1)`
+        //     then both return `pa`.
+        //   * `free(pa, 1)` then `free(pa + PAGE_SIZE, 0)` — the interior page
+        //     carries no tag at all, so nothing was checked, and `alloc(1)`
+        //     returns `pa` while `alloc(0)` returns a page inside it.
+        //
+        // The general statement is that no block *containing* `pa` may be free
+        // at any order. `pa & !(size - 1)` is that containing block, and the
+        // scan is driven by `nonempty` rather than by every order, because a
+        // block can only be free at an order whose list has an entry — so the
+        // usual case reads one or two tags rather than nineteen. Bits come out
+        // of `trailing_zeros` in ascending order, so the containing address
+        // decreases monotonically and dropping below `region_start` ends the
+        // scan: no lower ancestor can be a block of this region either.
+        //
+        // For every order at or below `order` the containing address is `pa`
+        // itself — the alignment guard above has just established that — so
+        // those iterations re-read one word rather than walking memory.
+        let mut mask = self.nonempty;
+        while mask != 0 {
+            let o = mask.trailing_zeros() as u8;
+            mask &= mask - 1;
+            let containing = pa & !(Self::block_size(o) - 1);
+            if containing < region_start {
+                break;
+            }
+            assert!(
+                self.word(containing, OFF_TAG) != Self::free_tag(containing, o),
+                "double free of {pa:#x} at order {order}: \
+                 {containing:#x} is already free at order {o}"
+            );
+        }
         while order < MAX_ORDER {
             let size = Self::block_size(order);
             let buddy = pa ^ size;
@@ -1173,6 +1207,356 @@ mod tests {
         unsafe { b.add_region(base, 4 * 4096) };
         unsafe { b.add_region(base + 8 * 4096, 4 * 4096) };
         assert!(b.alloc(3).is_none(), "coalesced across an unmanaged hole");
+    }
+
+    /// An order-1 block whose buddy stays allocated, so it cannot coalesce away.
+    ///
+    /// Every wrong-order double-free case below needs a block that is still
+    /// free at exactly the order it was freed at once `free` returns; a block
+    /// that merged upwards would be testing a different order than the one the
+    /// test named.
+    fn allocator_with_one_free_order_one_block() -> (BuddyAllocator<VecBacking>, u64) {
+        let base = 0x100000;
+        let mut a = allocator_with(base, 8 * 4096);
+        let block = a.alloc(1).expect("the region must yield an order-1 block");
+        let buddy = a.alloc(1).expect("and its buddy");
+        assert_eq!(block ^ (PAGE_SIZE << 1), buddy, "test needs the two blocks to be buddies");
+        unsafe { a.free(block, 1) };
+        assert_eq!(
+            a.word(block, OFF_TAG),
+            BuddyAllocator::<VecBacking>::free_tag(block, 1),
+            "the block must still be free at order 1, not coalesced to a higher one"
+        );
+        (a, block)
+    }
+
+    /// Re-freeing a block at a *different* order than it is free at must be
+    /// refused.
+    ///
+    /// The double-free guard used to compare only against `free_tag(pa, order)`,
+    /// so a block already free at order 1 sailed through a `free(pa, 0)`: the
+    /// tags differ by order by construction. `pa` then sat on two free lists at
+    /// once and `alloc(0)` and `alloc(1)` both returned it — two live callers,
+    /// one frame, every call reporting success. This was a live bug, not a
+    /// hypothetical.
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn free_refuses_a_block_already_free_at_a_higher_order() {
+        let (mut a, block) = allocator_with_one_free_order_one_block();
+        unsafe { a.free(block, 0) };
+    }
+
+    /// The mirror image: already free at a *lower* order than the re-free names.
+    ///
+    /// Same hole, opposite direction — a guard written to scan only orders above
+    /// `order` would pass the test above and fail this one.
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn free_refuses_a_block_already_free_at_a_lower_order() {
+        let base = 0x100000;
+        let mut a = allocator_with(base, 8 * 4096);
+        let low = a.alloc(0).unwrap();
+        let held = a.alloc(0).unwrap();
+        assert_eq!(low ^ PAGE_SIZE, held, "test needs the two frames to be buddies");
+        // Its buddy is held, so `low` stays free at order 0 rather than merging.
+        unsafe { a.free(low, 0) };
+        unsafe { a.free(low, 1) };
+    }
+
+    /// A page *inside* a block that is already free must be refused.
+    ///
+    /// The nastiest of the three: the interior page carries no tag of its own,
+    /// so a guard that only ever reads `pa`'s own word checks nothing at all.
+    /// Before the containment scan, `alloc(1)` returned the enclosing block
+    /// while `alloc(0)` returned a page inside it.
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn free_refuses_a_page_inside_a_block_that_is_already_free() {
+        let (mut a, block) = allocator_with_one_free_order_one_block();
+        unsafe { a.free(block + PAGE_SIZE, 0) };
+    }
+
+    /// The containment scan must not fire on caller data.
+    ///
+    /// Its cost and its risk are the same read: it consults the tag word of
+    /// blocks that may be live. A scan that mistook an ordinary allocation for
+    /// a free ancestor would panic the kernel on a correct free, which is worse
+    /// than the bug it closes. Freeing every frame of a region in turn, with
+    /// each frame first filled with the values most likely to collide, must
+    /// complete and must rebuild the whole region.
+    #[test]
+    fn the_containment_scan_does_not_fire_on_live_caller_data() {
+        for garbage in [0u64, u64::MAX, TAG_SEED, NIL - 1] {
+            let base = 0x100000;
+            let mut a = allocator_with(base, 8 * 4096);
+            let mut frames = Vec::new();
+            while let Some(pa) = a.alloc(0) {
+                for off in [OFF_NEXT, OFF_PREV, OFF_TAG] {
+                    unsafe { a.backing.write_link(pa + off, garbage) };
+                }
+                frames.push(pa);
+            }
+            assert_eq!(frames.len(), 8);
+            for pa in frames {
+                unsafe { a.free(pa, 0) };
+            }
+            assert_eq!(a.free_bytes(), 8 * 4096, "a correct free was refused with {garbage:#x}");
+            assert!(a.alloc(3).is_some(), "the region did not rebuild");
+        }
+    }
+
+    /// `alloc` must refuse an order above `MAX_ORDER` rather than index the
+    /// free-list array out of bounds or overflow the shift in `block_size`.
+    ///
+    /// `MAX_ORDER + 1` is the boundary; `u8::MAX` is what a corrupted or
+    /// attacker-influenced order argument looks like.
+    #[test]
+    fn alloc_refuses_an_order_above_max_order() {
+        let mut a = allocator_with(0x100000, 16 * 4096);
+        assert!(a.free_bytes() > 0, "the allocator must have memory, or None proves nothing");
+        for order in [MAX_ORDER + 1, MAX_ORDER + 2, u8::MAX] {
+            assert!(a.alloc(order).is_none(), "alloc({order}) was not refused");
+        }
+        // The refusals must not have disturbed the allocator.
+        assert!(a.alloc(0).is_some(), "a refused over-order alloc broke the allocator");
+    }
+
+    /// `free` must reject an over-large order loudly. Absorbing it would index
+    /// `free_lists` out of bounds and shift `PAGE_SIZE` past 64 bits.
+    #[test]
+    #[should_panic(expected = "above MAX_ORDER")]
+    fn free_refuses_an_order_above_max_order() {
+        let mut a = allocator_with(0x100000, 16 * 4096);
+        unsafe { a.free(0x100000, MAX_ORDER + 1) };
+    }
+
+    /// `free` before any region exists must panic rather than write 24 bytes of
+    /// link through a placeholder backing.
+    #[test]
+    #[should_panic(expected = "free before any region was added")]
+    fn free_refuses_a_block_before_any_region_is_added() {
+        let mut a = BuddyAllocator::new(VecBacking::new(0x100000, 4 * 4096));
+        unsafe { a.free(0x100000, 0) };
+    }
+
+    /// A start address so high that rounding it up to a page overflows takes the
+    /// `checked_next_multiple_of` arm of `add_region`, which nothing reached.
+    ///
+    /// The existing overflow test uses a start that rounds up fine and only
+    /// overflows on `start + len`, so it exercises the sibling arm. Wrapping
+    /// either one into a small plausible-looking region would hand the allocator
+    /// a range near address zero that firmware never offered.
+    #[test]
+    fn add_region_refuses_a_start_that_cannot_be_rounded_up_to_a_page() {
+        let mut a = BuddyAllocator::new(VecBacking::new(0, 0));
+        // Rounds up past u64::MAX; `start + len` on its own would not overflow.
+        let start = u64::MAX - 100;
+        assert!(start.checked_add(10).is_some(), "test must isolate the rounding arm");
+        unsafe { a.add_region(start, 10) };
+
+        assert_eq!(a.free_bytes(), 0, "an unroundable region added memory");
+        assert_eq!(a.malformed_region_bytes(), 10);
+        assert_eq!(a.edge_dropped_bytes(), 0, "a whole-entry discard is not edge slop");
+        assert_eq!(a.refused_region_bytes(), 0, "a whole-entry discard is not a cap refusal");
+        assert!(a.alloc(0).is_none());
+    }
+
+    /// A region based at address zero exercises the `saturating_sub` in the
+    /// order calculation, where `trailing_zeros()` reports 64.
+    ///
+    /// Without saturation-safe arithmetic the first block's order is nonsense
+    /// and `add_region` either panics or pushes a block larger than the region.
+    #[test]
+    fn a_region_based_at_address_zero_is_split_correctly() {
+        let mut a = BuddyAllocator::new(VecBacking::new(0, 8 * 4096));
+        unsafe { a.add_region(0, 8 * 4096) };
+        assert_eq!(a.free_bytes(), 8 * 4096);
+        // Eight pages at address zero are exactly one order-3 block, and nothing
+        // larger may be produced from them.
+        assert!(a.alloc(4).is_none(), "a block larger than the region was pushed");
+        assert_eq!(a.alloc(3), Some(0));
+        assert_eq!(drain_and_check(&mut a, (0, 8 * PAGE_SIZE)), 0);
+    }
+
+    /// `plausible_link` refuses a link that is inside a region but not aligned
+    /// to the order whose list it appears on.
+    ///
+    /// The existing truncation test forges a page-aligned address outside every
+    /// region, so only the `region_of` arm was ever exercised. A misaligned
+    /// in-region link is the arm an attacker who knows the region layout would
+    /// reach for, and following it makes the list head name an address that
+    /// straddles two real blocks.
+    #[test]
+    fn pop_refuses_a_next_link_that_is_in_region_but_misaligned_for_its_order() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 16 * 4096));
+        unsafe { a.add_region(base, 16 * 4096) };
+        // Two order-1 blocks freed with their buddies still held, so the order-1
+        // list genuinely has two entries.
+        let mut blocks = Vec::new();
+        for _ in 0..4 {
+            blocks.push(a.alloc(1).expect("the region must yield four order-1 blocks"));
+        }
+        unsafe { a.free(blocks[0], 1) };
+        unsafe { a.free(blocks[2], 1) };
+        let head = a.free_lists[1];
+        assert_eq!(head, blocks[2], "the most recent free must be the list head");
+        assert_ne!(a.word(head, OFF_NEXT), NIL, "a one-entry list cannot prove truncation");
+
+        // In-region and page-aligned, but not aligned to an order-1 block, so
+        // no order-1 block can ever start there.
+        let forged = base + PAGE_SIZE;
+        assert!(a.region_of(forged).is_some(), "the forged link must be in-region");
+        assert!(!forged.is_multiple_of(PAGE_SIZE << 1), "and misaligned for order 1");
+        unsafe { a.backing.write_link(head + OFF_NEXT, forged) };
+
+        let before = a.truncated_lists();
+        assert_eq!(a.alloc(1), Some(head));
+        assert_eq!(
+            a.truncated_lists(),
+            before + 1,
+            "a misaligned in-region link was spliced instead of refused"
+        );
+        while let Some(pa) = a.alloc(1) {
+            assert_ne!(pa, forged, "a misaligned link was handed out as an order-1 block");
+        }
+    }
+
+    /// Coalescing must refuse a buddy that lies *below* the region start.
+    ///
+    /// The loop tests `buddy < region_start` before anything else, and nothing
+    /// reached it: every existing region is aligned to a large power of two, so
+    /// every buddy computed inside it lies above its start. A region whose first
+    /// block is the odd half of an order-1 pair is what puts the buddy outside,
+    /// and merging there would push a block reaching below memory the allocator
+    /// was given.
+    #[test]
+    fn coalescing_refuses_a_buddy_below_the_region_start() {
+        // Starts one page in, so the first page's order-0 buddy is `base`, which
+        // is in no region.
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 4 * 4096));
+        unsafe { a.add_region(base + PAGE_SIZE, PAGE_SIZE) };
+        let region_start = base + PAGE_SIZE;
+        let pa = a.alloc(0).expect("the one page must be allocatable");
+        assert_eq!(pa, region_start);
+        // The buddy is genuinely below the region, which is the precondition.
+        assert_eq!(pa ^ PAGE_SIZE, base);
+        assert!(a.region_of(base).is_none(), "the buddy must lie in no region");
+
+        unsafe { a.free(pa, 0) };
+
+        assert_eq!(a.free_bytes(), PAGE_SIZE);
+        assert!(a.alloc(1).is_none(), "a merge reached below the region start");
+        assert_eq!(a.alloc(0), Some(region_start));
+        assert_eq!(a.alloc(0), None);
+    }
+
+    /// Coalescing must refuse a buddy whose own extent runs past the region end.
+    ///
+    /// `buddy >= region_end` catches a buddy wholly outside; this is the case
+    /// where the buddy *starts* inside and reaches out, which is the same defect
+    /// `free_refuses_a_block_that_overruns_its_region` fixed for the incoming
+    /// block. Merging would produce a block half of which the allocator never
+    /// owned, and the next `alloc` of that order would hand it out.
+    #[test]
+    fn coalescing_refuses_a_buddy_whose_extent_overruns_the_region() {
+        // Three pages: pages 0 and 1 are order-1 buddies, but the order-1 block
+        // that would be page 2's partner runs to page 4, past the end.
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 3 * 4096));
+        unsafe { a.add_region(base, 3 * 4096) };
+        let mut frames = Vec::new();
+        while let Some(pa) = a.alloc(0) {
+            frames.push(pa);
+        }
+        // Addressed by value rather than by allocation order: the region splits
+        // into an order-1 block and an order-0 block, so the order pages come
+        // back in is a property of the split, not of this test.
+        frames.sort_unstable();
+        assert_eq!(frames, std::vec![base, base + PAGE_SIZE, base + 2 * PAGE_SIZE]);
+        // Free pages 0 and 1 so they merge to an order-1 block at `base`, then
+        // page 2, whose order-1 partner would be `base + 2 pages .. base + 4`.
+        for pa in &frames {
+            unsafe { a.free(*pa, 0) };
+        }
+        assert_eq!(a.free_bytes(), 3 * PAGE_SIZE);
+
+        // The merge that must not happen is order 1 -> order 2 at `base`: its
+        // buddy `base + 2 pages` starts in-region but extends to `base + 4`.
+        assert!(a.alloc(2).is_none(), "coalesced into a block that overruns the region");
+        assert_eq!(a.alloc(1), Some(base), "the legitimate order-1 merge was lost");
+        assert_eq!(drain_and_check(&mut a, (base, base + 3 * PAGE_SIZE)), 1);
+    }
+
+    /// A tag that is valid, but for a *different* order, must not authorise a
+    /// merge.
+    ///
+    /// `free_tag` mixes the order in precisely so that a block free at order 2
+    /// is not mistaken for a free order-0 block at the same address. Nothing
+    /// asserted the refusal: the existing forged-tag tests all forge the tag for
+    /// the order being merged at. Accepting it would unlink a block from a list
+    /// it is not on, corrupting that list's head while the block stays reachable
+    /// at its real order — the same frame free twice over.
+    #[test]
+    fn unlink_refuses_a_tag_valid_for_a_different_order() {
+        let base = 0x100000;
+        let mut a = allocator_with(base, 8 * 4096);
+        let live = a.alloc(0).unwrap();
+        let other = live ^ PAGE_SIZE;
+        while a.alloc(0).map(|p| p != other).unwrap_or(false) {}
+
+        // A tag for order 3 in a block whose buddy is about to be freed at
+        // order 0. It is a genuine tag, just not for this order.
+        let wrong_order = BuddyAllocator::<VecBacking>::free_tag(live, 3);
+        assert_ne!(wrong_order, BuddyAllocator::<VecBacking>::free_tag(live, 0));
+        unsafe {
+            a.backing.write_link(live + OFF_TAG, wrong_order);
+            a.backing.write_link(live + OFF_PREV, NIL);
+            a.backing.write_link(live + OFF_NEXT, NIL);
+        }
+
+        // Links are `NIL`, so `free_neighbour` would wave them through — the
+        // only thing that can refuse this merge is the order in the tag itself.
+        let rejected_before = a.rejected_unlinks();
+        unsafe { a.free(other, 0) };
+        assert_eq!(
+            a.rejected_unlinks(),
+            rejected_before,
+            "the refusal must come from the tag, not from the neighbour links"
+        );
+        assert_never_handed_out_inside_an_order_one_block(&mut a, live);
+    }
+
+    /// The rejection counters must stay still when nothing is rejected.
+    ///
+    /// Every counter test above asserts that a counter *moved*. A counter that
+    /// also moved on the happy path would satisfy all of them while telling the
+    /// kernel its memory map is broken on every boot, so the silence has to be
+    /// asserted too.
+    #[test]
+    fn ordinary_use_moves_no_rejection_counter() {
+        let base = 0x100000;
+        let mut a = allocator_with(base, 16 * 4096);
+        let mut frames = Vec::new();
+        while let Some(pa) = a.alloc(0) {
+            frames.push(pa);
+        }
+        for pa in frames {
+            unsafe { a.free(pa, 0) };
+        }
+        let big = a.alloc(4).expect("the region must rebuild into one order-4 block");
+        unsafe { a.free(big, 4) };
+
+        assert_eq!(a.free_bytes(), 16 * 4096);
+        assert_eq!(a.foreign_frees(), 0, "a legitimate free was billed as foreign");
+        assert_eq!(a.rejected_unlinks(), 0, "a legitimate merge was refused");
+        assert_eq!(a.truncated_lists(), 0, "a legitimate free list was truncated");
+        assert_eq!(a.edge_dropped_bytes(), 0, "a page-aligned region lost bytes to rounding");
+        assert_eq!(a.refused_region_bytes(), 0);
+        assert_eq!(a.refused_regions(), 0);
+        assert_eq!(a.malformed_region_bytes(), 0);
+        assert_eq!(a.dropped_bytes(), 0);
     }
 
     #[test]

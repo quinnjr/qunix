@@ -48,6 +48,42 @@ fn manifest_field(manifest: &str, key: &str) -> Option<String> {
         .map(|value| value.trim_matches('"').to_string())
 }
 
+/// The licence a manifest effectively declares.
+///
+/// `license.workspace = true` resolves to the workspace value, which is the
+/// permissive licence. That is only acceptable for a crate whose zone IS
+/// permissive, and treating it as "unset" rather than as permissive is what
+/// would let a Linux-compat crate ship permissive by declaring nothing.
+fn declared_license(manifest: &str) -> Option<String> {
+    if manifest.contains("license.workspace = true") {
+        return Some(PERMISSIVE.to_string());
+    }
+    manifest_field(manifest, "license")
+}
+
+/// The verdict for one crate, given its name and its manifest text.
+///
+/// Split from the directory walk because the walk is I/O and the verdict is the
+/// rule. Until this existed the tests reached only `zone_for`, so nothing
+/// asserted the thing the check is for: that a Linux-compat crate inheriting
+/// the workspace licence is **rejected**. Every test was in the accepting
+/// direction, and deleting the comparison in `check` would have passed all of
+/// them.
+fn verdict(name: &str, manifest: &str) -> Result<()> {
+    let expected = zone_for(name);
+    let Some(declared) = declared_license(manifest) else {
+        bail!("{name} declares no license");
+    };
+    if declared != expected {
+        bail!(
+            "{name} is licensed {declared:?} but its zone requires {expected:?} \
+             (see LICENSING.md). A Linux-compatibility crate must declare \
+             `license = \"{COPYLEFT}\"` explicitly, not inherit the workspace default."
+        );
+    }
+    Ok(())
+}
+
 /// Fails if any crate's declared licence does not match its zone.
 pub fn check(root: &Path) -> Result<()> {
     let mut checked = 0usize;
@@ -65,27 +101,11 @@ pub fn check(root: &Path) -> Result<()> {
             let Some(name) = manifest_field(&manifest, "name") else {
                 continue; // virtual manifest, no [package]
             };
-            let expected = zone_for(&name);
-
-            // `license.workspace = true` resolves to the workspace value, which
-            // is the permissive licence. That is only acceptable for a crate
-            // whose zone IS permissive.
-            let declared = if manifest.contains("license.workspace = true") {
-                PERMISSIVE.to_string()
-            } else {
-                match manifest_field(&manifest, "license") {
-                    Some(license) => license,
-                    None => bail!("{name} declares no license", name = name),
-                }
-            };
-
-            if declared != expected {
-                bail!(
-                    "{name} is licensed {declared:?} but its zone requires {expected:?} \
-                     (see LICENSING.md). A Linux-compatibility crate must declare \
-                     `license = \"{COPYLEFT}\"` explicitly, not inherit the workspace default."
-                );
-            }
+            // The rule itself lives in `verdict`, which is testable without a
+            // directory to walk. Inlining it here as well would be two copies
+            // of the same comparison that must agree -- the shape of defect
+            // this project keeps finding.
+            verdict(&name, &manifest)?;
             checked += 1;
         }
     }
@@ -98,6 +118,70 @@ pub fn check(root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{COPYLEFT, PERMISSIVE, verdict};
+
+    /// A manifest with the two keys the checker reads.
+    fn manifest(name: &str, license_line: &str) -> String {
+        format!("[package]\nname = \"{name}\"\n{license_line}\nedition = \"2024\"\n")
+    }
+
+    #[test]
+    fn a_linux_compat_crate_inheriting_the_workspace_licence_is_rejected() {
+        // The whole reason the check exists, and until now nothing asserted it.
+        // `license.workspace = true` resolves to the permissive licence, so a
+        // Linux-compat crate that simply says nothing would ship permissive --
+        // silently, because every existing test was in the accepting direction
+        // and deleting the comparison in `check` passed all of them.
+        let m = manifest("qunix-linux-ext4", "license.workspace = true");
+        let err = verdict("qunix-linux-ext4", &m).unwrap_err().to_string();
+        assert!(err.contains("qunix-linux-ext4"), "{err}");
+        assert!(err.contains(COPYLEFT), "the error does not name the required licence: {err}");
+    }
+
+    #[test]
+    fn a_linux_compat_crate_declaring_permissive_is_rejected() {
+        // Explicitly wrong rather than merely unset. Both must fail, or the
+        // guard covers one of two ways to get it wrong.
+        let m = manifest("qunix-linux-drm", &format!("license = \"{PERMISSIVE}\""));
+        assert!(verdict("qunix-linux-drm", &m).is_err());
+    }
+
+    #[test]
+    fn a_permissive_crate_declaring_copyleft_is_rejected() {
+        // The opposite direction is also a violation: qunix's own code must not
+        // silently become GPL, which would relicense the project by accident.
+        let m = manifest("qunix-mm", &format!("license = \"{COPYLEFT}\""));
+        assert!(verdict("qunix-mm", &m).is_err());
+    }
+
+    #[test]
+    fn a_crate_declaring_no_licence_at_all_is_rejected() {
+        let m = "[package]\nname = \"qunix-mm\"\nedition = \"2024\"\n";
+        let err = verdict("qunix-mm", m).unwrap_err().to_string();
+        assert!(err.contains("declares no license"), "{err}");
+    }
+
+    #[test]
+    fn the_deliberate_exemption_is_exactly_one_crate() {
+        // `qunix-linux-abi` is exempt because matching UAPI struct layouts is
+        // not reimplementing the in-kernel driver API (see LICENSING.md). The
+        // risk is that the exemption widens by prefix match, taking every
+        // future `qunix-linux-*` crate with it.
+        assert!(verdict("qunix-linux-abi", &manifest("qunix-linux-abi", "license.workspace = true")).is_ok());
+        assert!(
+            verdict("qunix-linux-abi-helpers", &manifest("qunix-linux-abi-helpers", "license.workspace = true")).is_err(),
+            "the exemption widened to a crate that merely starts with the exempt name"
+        );
+    }
+
+    #[test]
+    fn crates_in_each_zone_are_accepted_when_correct() {
+        assert!(verdict("qunix-mm", &manifest("qunix-mm", "license.workspace = true")).is_ok());
+        assert!(
+            verdict("qunix-linux-ext4", &manifest("qunix-linux-ext4", &format!("license = \"{COPYLEFT}\""))).is_ok()
+        );
+    }
+
     use super::*;
 
     #[test]

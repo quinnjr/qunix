@@ -168,6 +168,48 @@ fn measure(root: &Path) -> Result<(BTreeMap<String, Lines>, String)> {
     Ok((measured, lcov))
 }
 
+/// Baseline lines that look like a floor but are not readable as one.
+///
+/// [`parse_baseline`] drops whatever it cannot read. That is the right shape for
+/// a parser and precisely the wrong shape for a gate: `qunix-mm = 98,57` — a
+/// decimal comma, a merge-conflict marker, a floor moved onto the same line as
+/// its note — removes the crate from the baseline *entirely*. `check` then finds
+/// no floor for it, reports it as a **new crate**, and prints success for a crate
+/// whose ratchet it just stopped enforcing. Nothing else notices, because
+/// [`unmeasured_floors`] compares against the parsed baseline and the entry is
+/// not in it either.
+///
+/// It is the same hole as the unmeasured-floor one, a step earlier in the
+/// pipeline: there the measurement went missing, here the floor does. Both make
+/// the tool confidently green about a crate it is no longer checking, so both
+/// are fatal rather than skipped.
+fn malformed_baseline_lines(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return false;
+            }
+            // Exactly what `parse_baseline` accepts. Written as its negation
+            // rather than sharing a helper on purpose: if the two ever disagree,
+            // the round-trip test below fails, whereas a shared helper would
+            // make them agree by construction even when both are wrong.
+            let Some((name, value)) = trimmed.split_once('=') else { return true };
+            name.trim().trim_matches('"').is_empty() || value.trim().parse::<f64>().is_err()
+        })
+        .map(|(index, line)| (index + 1, line.to_string()))
+        .collect()
+}
+
+fn render_malformed(lines: &[(usize, String)]) -> String {
+    lines
+        .iter()
+        .map(|(number, line)| format!("  {BASELINE}:{number}: {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn parse_baseline(text: &str) -> BTreeMap<String, f64> {
     text.lines()
         .map(str::trim)
@@ -346,6 +388,32 @@ fn render_uncovered(regressed: &[String], uncovered: &BTreeMap<String, Vec<Strin
     detail
 }
 
+/// How a measurement stands against its committed floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Regressed,
+    Improved,
+    Held,
+}
+
+/// Compares one measurement against one floor.
+///
+/// This is the ratchet — the single decision the whole command exists to make —
+/// and it was written inline in `check`, downstream of `cargo llvm-cov`, so
+/// nothing could test it. Every other rule here had a negative test and this one
+/// had none in either direction: no test asserted that a real drop is *caught*.
+/// Inverting the comparison, or applying the tolerance to both sides, would have
+/// left every existing test passing.
+fn verdict(now: f64, floor: f64) -> Verdict {
+    if now + TOLERANCE_PP < floor {
+        Verdict::Regressed
+    } else if now > floor + TOLERANCE_PP {
+        Verdict::Improved
+    } else {
+        Verdict::Held
+    }
+}
+
 /// Crates that carry a floor but produced no measurement.
 ///
 /// The comparison loop walks what was measured, so a crate missing from the
@@ -398,6 +466,23 @@ fn dropped_crates(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Fails if any baseline line is neither a comment, a blank, nor a readable floor.
+fn reject_malformed(text: &str) -> Result<()> {
+    let malformed = malformed_baseline_lines(text);
+    if !malformed.is_empty() {
+        bail!(
+            "{n} line(s) in {BASELINE} are not readable as a floor:\n{list}\n\n\
+             A line the parser cannot read is silently dropped, which removes that \
+             crate's floor entirely -- the ratchet then treats it as a new crate and \
+             reports success for something it has stopped enforcing. Fix the line or \
+             comment it out with `#`.",
+            n = malformed.len(),
+            list = render_malformed(&malformed)
+        );
+    }
+    Ok(())
+}
+
 /// Measures coverage and compares it against the committed floor.
 pub fn check(root: &Path, update: bool) -> Result<()> {
     let (measured, lcov) = measure(root)?;
@@ -406,6 +491,10 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
     if update {
         // Read before write so per-crate rationales survive the rewrite.
         let previous = std::fs::read_to_string(&baseline_path).unwrap_or_default();
+        // Before anything reads a floor out of it. An unreadable line is a floor
+        // this run cannot see, so `--update` would drop the crate and its note
+        // without either gate below noticing there was anything to authorise.
+        reject_malformed(&previous)?;
         let notes = existing_notes(&previous);
         // A floor may only go *down* with a recorded reason. Enforced rather
         // than requested: the last time this was a convention, a floor was
@@ -493,6 +582,7 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
     let baseline_text = std::fs::read_to_string(&baseline_path).with_context(|| {
         format!("reading {BASELINE}; create it with `cargo xtask coverage --update`")
     })?;
+    reject_malformed(&baseline_text)?;
     let baseline = parse_baseline(&baseline_text);
 
     let mut regressions = Vec::new();
@@ -507,17 +597,14 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
             improvements.push(format!("  {name:<20} {now:>6.2}%  (new, no floor recorded)"));
             continue;
         };
-        if now + TOLERANCE_PP < floor {
-            regressions.push(format!(
-                "  {name:<20} {now:>6.2}%  floor {floor:.2}%  ({:+.2} pp)",
-                now - floor
-            ));
-            regressed_names.push(name.clone());
-        } else if now > floor + TOLERANCE_PP {
-            improvements.push(format!(
-                "  {name:<20} {now:>6.2}%  floor {floor:.2}%  ({:+.2} pp)",
-                now - floor
-            ));
+        let line = format!("  {name:<20} {now:>6.2}%  floor {floor:.2}%  ({:+.2} pp)", now - floor);
+        match verdict(now, floor) {
+            Verdict::Regressed => {
+                regressions.push(line);
+                regressed_names.push(name.clone());
+            }
+            Verdict::Improved => improvements.push(line),
+            Verdict::Held => {}
         }
     }
 
@@ -940,6 +1027,149 @@ end_of_record
     fn the_file_header_is_not_attributed_to_the_first_crate() {
         let notes = existing_notes("# header line\n\nqunix-mm = 90.00\n");
         assert!(!notes.contains_key("qunix-mm"), "header captured as a crate note");
+    }
+
+    #[test]
+    fn the_ratchet_catches_a_real_drop() {
+        // The decision the entire command exists to make, and the one rule here
+        // that had no test in either direction. Inverting the comparison in
+        // `check` would have left every other test in this file passing.
+        assert_eq!(verdict(80.0, 90.0), Verdict::Regressed);
+        assert_eq!(verdict(0.0, 25.93), Verdict::Regressed);
+        // Just past the tolerance is still a regression: the tolerance absorbs
+        // measurement drift, it is not an allowance to spend.
+        assert_eq!(verdict(90.0 - TOLERANCE_PP - 0.01, 90.0), Verdict::Regressed);
+    }
+
+    #[test]
+    fn a_drop_within_the_tolerance_holds_and_a_rise_beyond_it_improves() {
+        assert_eq!(verdict(90.0, 90.0), Verdict::Held);
+        assert_eq!(verdict(90.0 - TOLERANCE_PP, 90.0), Verdict::Held);
+        // Inside the tolerance upward is not an improvement either, or the tool
+        // would tell contributors to raise a floor on pure noise.
+        assert_eq!(verdict(90.0 + TOLERANCE_PP, 90.0), Verdict::Held);
+        assert_eq!(verdict(96.0, 90.0), Verdict::Improved);
+    }
+
+    #[test]
+    fn the_tolerance_is_the_figure_it_claims_to_be() {
+        // Pinned deliberately. Widening this is the documented wrong answer to a
+        // red build -- it weakens the ratchet for every crate to accommodate
+        // one, and it is a one-character edit no reviewer would necessarily
+        // question. `qunix-sync` measured 97.84 here and 96.76 on a runner for
+        // the same commit; the fix was the test, not this number. Raising it
+        // must mean deleting this assertion, which is a decision to argue for.
+        assert_eq!(TOLERANCE_PP, 0.5);
+        // And it must stay smaller than the smallest drop worth catching. At
+        // 1 pp, an entire uncovered function in a 100-line crate passes.
+        assert!(TOLERANCE_PP < 1.0, "a tolerance of {TOLERANCE_PP} pp hides a whole function");
+    }
+
+    #[test]
+    fn an_unreadable_floor_line_is_fatal_rather_than_dropped() {
+        // The fail-open this replaced: `parse_baseline` filters out whatever it
+        // cannot read, so a typo'd figure deleted the crate's floor, `check` saw
+        // no floor and called it a new crate, and the ratchet printed success
+        // for a crate it had stopped enforcing.
+        let decimal_comma = "qunix-mm = 98,57\n";
+        assert!(parse_baseline(decimal_comma).is_empty(), "the premise changed");
+        assert_eq!(malformed_baseline_lines(decimal_comma).len(), 1);
+        assert!(reject_malformed(decimal_comma).is_err());
+
+        // Every other shape that silently vanishes.
+        for text in [
+            "qunix-mm 98.57\n",              // the `=` lost to a reflow
+            "qunix-mm = 98.5.7\n",           // a stray keystroke
+            "qunix-mm = ninety\n",           // a placeholder nobody replaced
+            "<<<<<<< HEAD\n",                // an unresolved merge
+            "= 98.57\n",                     // the crate name lost
+            "qunix-mm = 98.57 # inline\n",   // a note moved onto the floor line
+        ] {
+            assert!(
+                reject_malformed(text).is_err(),
+                "a line that parses to nothing was accepted: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_baseline_has_no_malformed_lines() {
+        // The other direction, or the check above is satisfied by rejecting
+        // everything. Includes the forms the file actually uses: a quoted name,
+        // an integer floor, comments and blanks.
+        let text = "# a note\n\n\"qunix-mm\" = 98.57\nxtask = 54\n#\n";
+        assert!(malformed_baseline_lines(text).is_empty(), "{:?}", malformed_baseline_lines(text));
+        assert_eq!(parse_baseline(text).len(), 2);
+    }
+
+    #[test]
+    fn the_malformed_report_names_the_line_and_its_number() {
+        // A gate whose message does not say where to look sends the user back
+        // to guessing, which is the failure the uncovered-line report fixed.
+        let out = render_malformed(&malformed_baseline_lines("ok = 1.0\nbroken\n"));
+        assert!(out.contains(":2:") && out.contains("broken"), "{out}");
+    }
+
+    /// The committed baseline read through the tool's own rules.
+    ///
+    /// It has violated them before -- `qunix-sync` carried a note headed 97.33
+    /// beside a floor of 98.54, so the recorded reason described a number the
+    /// file no longer held. Checked here rather than only when someone happens
+    /// to run `--update`, because the note is the durable record CONTRIBUTING
+    /// depends on and a wrong one is worse than none.
+    fn committed_baseline() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../coverage-baseline.toml"))
+            .expect("reading the committed coverage-baseline.toml")
+    }
+
+    #[test]
+    fn the_committed_baseline_is_readable_by_its_own_parser() {
+        let text = committed_baseline();
+        reject_malformed(&text).expect("the committed baseline has an unreadable line");
+        assert!(!parse_baseline(&text).is_empty());
+    }
+
+    #[test]
+    fn every_measured_crate_has_a_committed_floor() {
+        // A crate added to MEASURED without a floor is reported as "new" forever
+        // and is never ratcheted -- it can fall from 100% to 0% and pass.
+        let baseline = parse_baseline(&committed_baseline());
+        for (name, _) in MEASURED {
+            assert!(baseline.contains_key(*name), "{name} is measured but has no floor");
+        }
+    }
+
+    #[test]
+    fn every_committed_floor_names_a_measured_crate() {
+        // The direction `unmeasured_floors` catches at runtime, asserted at test
+        // time so it does not take a full `cargo llvm-cov` run to notice.
+        let baseline = parse_baseline(&committed_baseline());
+        for name in baseline.keys() {
+            assert!(
+                MEASURED.iter().any(|(m, _)| m == name),
+                "{name} has a floor but is not in MEASURED, so it is never enforced"
+            );
+        }
+    }
+
+    #[test]
+    fn every_committed_note_heads_with_the_floor_it_describes() {
+        // The rule `--update` enforces on a lowering, applied to the file as it
+        // stands. A note whose figure has drifted authorises nothing and
+        // misdescribes everything.
+        let text = committed_baseline();
+        let baseline = parse_baseline(&text);
+        for (name, note) in existing_notes(&text) {
+            let floor = baseline.get(&name).unwrap_or_else(|| panic!("note for unknown crate {name}"));
+            let figure = format!("{floor:.2}");
+            let first = note.first().expect("an empty note block");
+            let rest = first.trim_start_matches('#').trim_start();
+            assert!(
+                rest.strip_prefix(&figure)
+                    .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit())),
+                "the note above `{name}` is headed {first:?} but the floor is {figure}"
+            );
+        }
     }
 
     #[test]

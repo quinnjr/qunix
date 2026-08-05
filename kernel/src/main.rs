@@ -1264,6 +1264,10 @@ mod tests {
 
     #[test_case]
     fn a_faulting_user_program_dies_without_taking_the_kernel_with_it() {
+        // Declared, not exempted: the harness asserts the kill count moves by
+        // exactly this much, so a test that expects one kill and causes two --
+        // or none -- still fails.
+        crate::testing::expect_process_kills(1);
         use crate::process;
 
         crate::frames::init();
@@ -1385,6 +1389,10 @@ mod tests {
 
     #[test_case]
     fn a_process_killed_by_a_ring_three_fault_gives_back_its_address_space() {
+        // Declared, not exempted: the harness asserts the kill count moves by
+        // exactly this much, so a test that expects one kill and causes two --
+        // or none -- still fails.
+        crate::testing::expect_process_kills(1);
         crate::frames::init();
         crate::heap::init();
         crate::sched::init();

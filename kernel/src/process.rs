@@ -280,6 +280,60 @@ mod tests {
             Err(LoadError::NotUserAddress(USER_MAX - 4096)),
             "a segment crossing into the kernel half was accepted"
         );
+        // The last page that still fits. Pinned from below so the bound cannot
+        // drift downward and refuse a legal program without anything noticing.
+        assert!(
+            segment_pages(&segment_at(USER_MAX - 4096, 4096)).is_ok(),
+            "the last legal user page was refused"
+        );
+    }
+
+    #[test_case]
+    fn a_segment_whose_end_overflows_is_refused_rather_than_wrapping() {
+        // The arm the doc comment on `segment_pages` is about, and the one no
+        // test reached. The kernel builds without overflow checks in release,
+        // so an unchecked `vaddr + mem_size` or `next_multiple_of` wraps to a
+        // small number instead of trapping -- and a wrapped `end` is *below*
+        // `USER_MAX`, so the bound check passes and the range the permission
+        // pass iterates is empty. An empty permission pass leaves every page
+        // the mapping pass created writable *and* executable, which is the W^X
+        // hole this whole file is arranged to prevent.
+        //
+        // Two distinct overflows, because they are two distinct arithmetic
+        // steps and a fix applied to one of them is the shape of hole this
+        // kernel keeps finding.
+
+        // `vaddr + mem_size` overflows.
+        assert_eq!(
+            segment_pages(&segment_at(u64::MAX - 0x100, 0x200)),
+            Err(LoadError::BadAddress),
+            "a segment whose end wraps past the top of the address space was accepted"
+        );
+        assert_eq!(
+            segment_pages(&segment_at(0x40_0000, u64::MAX)),
+            Err(LoadError::BadAddress),
+            "a segment with a wrapping mem_size was accepted"
+        );
+
+        // The add is fine; rounding the end up to a page boundary is what
+        // overflows. `u64::MAX - 8 + 8` is `u64::MAX`, which has no next
+        // multiple of 4096.
+        assert_eq!(
+            segment_pages(&segment_at(u64::MAX - 8, 8)),
+            Err(LoadError::BadAddress),
+            "a segment ending within a page of the top of the address space was accepted"
+        );
+
+        // Neither error may be reported as a *user address* problem: the two
+        // carry different payloads and a caller told `NotUserAddress(0)` for an
+        // overflow would look for a segment at the null page.
+        assert!(
+            !matches!(
+                segment_pages(&segment_at(u64::MAX - 8, 8)),
+                Err(LoadError::NotUserAddress(_))
+            ),
+            "an overflow was reported as a user-address violation"
+        );
     }
 }
 

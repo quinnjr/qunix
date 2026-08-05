@@ -266,16 +266,163 @@ mod tests {
         (heap, backing)
     }
 
-    /// The claim that makes `alloc` safe to call before `set_backing`.
+    /// A backing range that wraps the address space must abort rather than be
+    /// absorbed.
     ///
-    /// This is the load-bearing half of the argument for dropping `unsafe`: if
-    /// any branch of `class_for` reached a free-list read before consulting
-    /// `bump_end`, safe code could dereference a null head. One case per branch.
+    /// Absorbing it by taking nothing left the heap permanently empty and
+    /// surfaced much later as an allocation failure with no connection to its
+    /// cause, which is the regression this pins.
     #[test]
     #[should_panic(expected = "wraps the address space")]
     fn set_backing_refuses_a_wrapping_range() {
         let mut heap = SlabHeap::new();
         unsafe { heap.set_backing(usize::MAX - 16, 4096) };
+    }
+
+    /// A second `set_backing` must abort.
+    ///
+    /// The "at most once" rule is enforced rather than documented because a
+    /// repeat call orphans every block handed out from the first region while
+    /// leaving the free lists pointing into it — the next `alloc` of a recycled
+    /// class then returns a pointer into memory the heap no longer manages.
+    /// `bump_end` is what catches the case where nothing was allocated yet, so
+    /// the no-allocation variant is the one asserted here.
+    #[test]
+    #[should_panic(expected = "backing replaced after allocations")]
+    fn set_backing_refuses_a_second_call() {
+        let (mut heap, _backing) = heap_with(64 * 1024);
+        let mut second = std::vec![0u8; 64 * 1024];
+        let va = second.as_mut_ptr() as usize;
+        unsafe { heap.set_backing(va, 64 * 1024) };
+    }
+
+    /// Rounding `bump_next` up to a very strong alignment must not overflow.
+    ///
+    /// `GlobalAlloc::alloc` may not panic, and overflow checks are on for this
+    /// crate in the dev profile, so an unchecked `bump_next + (align - 1)`
+    /// aborts the kernel on a request a caller is entitled to make and be
+    /// refused. The heap is placed at the top of the address space, which is
+    /// what makes the rounding overflow rather than merely exceed `bump_end`.
+    #[test]
+    fn bump_refuses_an_alignment_that_overflows_the_address_space() {
+        let mut heap = SlabHeap::new();
+        // Never dereferenced: every path below returns null.
+        unsafe { heap.set_backing(usize::MAX - 4096, 4096) };
+        let layout = Layout::from_size_align(8, 1 << 62).unwrap();
+        assert!(heap.alloc(layout).is_null(), "an unsatisfiable alignment was served");
+        assert_eq!(heap.allocated_bytes(), 0, "a refused alloc was charged");
+    }
+
+    /// The same for `start + size`, which is a separate `checked_add`.
+    ///
+    /// An alignment the heap can round to, and a size that then runs off the end
+    /// of the address space rather than merely off the end of the heap.
+    #[test]
+    fn bump_refuses_a_size_that_overflows_the_address_space() {
+        let mut heap = SlabHeap::new();
+        unsafe { heap.set_backing(usize::MAX - 4096, 4096) };
+        let layout = Layout::from_size_align(1 << 62, 8).unwrap();
+        assert!(heap.alloc(layout).is_null(), "an unsatisfiable size was served");
+        assert_eq!(heap.allocated_bytes(), 0, "a refused alloc was charged");
+    }
+
+    /// A recycled size-class block must still satisfy the strongest alignment
+    /// that class can be asked for, not the alignment of the request that
+    /// created it.
+    ///
+    /// Every block of a class lands on one shared free list, so a block carved
+    /// at align 1 for an `align(1)` request would later be handed to an
+    /// `align(16)` request. `alloc` bumps class blocks at `MAX_CLASS_ALIGN`
+    /// precisely to stop that, and nothing asserted it: the existing alignment
+    /// test allocates from a fresh bump region whose base is page aligned, so it
+    /// passes whatever alignment the bump used.
+    #[test]
+    fn a_recycled_class_block_still_meets_the_strongest_class_alignment() {
+        let (mut heap, _backing) = heap_with(64 * 1024);
+        let weak = Layout::from_size_align(8, 1).unwrap();
+        let strong = Layout::from_size_align(8, MAX_CLASS_ALIGN).unwrap();
+        assert_eq!(
+            SlabHeap::class_for(weak),
+            SlabHeap::class_for(strong),
+            "both requests must share a class, or the free list is not shared"
+        );
+
+        // Several blocks, so at least one lands where a weaker bump stride would
+        // have left an odd address.
+        let mut carved = Vec::new();
+        for _ in 0..4 {
+            let p = heap.alloc(weak);
+            assert!(!p.is_null());
+            carved.push(p);
+        }
+        for p in carved {
+            unsafe { heap.dealloc(p, weak) };
+        }
+        for _ in 0..4 {
+            let p = heap.alloc(strong);
+            assert!(!p.is_null());
+            assert_eq!(
+                p as usize % MAX_CLASS_ALIGN,
+                0,
+                "a recycled block did not meet the class's strongest alignment"
+            );
+        }
+    }
+
+    /// A large request the bump region cannot satisfy must be refused without
+    /// charging it, and must leave the heap able to serve the next request.
+    ///
+    /// `allocated_bytes` is what the kernel reads to decide how much heap it is
+    /// using; charging a failed allocation inflates it permanently, and nothing
+    /// ever subtracts it because there is no pointer to `dealloc`.
+    #[test]
+    fn a_failed_large_allocation_is_not_charged_and_leaves_the_heap_usable() {
+        let (mut heap, _backing) = heap_with(64 * 1024);
+        let small = Layout::from_size_align(64, 8).unwrap();
+        let live = heap.alloc(small);
+        assert!(!live.is_null());
+        let charged = heap.allocated_bytes();
+        let remaining = heap.bump_remaining();
+
+        // A megabyte out of a 64 KiB heap: classless by size, and hopeless.
+        let huge = Layout::from_size_align(1 << 20, 8).unwrap();
+        assert!(heap.alloc(huge).is_null(), "the heap served more than it has");
+
+        assert_eq!(heap.allocated_bytes(), charged, "a failed allocation was charged");
+        assert_eq!(heap.bump_remaining(), remaining, "a failed allocation consumed bump space");
+        assert!(!heap.alloc(small).is_null(), "a failed allocation broke the heap");
+    }
+
+    /// A recycled large block must only be reused for its own extent.
+    ///
+    /// The large lists are indexed by power-of-two extent precisely so that a
+    /// freed 64-byte extent cannot satisfy a 128-byte one. Nothing asserted the
+    /// refusal — every large test frees and re-requests the same layout — and
+    /// getting it wrong hands back a block half the size of the request, which
+    /// the caller then writes past the end of.
+    #[test]
+    fn a_large_block_is_not_recycled_for_a_different_extent() {
+        let (mut heap, _backing) = heap_with(64 * 1024);
+        // Classless via alignment, so both take the large path.
+        let small = Layout::from_size_align(32, 64).unwrap();
+        let large = Layout::from_size_align(32, 128).unwrap();
+        assert!(SlabHeap::class_for(small).is_none() && SlabHeap::class_for(large).is_none());
+        assert_ne!(
+            large_extent(small),
+            large_extent(large),
+            "the two layouts must land in different large lists"
+        );
+
+        let freed = heap.alloc(small);
+        assert!(!freed.is_null());
+        unsafe { heap.dealloc(freed, small) };
+
+        let bigger = heap.alloc(large);
+        assert!(!bigger.is_null());
+        assert_ne!(bigger, freed, "a 64-byte extent was handed out for a 128-byte request");
+        assert_eq!(bigger as usize % 128, 0, "the large block is not aligned to its extent");
+        // And the freed block is still there for a request of its own extent.
+        assert_eq!(heap.alloc(small), freed, "the 64-byte extent stopped being recycled");
     }
 
     #[test]
@@ -406,9 +553,14 @@ mod tests {
         let layout = Layout::from_size_align(8 * 1024 * 1024, 8).unwrap();
         let first = heap.alloc(layout);
         assert!(!first.is_null());
+        assert_eq!(heap.allocated_bytes(), 8 * 1024 * 1024);
         let remaining = heap.bump_remaining();
         unsafe { heap.dealloc(first, layout) };
         assert_eq!(heap.bump_remaining(), remaining, "bump region cannot reclaim");
+        // The memory is leaked but the *accounting* is not: `dealloc` reverses
+        // the charge on every path, or `allocated_bytes` drifts upward for the
+        // life of the kernel and eventually underflows on an unrelated free.
+        assert_eq!(heap.allocated_bytes(), 0, "a leaked extent kept its charge");
         let second = heap.alloc(layout);
         assert!(!second.is_null());
         assert_ne!(first, second, "an extent beyond the largest list was recycled");
