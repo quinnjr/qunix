@@ -11,6 +11,7 @@ pub mod paging;
 pub mod percpu;
 pub mod port;
 pub mod serial;
+pub mod syscall;
 
 pub struct Irq;
 

@@ -16,6 +16,8 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub struct Selectors {
     pub kernel_code: SegmentSelector,
     pub kernel_data: SegmentSelector,
+    pub user_code: SegmentSelector,
+    pub user_data: SegmentSelector,
     pub tss: SegmentSelector,
 }
 
@@ -54,6 +56,13 @@ pub unsafe fn build_and_load(
     *gdt = GlobalDescriptorTable::new();
     let kernel_code = gdt.append(Descriptor::kernel_code_segment());
     let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+    // Order is dictated by `SYSRET`, not by taste. It loads CS from
+    // `IA32_STAR[63:48] + 16` and SS from `+ 8`, so the user *data* descriptor
+    // must sit immediately before the user *code* one. Appending them the other
+    // way round compiles, boots, and then returns to ring 3 with a data
+    // selector in CS -- a #GP on the first user instruction.
+    let user_data = gdt.append(Descriptor::user_data_segment());
+    let user_code = gdt.append(Descriptor::user_code_segment());
     // SAFETY: the caller guarantees `tss` outlives this CPU, which is what the
     // `'static` bound on `tss_segment` is really asking for.
     let tss_static: &'static TaskStateSegment = unsafe { &*(tss as *const TaskStateSegment) };
@@ -71,7 +80,7 @@ pub unsafe fn build_and_load(
         load_tss(tss_sel);
     }
 
-    Selectors { kernel_code, kernel_data, tss: tss_sel }
+    Selectors { kernel_code, kernel_data, user_code, user_data, tss: tss_sel }
 }
 
 /// Whether this CPU's double-fault stack canary survives: `Some(false)` means
@@ -93,4 +102,12 @@ pub fn kernel_data_selector() -> SegmentSelector {
 
 pub fn tss_selector() -> SegmentSelector {
     crate::percpu::current().selectors().tss
+}
+
+pub fn user_code_selector() -> SegmentSelector {
+    crate::percpu::current().selectors().user_code
+}
+
+pub fn user_data_selector() -> SegmentSelector {
+    crate::percpu::current().selectors().user_data
 }

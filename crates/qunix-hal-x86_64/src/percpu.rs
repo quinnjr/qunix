@@ -285,6 +285,27 @@ fn self_ptr() -> *const PerCpu {
     ptr as *const PerCpu
 }
 
+/// Records the stack the CPU switches to when it leaves ring 3.
+///
+/// Sets *both* places that matter, because they are used by different
+/// mechanisms and setting only one produces a machine that works until it
+/// doesn't:
+///
+/// - `PerCpu::kernel_rsp` is read by the `SYSCALL` entry stub, which does its
+///   own stack switch because `syscall` does not.
+/// - `TSS.privilege_stack_table[0]` is read by the *CPU* on any interrupt or
+///   exception taken from ring 3. Leaving it zero means the first timer tick in
+///   userspace pushes an interrupt frame to address 0.
+///
+/// # Safety
+/// `stack_top` must be the top of a kernel stack that stays valid for as long
+/// as this CPU can enter the kernel from ring 3.
+pub unsafe fn set_kernel_stack(stack_top: u64) {
+    let block = unsafe { current_mut() };
+    block.kernel_rsp = stack_top;
+    block.tss.privilege_stack_table[0] = x86_64::VirtAddr::new(stack_top);
+}
+
 /// This CPU's index.
 pub fn cpu_id() -> u32 {
     current().cpu_id

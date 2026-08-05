@@ -2850,6 +2850,36 @@ M1 is complete when all of the following hold:
 - [ ] A user mapping in one address space is not visible in another.
 - [ ] `cargo xtask run` boots and runs a real `init` ELF in ring 3, which issues syscalls and exits cleanly.
 
+### D4 — SYSCALL argument registers do not line up with System V (Task 8, 2026-08-05)
+
+The plan's stub moves `r10` into `rcx` and calls the handler, implying the rest
+of the registers already match. They do not:
+
+    syscall:  nr=rax  a0=rdi  a1=rsi  a2=rdx  a3=r10  a4=r8
+    sysv:     nr=rdi  a0=rsi  a1=rdx  a2=rcx  a3=r8   a4=r9
+
+Every argument shifts by one register, and the syscall number has to move from
+`rax` into `rdi`. The first version of the stub did only the `r10` move, and
+the failure was silent: the kernel dispatched on whatever was in `rdi`, so a
+process calling `exit(7)` had its message *address* interpreted as the syscall
+number, both syscalls returned `BadSyscall`, and execution ran off the end of
+the program into a `ud2`. Nothing faulted at the point of the mistake.
+
+The moves are written right-to-left so each source is read before it is
+overwritten.
+
+### D5 — `TSS.rsp0` is a second, separate kernel stack pointer (Task 8/10, 2026-08-05)
+
+`percpu::kernel_rsp` is read by the `SYSCALL` stub, which switches stacks
+itself because `syscall` does not. `TSS.privilege_stack_table[0]` is read by
+the *CPU* on any interrupt or exception taken from ring 3. They are different
+mechanisms and both must be set; the plan mentions only the first.
+
+Setting only `kernel_rsp` produces a kernel that services syscalls correctly
+and then dies on the first timer tick that lands while a process is running,
+because the CPU pushes the interrupt frame to address 0. `percpu::set_kernel_stack`
+now sets both, which is why it lives there rather than in `syscall`.
+
 ## Known Limitations Carried Into M2
 
 - **Application processors are online but idle.** They install per-CPU state

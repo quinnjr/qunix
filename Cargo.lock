@@ -382,6 +382,7 @@ name = "qunix-hal-x86_64"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "qunix-abi",
  "qunix-sync",
  "x86_64",
 ]

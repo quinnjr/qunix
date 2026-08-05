@@ -11,8 +11,10 @@ mod boot;
 mod frames;
 mod heap;
 mod panic;
+mod process;
 mod sched;
 mod smp;
+mod syscall;
 mod thread;
 mod vmspace;
 mod testing;
@@ -161,6 +163,13 @@ pub extern "C" fn kmain() -> ! {
     // exists there is nothing to drive it anyway.
     sched::set_preemption(true);
     println!("qunix: apic timer running, preemption enabled");
+
+    match process::spawn_user(process::INIT_BINARY) {
+        Some(id) => println!("qunix: spawned init as {id:?}"),
+        None => println!("qunix: could not create the init address space"),
+    }
+    // Hand the CPU over so init actually runs before the boot thread parks.
+    sched::yield_now();
 
     let started = smp::start_all();
     // Bounded: a firmware that lists a CPU it cannot start would otherwise hang

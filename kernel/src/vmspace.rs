@@ -117,6 +117,22 @@ impl VmSpace {
         Ok(pa)
     }
 
+    /// Changes the writability of an already-mapped user page.
+    ///
+    /// Exists for one reason: a program's text must be writable while the
+    /// kernel copies it in and read-only once the process can run. Remapping
+    /// is cheaper than a second temporary mapping of the same frame, and
+    /// nothing else can reach the address space in between.
+    pub fn set_writable(&mut self, va: u64, writable: bool) -> Result<(), MapError> {
+        // SAFETY: `va` was mapped by this address space, so unmapping returns
+        // the frame this owns rather than one shared with the kernel half.
+        let pa = unsafe { self.space.unmap(va)? };
+        // The frame is still in `owned` -- it was never given back to the frame
+        // allocator, only detached from this virtual address.
+        let executable = !writable;
+        self.map_user(va, pa, writable, executable)
+    }
+
     /// Loads this address space into CR3.
     ///
     /// # Safety
