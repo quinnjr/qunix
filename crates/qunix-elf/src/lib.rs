@@ -418,6 +418,40 @@ mod tests {
         assert_eq!(Elf64::parse(&bytes), Err(ElfError::BadProgramHeader));
     }
 
+    /// A `e_phoff` so large that adding the table length wraps.
+    ///
+    /// The sibling test above exercises the `table_end > bytes.len()` bound and
+    /// notes that `checked_mul` cannot wrap on a 64-bit host. The `checked_add`
+    /// on `e_phoff` is different: it is reachable, and removing it passed every
+    /// other test in this file.
+    ///
+    /// What makes it dangerous rather than merely wrong is where the wrap
+    /// lands. `phoff` near the top of the address space plus a small table
+    /// wraps to a *small* `table_end`, which then satisfies the file-length
+    /// bound -- so the header table is accepted, and every subsequent read
+    /// strides from `phoff` itself, far outside the buffer. A wrap that
+    /// produced a large value would have been caught by the very next line;
+    /// this one is caught by nothing else.
+    #[test]
+    fn a_program_header_offset_that_wraps_when_the_table_is_added_is_refused() {
+        let mut bytes = minimal();
+        // One header of the usual size, so `table_len` is 56 and the sum wraps
+        // to 47 -- comfortably inside the file, and accepted without the guard.
+        bytes[ehdr::PHNUM..ehdr::PHNUM + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[ehdr::PHENTSIZE..ehdr::PHENTSIZE + 2].copy_from_slice(&56u16.to_le_bytes());
+        bytes[ehdr::PHOFF..ehdr::PHOFF + 8].copy_from_slice(&(u64::MAX - 8).to_le_bytes());
+
+        // Pin the premise: the wrapped end must land inside the file, or the
+        // test proves nothing the length bound would not have caught anyway.
+        assert!(
+            (u64::MAX - 8).wrapping_add(56) < bytes.len() as u64,
+            "the wrapped table end is not inside the file; this test would pass \
+             even with the guard removed"
+        );
+
+        assert_eq!(Elf64::parse(&bytes), Err(ElfError::BadProgramHeader));
+    }
+
     #[test]
     fn a_program_header_count_that_overflows_is_refused() {
         // A header count that puts the table past the end of the file. The
