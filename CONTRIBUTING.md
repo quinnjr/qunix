@@ -1,8 +1,15 @@
 # Contributing to qunix
 
-Two things are non-negotiable here: **every commit attests what assisted in
-writing it**, and **branching follows git-flow**. Both are checked, not merely
-requested — see [Enforcement](#enforcement).
+Three things are non-negotiable here:
+
+- **Every commit attests what assisted in writing it.**
+- **Branching follows git-flow.**
+- **You are responsible for the pull request you open, and nothing is accepted
+  unverified.**
+
+The first two are checked by `cargo xtask test` — see
+[Enforcement](#enforcement). The third cannot be, which is exactly why it is
+stated first among equals rather than left implied.
 
 Everything else is in [`CLAUDE.md`](CLAUDE.md), which records the conventions and
 the traps this codebase has already paid for. Read it before your first change.
@@ -90,17 +97,60 @@ Explain **why** in the body. The subject says what changed; the body says what
 was wrong with the previous state. A commit that says only what it did is a
 diff with extra steps.
 
+## Responsibility
+
+**A pull request is the responsibility of the person who opens it.** Not the
+tool that helped write it, not the reviewer who approves it, and not the
+maintainer who merges it. If you open it, you own it: its correctness, its
+tests, and its consequences.
+
+That holds whatever produced the code. A model wrote most of M0 — the standard
+is unchanged by that fact. Opening a PR is a claim that you have read every line
+in it and can defend it. If you cannot explain why a hunk is there, it is not
+ready to submit; delete it or go and understand it.
+
+The obligation does not transfer on merge. If a change of yours turns out to be
+wrong, the expectation is that you are the one who fixes it.
+
+## Verification before acceptance
+
+**No PR is accepted without being verified.** Verification means someone ran it
+and checked the claims — not that it looked reasonable, and not that CI was
+green, which only proves the assertions that exist actually pass.
+
+Two independent obligations:
+
+- **You verify before opening.** `cargo xtask test` green, the change exercised,
+  and every claim in the PR description something you checked rather than
+  expected.
+- **A reviewer verifies before merging.** Independently, not by re-reading your
+  description. A review that only reads the diff has not verified anything.
+
+That distinction is load-bearing here. This codebase has shipped changes where
+the full suite passed, the reasoning was sound, and the code was wrong —
+including two memory-corruption bugs that survived a seven-agent review because
+every test asserted the happy path. Green is a necessary condition, never a
+sufficient one.
+
+### What a PR must state
+
+- What changes, and what was wrong with the previous state.
+- **What you verified, and how.** Name the commands and what you observed.
+- **What you did not verify.** An honest gap is reviewable; a silent one is a
+  trap for whoever hits it later.
+
+"Tests pass" is not verification of anything except that the tests pass. If a
+change adds a guard, show the guard failing when it should. If it fixes a bug,
+show the test failing before the fix.
+
 ## Before you open a PR
 
 ```sh
 cargo xtask test
 ```
 
-That must be green: 14 in-QEMU tests, 51 host tests, and the licensing check.
-
-A PR is expected to state what it changes, why, and **what you verified rather
-than assumed**. If you could not test something, say so — an honest gap is
-reviewable, a silent one is not.
+That must be green: 14 in-QEMU tests, 56 host tests, the licensing check, and the
+attestation check.
 
 ### Tests
 

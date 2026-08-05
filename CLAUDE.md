@@ -6,7 +6,7 @@ already cost someone an hour. It is not a style guide.
 ## Commands
 
 ```sh
-cargo xtask test    # 14 in-QEMU + 51 host tests + the licensing check
+cargo xtask test    # 14 in-QEMU + 56 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 ```
