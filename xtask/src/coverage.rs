@@ -483,6 +483,44 @@ fn reject_malformed(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails when a crate carries a floor that this run did not measure.
+///
+/// Extracted from `check` so the refusal itself is testable. It was a `bail!`
+/// inline in a function that needs a real `cargo llvm-cov` run to reach, so
+/// nothing exercised it: deleting the whole block failed no test, and the gate
+/// that exists to stop a floor being silently unenforced was itself silently
+/// unenforced. That is the same shape as the licensing `verdict` extraction --
+/// a rule computed and then not acted on.
+///
+/// What remains untestable is the call site: a test cannot prove `check` still
+/// calls this. That limit is irreducible without an integration harness, and it
+/// is the reason the call is a bare `?` on its own line rather than something
+/// easy to drop during an edit.
+fn gate_unmeasured(
+    baseline: &BTreeMap<String, f64>,
+    measured: &BTreeMap<String, Lines>,
+) -> Result<()> {
+    let unmeasured = unmeasured_floors(baseline, measured);
+    if unmeasured.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{n} crate(s) have a coverage floor but produced no measurement:\n{list}\n\n\
+         A floor that is never measured is not enforced. Restore the crate: put it \
+         back in `MEASURED` and in the workspace, or fix whatever stopped it \
+         emitting coverage records. Only if it is genuinely gone, delete its floor \
+         deliberately with `cargo xtask coverage --update {flags}` -- which also \
+         deletes the recorded reason for that floor.",
+        n = unmeasured.len(),
+        list = render_unmeasured(&unmeasured),
+        flags = unmeasured
+            .iter()
+            .map(|(name, _)| format!("--drop-crate={name}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 /// Measures coverage and compares it against the committed floor.
 pub fn check(root: &Path, update: bool) -> Result<()> {
     let (measured, lcov) = measure(root)?;
@@ -615,24 +653,7 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
     // floor silently stops being enforced -- the ratchet reports success for a
     // crate it did not look at. Named explicitly, so removing a crate means
     // editing the baseline deliberately.
-    let unmeasured = unmeasured_floors(&baseline, &measured);
-    if !unmeasured.is_empty() {
-        bail!(
-            "{n} crate(s) have a coverage floor but produced no measurement:\n{list}\n\n\
-             A floor that is never measured is not enforced. Restore the crate: put it \
-             back in `MEASURED` and in the workspace, or fix whatever stopped it \
-             emitting coverage records. Only if it is genuinely gone, delete its floor \
-             deliberately with `cargo xtask coverage --update {flags}` -- which also \
-             deletes the recorded reason for that floor.",
-            n = unmeasured.len(),
-            list = render_unmeasured(&unmeasured),
-            flags = unmeasured
-                .iter()
-                .map(|(name, _)| format!("--drop-crate={name}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    }
+    gate_unmeasured(&baseline, &measured)?;
 
     if !improvements.is_empty() {
         println!("coverage improved:\n{}", improvements.join("\n"));
@@ -907,6 +928,31 @@ end_of_record
             vec!["qunix-sync".to_string()],
             "a drop inside the tolerance was written without a reason"
         );
+    }
+
+    #[test]
+    fn the_unmeasured_gate_actually_refuses() {
+        // `a_floor_with_no_measurement_is_reported` covers the computation.
+        // This covers the *refusal*, which was previously a `bail!` inline in
+        // `check` -- unreachable without a real `cargo llvm-cov` run, so
+        // deleting the entire block failed no test. The gate that stops a floor
+        // going silently unenforced was itself silently unenforced.
+        let baseline = BTreeMap::from([
+            ("qunix-mm".to_string(), 98.11),
+            ("qunix-gone".to_string(), 91.00),
+        ]);
+        let measured = BTreeMap::from([("qunix-mm".to_string(), Lines { hit: 9, found: 10 })]);
+
+        let err = gate_unmeasured(&baseline, &measured).unwrap_err().to_string();
+        assert!(err.contains("qunix-gone"), "the error does not name the crate: {err}");
+        assert!(
+            err.contains("--drop-crate=qunix-gone"),
+            "the error does not say how to resolve it deliberately: {err}"
+        );
+        // And the accepting direction, so the gate cannot be made to fire
+        // always -- which would be just as broken and would pass the above.
+        let complete = BTreeMap::from([("qunix-mm".to_string(), 98.11)]);
+        assert!(gate_unmeasured(&complete, &measured).is_ok());
     }
 
     #[test]
