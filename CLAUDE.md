@@ -158,10 +158,14 @@ LeakSanitizer.
 
 ## Gotchas already paid for
 
-- `static mut` access uses `&raw const` / `&raw mut`. Clippy's `deref_addrof`
-  suggestion is **wrong** here — taking a direct reference to a `static mut` is a
-  hard error under `static_mut_refs` in edition 2024. Those 13 warnings are
-  expected; do not "fix" them.
+- **`static mut` is gone as of M1 Task 1**, and is banned from here on. The GDT,
+  TSS, IDT and double-fault stack it held are per-CPU state, and sharing them
+  across CPUs is not a style question — two CPUs faulting onto one IST stack
+  corrupt each other. They live in `percpu::PerCpu` now, reached through `GS`.
+  The 13 `static_mut_refs` warnings M0 documented as expected are zero; if any
+  reappear, something reintroduced a shared mutable static. Use `UnsafeCell` in
+  a `Sync` newtype (see `percpu::BspCell`) when a static genuinely cannot be
+  allocated, and say who the single writer is.
 - The HHDM covers **RAM only**. Device MMIO (the LAPIC at `0xFEE00000`) is not
   mapped and must be mapped explicitly, uncacheable.
 - Limine's stack has **no guard page**. Stack overflow scribbles through memory
@@ -190,5 +194,11 @@ diverging. A plan written before the code is a hypothesis; the deviations are th
 result.
 
 M0 is complete. M1 is SMP, scheduling, address spaces and the first userspace
-process; its plan assumes M0's *planned* interfaces, several of which drifted, so
-reconcile it against the code before executing it.
+process. Its plan assumed M0's *planned* interfaces and five of them had
+drifted; the reconciliation is written up as Execution Deviation D1 in
+`docs/superpowers/plans/2026-08-04-m1-processes.md`. Read that before picking up
+a task — in particular, `gdt` exposes selector *accessors* rather than
+constants, `AddressSpace::from_root` is what the plan calls `new_empty`, and
+`qunix-abi` already exists and is consumed by `xtask`.
+
+M1 Task 1 (per-CPU state) is done. Tasks 2-11 are not started.

@@ -10,6 +10,72 @@
 
 **Tech Stack:** Rust (pinned nightly, edition 2024), `limine` 0.6.5 MP request for SMP bring-up, `x86_64` 0.15, naked functions via `#[unsafe(naked)]` + `naked_asm!`.
 
+## Execution Deviations
+
+Recorded as they are found, per CLAUDE.md. The plan was written against M0's
+*planned* interfaces; this section is the reconciliation against what M0
+actually landed, plus anything reality contradicted during execution.
+
+### D1 — Reconciliation before Task 1 (2026-08-05)
+
+Re-read of the M0 source as it shipped. Five assumptions in this plan are wrong:
+
+1. **`gdt::{KERNEL_CODE, USER_DATA}` do not exist as constants.** M0 landed
+   accessor *functions* — `kernel_code_selector()`, `kernel_data_selector()`,
+   `tss_selector()` — because the selectors are computed when the table is
+   built rather than being fixed indices. There are **no user segments at all**;
+   Task 8 must add them, not merely reference them. Tasks 1 and 8 are corrected
+   to call the accessors.
+
+2. **`AddressSpace::new_empty(hhdm_offset, root_pa)` does not exist.** M0 landed
+   `unsafe fn AddressSpace::from_root(hhdm_offset, root_pa)`, which is the same
+   thing under another name and is `unsafe` because it trusts `root_pa`. Task 7
+   uses `from_root`; `new_empty` is not added.
+
+3. **`AddressSpace::activate` does not exist.** Nothing in M0 ever reloads CR3 —
+   the kernel runs on the bootloader's tables. Task 7 must add it, and it is the
+   first code in the project to write CR3, so the TLB and the "are we still
+   mapped afterwards" question are live for the first time.
+
+4. **`qunix-abi` already exists.** Task 8 Step 1 says "create the ABI crate"; M0
+   created it for `ExitCode` and the `HOST_STATUS_*` values that `xtask` matches
+   on. Task 8 **extends** it. Nothing in it may be renamed without updating
+   `xtask/src/qemu.rs`, which is a host-side consumer.
+
+5. **`AddressSpace::translate` takes `&mut self`,** not `&self`, because the
+   `x86_64` crate's `OffsetPageTable` needs a mutable mapper. Any caller the
+   plan shows holding a shared borrow needs adjusting.
+
+Unchanged and confirmed: `frames::alloc(order) -> Option<u64>`,
+`unsafe frames::free(pa, order)`, `boot::hhdm_offset()`, `apic::eoi()`,
+`apic::TIMER_VECTOR`, `qunix_mm::PAGE_SIZE`, and the `SpinLock`/`IrqSpinLock`
+API. The `static mut` GDT/IDT the plan promises to remove are indeed still
+there, in `gdt.rs` and `idt.rs`.
+
+### D2 — The BSP cannot heap-allocate its per-CPU block (Task 1, 2026-08-05)
+
+The plan's `unsafe fn percpu::install(cpu_id)` `Box`es the block. That is
+impossible for the bootstrap processor. `gdt::init` runs at `kmain` line 101,
+*before* `frames::init` and `heap::init`, and it has to: a CPU with no IDT
+triple-faults on the first fault instead of printing a diagnostic, so the
+descriptor tables must exist before the allocators run, not after.
+
+Split into two entry points instead:
+
+- `unsafe fn percpu::install_bsp()` — uses a statically reserved block, so it
+  needs no allocator. Idempotent, because the in-QEMU harness brings the CPU up
+  once per test and `ltr` refuses an already-busy TSS descriptor, so the tables
+  must be rebuilt each time; `installed_count` is not incremented twice.
+- `unsafe fn percpu::install_ap(cpu_id)` — boxes and leaks, for Task 6's APs,
+  which start long after the heap is up.
+
+Linux splits it the same way and for the same reason.
+
+Also changed from the plan: `PerCpu` carries a `self_ptr` at offset 0x20.
+`gs:`-relative addressing can read *through* the base but cannot produce it, so
+recovering `&PerCpu` needs a pointer stored inside the block. The plan's
+`current()` had no way to work as written.
+
 ## Global Constraints
 
 - **MSRV:** `rust-version = "1.97"` in every crate manifest.

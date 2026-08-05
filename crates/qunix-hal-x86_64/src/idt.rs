@@ -4,48 +4,45 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 
 pub type HandlerFn = extern "x86-interrupt" fn(InterruptStackFrame);
 
-static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
-static mut INITIALISED: bool = false;
-
-/// Installs the IDT on the current CPU. Idempotent per CPU — the table is built
-/// once and reloaded on every CPU that calls this.
+/// Builds this CPU's IDT into `idt` and loads it.
 ///
-/// Must be called after [`crate::gdt::init`]: the double-fault gate sets an IST
-/// index, which only means anything once a TSS with a populated
-/// `interrupt_stack_table[0]` is loaded. Called first, a #DF would switch to a
-/// zeroed stack pointer and triple-fault. `gdt::init` is idempotent in the same
-/// per-CPU sense — it loads the GDT, the segment registers and the TSS on every
-/// call, not just the first — so this simply calls it rather than relying on
-/// the caller's ordering, and a CPU that reaches only `idt::init` still gets
-/// the TSS its IST index depends on.
-pub fn init() {
-    crate::gdt::init();
+/// Every CPU gets its own table. M0 shared one because there was only ever one
+/// CPU; sharing it now would mean `set_handler` mutating a table other CPUs are
+/// actively reading, with no way to sequence the write against their fetches.
+///
+/// Must be called *after* this CPU's GDT and TSS are loaded: the double-fault
+/// gate names an IST index, which only means anything once a TSS with a
+/// populated `interrupt_stack_table[0]` is live. Called first, a #DF would
+/// switch to a zeroed stack pointer and triple-fault. `percpu::finish_install`
+/// is what guarantees that order.
+///
+/// # Safety
+/// `idt` must live for as long as this CPU runs — the CPU keeps reading it via
+/// IDTR long after this returns — so it must not be moved or dropped. The
+/// caller stores it in the per-CPU block for exactly that reason.
+pub unsafe fn build_and_load(idt: &mut InterruptDescriptorTable) {
+    idt.breakpoint.set_handler_fn(breakpoint_handler);
+    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.general_protection_fault.set_handler_fn(gp_fault_handler);
+    idt.page_fault.set_handler_fn(page_fault_handler);
+    // SAFETY: the caller guarantees the table outlives this CPU.
     unsafe {
-        if *(&raw const INITIALISED) {
-            // Already built; just reload it on this CPU.
-            (*(&raw const IDT)).load();
-            return;
-        }
-        let idt = &mut *(&raw mut IDT);
-        idt.breakpoint.set_handler_fn(breakpoint_handler);
-        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-        idt.general_protection_fault.set_handler_fn(gp_fault_handler);
-        idt.page_fault.set_handler_fn(page_fault_handler);
         idt.double_fault
             .set_handler_fn(double_fault_handler)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
-        INITIALISED = true;
-        (*(&raw const IDT)).load();
+        let idt_static: &'static InterruptDescriptorTable =
+            &*(idt as *const InterruptDescriptorTable);
+        idt_static.load();
     }
 }
 
 /// Registers a handler for a hardware-interrupt vector.
 ///
 /// # Safety
-/// [`init`] must already have run on this CPU, and no other context may be
-/// concurrently in `init` or `set_handler` — this mutates a shared IDT the CPU
-/// is actively reading. Interrupts are masked internally for the duration of
-/// the descriptor write, so callers need not do so themselves.
+/// This CPU's per-CPU block must be installed. The write targets *this* CPU's
+/// table only, so it must be called on every CPU that needs the vector rather
+/// than once globally. Interrupts are masked internally for the duration of the
+/// descriptor write, so callers need not do so themselves.
 pub unsafe fn set_handler(vector: u8, handler: HandlerFn) {
     assert!(vector >= 32, "vector {vector} is reserved for exceptions");
     // A gate is 16 bytes and is written non-atomically. An interrupt arriving
@@ -53,7 +50,7 @@ pub unsafe fn set_handler(vector: u8, handler: HandlerFn) {
     // the duration. No `lidt` reload is needed: mutating an entry in the table
     // the IDTR already points at is enough.
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        let idt = &mut *(&raw mut IDT);
+        let idt = &mut crate::percpu::current_mut().idt;
         idt[vector].set_handler_fn(handler);
     });
 }

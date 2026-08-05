@@ -1,10 +1,13 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
+pub mod percpu;
 pub mod port;
 pub mod serial;
 

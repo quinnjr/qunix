@@ -98,11 +98,11 @@ pub extern "C" fn kmain() -> ! {
     assert!(boot::base_revision_supported(), "limine base revision unsupported");
     println!("qunix: booted");
 
-    qunix_hal_x86_64::gdt::init();
-    println!("qunix: gdt installed");
-
-    qunix_hal_x86_64::idt::init();
-    println!("qunix: idt installed");
+    // GDT, TSS and IDT are all per-CPU now and are installed together, because
+    // the IDT's double-fault gate names an IST index that only means anything
+    // once this CPU's TSS is loaded.
+    unsafe { qunix_hal_x86_64::percpu::install_bsp() };
+    println!("qunix: per-cpu block installed (cpu {})", qunix_hal_x86_64::percpu::cpu_id());
 
     // One walk, one number. The previous pair printed two slightly different
     // totals -- the raw memmap sum, then the allocator's -- because frames::init
@@ -150,6 +150,46 @@ fn halt_forever() -> ! {
 #[cfg(test)]
 mod tests {
     #[test_case]
+    fn percpu_block_is_reachable_and_reports_its_id() {
+        unsafe { qunix_hal_x86_64::percpu::install_bsp() };
+        assert_eq!(qunix_hal_x86_64::percpu::cpu_id(), 0);
+        assert_eq!(qunix_hal_x86_64::percpu::current().cpu_id, 0);
+
+        // Writing through the block must be visible on the next read, which is
+        // what proves `gs:` is pointing at the block rather than at zero.
+        unsafe { qunix_hal_x86_64::percpu::current_mut().kernel_rsp = 0xffff_ffff_dead_0000 };
+        assert_eq!(qunix_hal_x86_64::percpu::current().kernel_rsp, 0xffff_ffff_dead_0000);
+        unsafe { qunix_hal_x86_64::percpu::current_mut().kernel_rsp = 0 };
+    }
+
+    #[test_case]
+    fn percpu_reinstall_does_not_double_count_the_cpu() {
+        use qunix_hal_x86_64::percpu;
+        unsafe { percpu::install_bsp() };
+        let before = percpu::installed_count();
+        // The harness re-installs per test; a count that grew each time would
+        // make SMP bring-up wait for CPUs that do not exist.
+        unsafe { percpu::install_bsp() };
+        unsafe { percpu::install_bsp() };
+        assert_eq!(percpu::installed_count(), before, "reinstall counted a new CPU");
+        assert!(before >= 1, "the BSP was never counted");
+    }
+
+    #[test_case]
+    fn percpu_selectors_are_live_and_the_ist_canary_is_written() {
+        use qunix_hal_x86_64::{gdt, percpu};
+        unsafe { percpu::install_bsp() };
+        // The selectors must be the ones actually loaded, not zero: CS is what
+        // the CPU is executing under right now.
+        use x86_64::instructions::segmentation::Segment;
+        let cs = x86_64::instructions::segmentation::CS::get_reg();
+        assert_eq!(cs, gdt::kernel_code_selector(), "CS is not this CPU's code selector");
+        assert_ne!(gdt::tss_selector().0, 0, "TSS selector is null");
+        // `None` would mean install never ran; `Some(false)` a real overflow.
+        assert_eq!(gdt::ist_canary_intact(), Some(true));
+    }
+
+    #[test_case]
     fn backtrace_walks_at_least_one_kernel_frame() {
         #[inline(never)]
         fn depth_two() -> usize {
@@ -170,8 +210,7 @@ mod tests {
 
     #[test_case]
     fn exception_while_console_is_held_does_not_deadlock() {
-        qunix_hal_x86_64::gdt::init();
-        qunix_hal_x86_64::idt::init();
+        unsafe { qunix_hal_x86_64::percpu::install_bsp() };
         // Hold the console, then take an exception whose handler also prints.
         // Interrupts are maskable and IrqSpinLock handles them; exceptions are
         // NOT, so this is the case that can still self-deadlock.
@@ -200,15 +239,14 @@ mod tests {
     #[test_case]
     fn gdt_installs_expected_kernel_code_selector() {
         use x86_64::instructions::segmentation::{CS, Segment};
-        qunix_hal_x86_64::gdt::init();
+        unsafe { qunix_hal_x86_64::percpu::install_bsp() };
         // Entry 0 is the null descriptor, so kernel code lands at index 1 => 0x08.
         assert_eq!(CS::get_reg().0, 0x08);
     }
 
     #[test_case]
     fn breakpoint_exception_returns_to_caller() {
-        qunix_hal_x86_64::gdt::init();
-        qunix_hal_x86_64::idt::init();
+        unsafe { qunix_hal_x86_64::percpu::install_bsp() };
         // Reaching the line after `int3` proves the IDT is not broken enough to
         // triple-fault, but not that the gate is well-formed. The interrupt
         // flag is: an interrupt gate clears IF on entry and `iret` restores it
@@ -307,8 +345,7 @@ mod tests {
 
         crate::frames::init();
         crate::heap::init();
-        qunix_hal_x86_64::gdt::init();
-        qunix_hal_x86_64::idt::init();
+        unsafe { qunix_hal_x86_64::percpu::install_bsp() };
         crate::install_timer();
         crate::map_lapic();
         // SAFETY: map_lapic() has just mapped the LAPIC page uncacheable.
