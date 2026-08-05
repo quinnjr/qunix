@@ -36,11 +36,11 @@ blocks on hardware:
 - **No process reaping.** `PROCESSES` grows without bound. Harmless while
   nothing creates processes in a loop; not harmless once a shell does.
 
-### Carried limitations that are already stale
+### The carried-limitations list has been reconciled
 
-M1's "Known Limitations Carried Into M2" list is partly out of date, in the
-same way M0's planned interfaces had drifted by the time M1 consumed them
-(recorded there as Execution Deviation D1). Reconciled against the merged code:
+M1's "Known Limitations Carried Into M2" list was partly out of date when this
+spec was written — three of its seven entries described code that had already
+changed:
 
 | M1's claim | Actual state |
 | --- | --- |
@@ -48,10 +48,20 @@ same way M0's planned interfaces had drifted by the time M1 consumed them
 | No user-pointer validation beyond a range check | False. The range check is joined by a per-page mapping check, so an unmapped user pointer returns `BadAddress` rather than faulting in ring 0. |
 | `VmSpace::drop` reclaims only the PML4 frame | False. `owned: Vec<u64>` records every frame the address space allocated and drop returns all of them. |
 
-Still true, and in scope here: no TLB shootdown, APs idle, single global run
-queue, no process reaping. Also still true and **out** of scope: no FPU/SSE
-state is context-switched, and a process's address space is leaked on exit
-(Deviation D7).
+Those entries have been **removed at the source**, in
+`docs/superpowers/plans/2026-08-04-m1-processes.md`, rather than corrected only
+here. A handoff list that is wrong in one document and right in another is
+worse than one that is simply wrong, because the next reader has no way to know
+which is current.
+
+This is the same failure M1 hit and recorded as Execution Deviation D1: M0's
+*planned* interfaces had drifted from its shipped ones, and five assumptions
+had to be reconciled mid-milestone. Catching it during the spec costs an hour;
+catching it during Task 6 costs a deviation.
+
+In scope here: no TLB shootdown, APs idle, single global run queue, no process
+reaping. Out of scope and still true: no FPU/SSE context switching, and a
+process's address space is leaked on exit (Deviation D7).
 
 ## Design decisions
 
@@ -113,12 +123,36 @@ The straightforward alternative was wait queues — a thread sleeps, an ISR wake
 it, kernel code stays straight-line synchronous. That is what Linux and the BSDs
 do and it is meaningfully less work.
 
-Async was chosen because qunix exists to find where Rust stops helping with
-kernel work, and `async` in `no_std` with interrupt-context wakers is one of the
-sharpest places to look. The expected findings — the boxing problem above,
-waker construction under interrupts-off, and the fact that async colours every
-signature it touches — are the answer to the project's actual question. A
-milestone that avoided the hard case would have less to report.
+Async was chosen to answer a question the project was built to ask: **is an
+asynchronous kernel possible at all, and does Rust supply the primitives that
+make it testable?**
+
+That is a positive hypothesis, not a search for a limit. Nobody ships a
+mainstream general-purpose kernel built on `async`/`await` — Linux, the BSDs
+and Redox all use blocking primitives with a thread per blocked operation. The
+usual explanation is that the machinery is too costly to hand-build. In C it
+would be: a state machine per suspension point, written out by hand, with the
+compiler offering no help proving the resumption is correct and no way to name
+the type of a partially-completed operation.
+
+Rust makes the experiment tractable rather than merely tedious. `async fn`
+generates the state machines, `Pin` encodes the address-stability requirement
+those machines have in the type system rather than in a comment, and `Waker` is
+a stable interface an interrupt handler can call without knowing what it wakes.
+None of those are performance features; they are the reason the experiment can
+be attempted by one person in a milestone instead of being a research project.
+
+So M2 is a real test of that. If an async kernel is achievable, it should be
+achievable here — the workload is right (block I/O is exactly the latency the
+model exists for), the scale is small enough to hold in one head, and the
+language supplies the parts. If it is not achievable, the specific reason it
+fails is worth more than a working kernel built the ordinary way, and this
+milestone should report it plainly rather than quietly retreating to wait
+queues.
+
+The known costs are accepted going in, not discovered: the boxing problem
+above, waker construction with interrupts masked, and the fact that `async`
+colours every signature it touches.
 
 ### Wakers never allocate and never take a contended lock
 
@@ -214,8 +248,10 @@ produces one.
 - **Allocation in the writeback path.** Designed against from T5, not
   discovered at T11. The buffer cache must be able to write back without
   calling the general allocator.
-- **Wakers from interrupt context.** The sharpest unknown, and the one most
-  likely to produce a finding worth writing up.
+- **Wakers from interrupt context.** The sharpest unknown, and the point where
+  the async hypothesis is most likely to fail. If it does, the specific reason
+  is the milestone's most valuable output and must be written up rather than
+  worked around silently.
 - **Scope.** Twelve tasks, several larger than M1's. The prerequisites are
   sequenced first specifically so that a mid-milestone stop still leaves the
   kernel better than it started.

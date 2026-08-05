@@ -2919,15 +2919,40 @@ belonging to M2's reaping work, not something the ring-3 entry path can do.
 
 ## Known Limitations Carried Into M2
 
-- **Application processors are online but idle.** They install per-CPU state
-  and park. Making them schedule requires moving `sched::Scheduler::current`
-  and the run queue into `percpu::PerCpu`; see Execution Deviation D3.
+Reconciled against the merged branch (PR #4) on 2026-08-05. Three entries that
+appeared here when M1 was written are no longer true and have been removed
+rather than left to be believed: `sys_write` now takes a real user buffer,
+user pointers are checked for mapping and not merely for range, and
+`VmSpace::drop` returns every frame the address space allocated rather than
+only the PML4.
 
+The lesson is the one M1 itself paid for. This plan's Execution Deviation D1
+exists because M0's *planned* interfaces had drifted from its shipped ones by
+the time M1 consumed them, and five assumptions had to be reconciled
+mid-milestone. A handoff list is a claim about code, and it decays the moment
+the code moves. Check it before planning against it.
 
-1. **Application processors idle.** `smp::start_all` brings APs online but leaves them halted; they have no run queues. Per-CPU scheduling and work stealing use the `RunQueue::steal` already implemented here.
-2. **No TLB shootdown.** Unmapping still flushes only the local CPU. Now that there is more than one CPU, this is a live correctness bug rather than a theoretical one — it must be fixed before any address space is modified while shared.
-3. **Address spaces leak intermediate page tables.** `VmSpace::drop` reclaims only the PML4 frame.
-4. **No process reaping.** Exited threads are removed from the scheduler, but `PROCESSES` grows without bound.
-5. **`sys_write` takes a value, not a buffer.** There are no file descriptors until the M2 VFS exists; the syscall is a placeholder that proves the ABI path works.
-6. **No user-pointer validation beyond a range check.** Copying to and from userspace needs fault-tolerant accessors before any syscall accepts a real buffer.
-7. **Single global run queue behind one lock.** Correct but not scalable; replaced by per-CPU queues in M2.
+1. **Application processors are online but idle.** `smp::start_all` brings them
+   up and they install per-CPU state, then park. They have no run queues.
+   Making them schedule requires moving `sched::Scheduler::current` and the run
+   queue into `percpu::PerCpu`; see Execution Deviation D3. Per-CPU scheduling
+   and work stealing can use the `RunQueue::steal` already implemented here.
+2. **No TLB shootdown.** Unmapping flushes only the local CPU. Now that there
+   is more than one CPU this is a live correctness bug rather than a
+   theoretical one, and it must be fixed before any address space is modified
+   while shared.
+3. **No process reaping.** Exited threads are removed from the scheduler, but
+   `PROCESSES` grows without bound.
+4. **Single global run queue behind one lock.** Correct but not scalable.
+5. **A process's address space is leaked on exit.** `user_thread_entry` forgets
+   the `VmSpace` because `enter_user` never returns, and nothing reclaims it
+   afterwards. See Execution Deviation D7 — this became routine rather than
+   theoretical when `Sys::Exit` and the ring-3 fault path both started reaching
+   `exit_current`.
+6. **No FPU/SSE state is context-switched.** The kernel target is soft-float so
+   the kernel never writes those registers, which means a process's `xmm`
+   contents survive verbatim into the next process to run.
+
+Items 1 through 4 are in scope for M2 and sequenced ahead of its filesystem
+work; see `docs/superpowers/specs/2026-08-05-m2-filesystems-design.md`. Items 5
+and 6 are explicitly out of scope there.
