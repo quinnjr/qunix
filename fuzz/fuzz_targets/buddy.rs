@@ -91,7 +91,21 @@ enum Op {
     AddRegion { offset: u32, len: u32 },
     Alloc { order: u8 },
     /// Frees a live allocation, indexed modulo the live set.
-    Free { which: u16 },
+    ///
+    /// `reclaim` decides whether the block is immediately allocated back. It
+    /// exists because the arm unconditionally re-allocated, which meant `live`
+    /// could never shrink: every free was followed by a matching alloc, so the
+    /// allocator never held more than one adjacent free block and multi-level
+    /// coalescing -- the part with the interesting arithmetic -- was
+    /// unreachable by construction, in the same way the address-rounding did
+    /// for misaligned frees.
+    ///
+    /// Adding the field changed how `Arbitrary` consumes bytes, so every corpus
+    /// entry written before it decodes to a different sequence of ops. They
+    /// still load and still run; what they lose is the minimisation and the
+    /// coverage the fuzzer had accumulated for them, so the search effectively
+    /// restarts from those inputs as fresh seeds rather than from where it was.
+    Free { which: u16, reclaim: bool },
     /// Frees an address the allocator never handed out. This is a *supported*
     /// path — `free` is documented to reject foreign addresses rather than
     /// corrupt itself — so the assertion is that the counter moves and the
@@ -203,7 +217,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 admit(pa, order, &regions, &mut live);
             }
 
-            Op::Free { which } => {
+            Op::Free { which, reclaim } => {
                 // `free` deliberately asserts when no region has been added --
                 // pre-init the backing is a placeholder and `push` would write
                 // through a zero offset. Respecting that guard rather than
@@ -224,11 +238,21 @@ fuzz_target!(|ops: Vec<Op>| {
                 );
                 // Negative direction: a just-freed block sits at some order >=
                 // `order`, and alloc splits downward, so this must succeed.
-                // Without it, an allocator that regressed to always returning
-                // None would satisfy every other assertion in this file.
-                let again = buddy.alloc(order)
-                    .unwrap_or_else(|| panic!("alloc({order}) failed right after free({pa:#x})"));
-                admit(again, order, &regions, &mut live);
+                //
+                // Conditional, so the free set can actually grow. Doing it every
+                // time kept `live` at a fixed size and hid every coalescing path
+                // past the first level. The cost of making it conditional is that
+                // this is now only half the guard it was: an allocator that
+                // regressed to always returning `None` is caught here on the
+                // `reclaim == true` ops, and by the end-of-run `alloc(0)` check,
+                // but not by the `reclaim == false` half, which asserts nothing
+                // about allocation succeeding.
+                if reclaim {
+                    let again = buddy.alloc(order).unwrap_or_else(|| {
+                        panic!("alloc({order}) failed right after free({pa:#x})")
+                    });
+                    admit(again, order, &regions, &mut live);
+                }
             }
 
             Op::FreeForeign { offset, order } => {

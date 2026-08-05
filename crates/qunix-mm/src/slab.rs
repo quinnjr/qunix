@@ -87,8 +87,15 @@ impl SlabHeap {
     /// second call would orphan everything handed out from the first.
     ///
     /// # Safety
-    /// `va..va + len` must be mapped, writable, and owned exclusively by the
-    /// heap. Must be called at most once, before any allocation.
+    /// `va..va + len` must be mapped, writable, owned exclusively by the heap,
+    /// and must not wrap the address space. Must be called at most once,
+    /// before any allocation.
+    ///
+    /// # Panics
+    /// Both requirements are asserted rather than assumed, so violating them
+    /// aborts rather than being undefined behaviour. A wrapping range was
+    /// previously absorbed by taking nothing, which left the heap permanently
+    /// empty and surfaced much later as an unrelated allocation failure.
     pub unsafe fn set_backing(&mut self, va: usize, len: usize) {
         // The "at most once" rule above is load-bearing, so it is enforced
         // rather than merely documented: a second call orphans every block

@@ -97,12 +97,14 @@ impl Segment<'_> {
     /// This is `.bss`. A loader that maps `mem_size` but only zeroes what the
     /// file supplied leaves the rest holding whatever the frame previously
     /// contained, which is an information leak across the ring boundary.
+    ///
+    /// Saturates rather than underflowing. `parse` rejects `filesz > memsz`, so
+    /// a `Segment` from [`Elf64::segments`] cannot reach that case; the fields
+    /// are `pub`, and a caller-built one with `data.len() > mem_size` returns
+    /// `0` here instead of wrapping to ~16 EiB in a build without overflow
+    /// checks. It does not report that the `Segment` was malformed, so validate
+    /// before constructing one by hand.
     pub fn zero_fill(&self) -> u64 {
-        // Saturating, not plain subtraction. `parse` rejects `filesz > memsz`
-        // so a `Segment` this crate produced can never underflow here -- but
-        // the fields are `pub`, and a caller-built one that did would return
-        // ~16 exabytes in release, where the kernel builds without overflow
-        // checks. A loader trusting that would zero the address space.
         self.mem_size.saturating_sub(self.data.len() as u64)
     }
 }

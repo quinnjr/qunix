@@ -32,6 +32,14 @@ pub struct Thread {
     /// The thread's kernel stack. `Option` so `reap` can drop it without
     /// dropping the bookkeeping that says the thread is gone.
     pub stack: Option<Box<[u8]>>,
+    /// Top of this thread's kernel stack, or 0 for a thread that adopted the
+    /// stack the CPU booted on.
+    ///
+    /// The scheduler programs this into `TSS.rsp0` and the syscall stub's slot
+    /// on every switch. It has to be per-thread: a single value set once means
+    /// the second user thread to enter ring 3 traps onto the *first* thread's
+    /// stack, and both then scribble through each other's kernel frames.
+    pub kernel_stack_top: u64,
     pub state: ThreadState,
     pub priority: Priority,
 }
@@ -67,7 +75,13 @@ impl Thread {
         // and `stack_top` lies inside it and is 16-aligned.
         let ctx = unsafe { context::init_kernel_stack(stack_top, entry, arg) };
 
-        Self { context: ctx, stack: Some(stack), state: ThreadState::Ready, priority }
+        Self {
+            context: ctx,
+            stack: Some(stack),
+            kernel_stack_top: stack_top,
+            state: ThreadState::Ready,
+            priority,
+        }
     }
 
     /// The idle thread for a CPU: no stack of its own is prepared because it
@@ -79,6 +93,7 @@ impl Thread {
         Self {
             context: core::ptr::null_mut(),
             stack: None,
+            kernel_stack_top: 0,
             state: ThreadState::Running,
             priority: Priority::Idle,
         }

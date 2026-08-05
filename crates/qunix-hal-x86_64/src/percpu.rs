@@ -17,9 +17,11 @@
 //!
 //! # Fixed offsets
 //!
-//! Three of these fields are reached from assembly by `gs:[N]`, before any Rust
-//! runs and before a stack exists: `kernel_rsp` and `user_rsp` by the `SYSCALL`
-//! entry stub, and `self_ptr` by `self_ptr()` below. `cpu_id` and
+//! Three fields are reached through `gs:[N]` rather than through a `&PerCpu`.
+//! `kernel_rsp` and `user_rsp` by the `SYSCALL` entry stub, which runs before
+//! any Rust and before a stack exists; `self_ptr` by `self_ptr()` below, which
+//! is ordinary Rust but is how a `&PerCpu` is produced at all -- `gs:`
+//! addressing can read through the base but cannot yield it. `cpu_id` and
 //! `current_thread` are pinned alongside them so the scheduler can reach them
 //! the same way without a later reshuffle.
 //!
@@ -209,12 +211,21 @@ unsafe fn finish_install(block: &mut PerCpu, cpu_id: u32) {
     let base = block as *mut PerCpu as u64;
     unsafe {
         write_msr(IA32_GS_BASE, base);
-        // Both MSRs hold the block address, and that is now a requirement
-        // rather than a transitional convenience: `enter_user` does not
-        // `swapgs` before `iretq`, so ring 3 runs with `GS_BASE` still naming
-        // the kernel block, and the entry stub's `swapgs` pair only works
-        // because the two are equal. Changing either means changing
-        // `enter_user`.
+        // Both MSRs hold the block address. `enter_user` does not `swapgs`
+        // before `iretq`, so ring 3 runs with `GS_BASE` naming the kernel
+        // block, and the syscall stub's `swapgs` pair only works because the
+        // two are equal.
+        //
+        // `KERNEL_GS_BASE` is the authoritative copy, and that is what makes
+        // the arrangement survivable. Ring 3 can zero the *hidden* `GS.base`
+        // with three bytes -- `xor eax, eax; mov gs, ax` -- because loading a
+        // segment register from ring 3 reloads the base from the descriptor.
+        // Nothing prevents that and nothing should try to. What matters is
+        // that no kernel entry path trusts `GS_BASE` on arrival: the syscall
+        // stub reloads it via `swapgs`, and every interrupt and exception
+        // handler reachable from ring 3 calls `restore_gs_base` before its
+        // first `gs:` access. `KERNEL_GS_BASE` is writable only in ring 0, so
+        // it is the one copy ring 3 cannot touch.
         write_msr(IA32_KERNEL_GS_BASE, base);
     }
 
@@ -229,6 +240,51 @@ unsafe fn finish_install(block: &mut PerCpu, cpu_id: u32) {
 
 /// # Safety
 /// `msr` must be a writable MSR and `value` valid for it.
+/// # Safety
+/// `msr` must be readable.
+unsafe fn read_msr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags),
+        )
+    };
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Repoints `GS_BASE` at this CPU's block, from the copy ring 3 cannot write.
+///
+/// Ring 3 can clear the hidden `GS.base` with `mov gs, ax`, so a handler
+/// entered from ring 3 cannot assume `gs:` resolves to anything. Every
+/// interrupt and exception handler that can be entered from ring 3 must call
+/// this before its first `gs:` access, or it dereferences a base the faulting
+/// process chose -- under that process's own page tables.
+///
+/// Deliberately *not* `swapgs`. `swapgs` is an exchange, so it is only correct
+/// when paired with a second one on the way out and only when the caller knows
+/// which side it is on; getting either wrong silently hands the kernel a user
+/// value. This reads `KERNEL_GS_BASE`, which is ring-0-only, and writes
+/// `GS_BASE` -- idempotent, unpaired, and correct whether or not ring 3
+/// actually clobbered anything. It costs an `rdmsr`/`wrmsr` pair on entry,
+/// which at the 100 Hz timer and on a fault path is not a measurable cost.
+///
+/// # Safety
+/// This CPU's per-CPU block must have been installed, so `KERNEL_GS_BASE`
+/// holds its address.
+pub unsafe fn restore_gs_base() {
+    // SAFETY: the caller guarantees the block is installed, so this MSR holds
+    // its address; writing that same address to `GS_BASE` restores the
+    // invariant every `gs:` access in the kernel depends on.
+    unsafe {
+        let base = read_msr(IA32_KERNEL_GS_BASE);
+        write_msr(IA32_GS_BASE, base);
+    }
+}
+
 unsafe fn write_msr(msr: u32, value: u64) {
     unsafe {
         core::arch::asm!(

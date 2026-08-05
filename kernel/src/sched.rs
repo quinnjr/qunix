@@ -205,6 +205,7 @@ fn schedule(outgoing_state: ThreadState) {
     // Raw pointers are copied out under the lock and used after it is dropped;
     // see the module docs on why the lock cannot span the switch.
     let (from_slot, to_ctx): (*mut *mut Context, *mut Context);
+    let incoming_stack_top: u64;
 
     {
         let mut sched = SCHED.lock();
@@ -256,6 +257,7 @@ fn schedule(outgoing_state: ThreadState) {
             panic!("run queue holds {next:?}, which is not a live thread");
         };
         next_thread.state = ThreadState::Running;
+        incoming_stack_top = next_thread.kernel_stack_top;
         to_ctx = next_thread.context;
         assert!(!to_ctx.is_null(), "{next:?} has no saved context to resume");
 
@@ -267,6 +269,18 @@ fn schedule(outgoing_state: ThreadState) {
             .get_mut(&current)
             .expect("the running thread is not in the table");
         from_slot = &raw mut outgoing.context;
+    }
+
+    // The incoming thread's kernel stack is programmed *before* the switch, so
+    // it is in place the moment that thread runs. A thread that adopted the
+    // boot stack reports 0 and is skipped: it never enters ring 3, so nothing
+    // traps back onto a stack it would have to name, and writing 0 into
+    // `TSS.rsp0` would point the next ring-3 trap at the null page.
+    if incoming_stack_top != 0 {
+        // SAFETY: the value came from the incoming thread's own stack
+        // allocation, which the scheduler's table keeps alive for as long as
+        // the thread exists.
+        unsafe { qunix_hal_x86_64::percpu::set_kernel_stack(incoming_stack_top) };
     }
 
     // Lock released. From here the outgoing thread stops running and does not

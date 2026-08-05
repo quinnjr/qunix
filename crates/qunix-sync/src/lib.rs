@@ -216,19 +216,18 @@ impl<T: ?Sized, I: IrqControl> Drop for IrqSpinLockGuard<'_, T, I> {
     }
 }
 
-/// Compile-time assertions on the guards' auto-traits.
-///
-/// These are the properties that make the locks sound, and they are invisible
-/// in ordinary tests: an accidental auto-derive would compile and pass every
-/// runtime test while allowing a data race. Kept outside `#[cfg(test)]` so they
-/// are checked on every build, including the kernel target.
 /// `IrqControl` that masks nothing.
 ///
 /// Used by the auto-trait assertions below, and by the host tests: it makes
-/// `IrqSpinLock`'s own logic — the guard lifecycle, the `try_lock` restore
-/// path — testable off the machine, which is otherwise reachable only from the
-/// kernel where a failure is a hang rather than an assertion.
-pub struct NoIrq;
+/// `IrqSpinLock`'s guard lifecycle testable off the machine, which is
+/// otherwise reachable only from the kernel where a failure is a hang rather
+/// than an assertion. It cannot witness the *restore* half of the contract —
+/// its `restore` is empty — so that is covered by the tests' `CountingIrq`.
+///
+/// Deliberately not `pub`: an `IrqSpinLock<T, NoIrq>` in kernel code is a lock
+/// that does not mask interrupts while reading as though it does, which is the
+/// self-deadlock this whole type exists to prevent.
+pub(crate) struct NoIrq;
 impl IrqControl for NoIrq {
     fn disable_and_save() -> bool {
         false
@@ -236,6 +235,12 @@ impl IrqControl for NoIrq {
     fn restore(_: bool) {}
 }
 
+/// Compile-time assertions on the guards' auto-traits.
+///
+/// These are the properties that make the locks sound, and they are invisible
+/// in ordinary tests: an accidental auto-derive would compile and pass every
+/// runtime test while allowing a data race. Kept outside `#[cfg(test)]` so they
+/// are checked on every build, including the kernel target.
 const _: () = {
     const fn assert_sync<T: Sync>() {}
     const fn assert_send<T: Send>() {}
@@ -243,11 +248,14 @@ const _: () = {
     // The locks themselves are shareable and sendable for `T: Send`.
     let _ = assert_sync::<SpinLock<u32>>;
     let _ = assert_send::<SpinLock<u32>>;
-    // The IRQ guard's `!Send` requirement is sharper than the plain guard's --
-    // dropping it on another CPU would restore an interrupt flag captured
-    // elsewhere -- so it is asserted too rather than assumed to follow.
-    let _ = assert_sync::<IrqSpinLockGuard<'static, u32, NoIrq>>;
+    // The same two properties, restated for the IRQ pair: they are separate
+    // types with separate `PhantomData`, so an omission in one is not caught by
+    // the other. The guard's `!Send` -- sharper here, since dropping it on
+    // another CPU would restore a flag captured elsewhere -- is still enforced
+    // only by `PhantomData<*const ()>`, for the reason given below.
+    let _ = assert_sync::<IrqSpinLock<u32, NoIrq>>;
     let _ = assert_send::<IrqSpinLock<u32, NoIrq>>;
+    let _ = assert_sync::<IrqSpinLockGuard<'static, u32, NoIrq>>;
     // A guard over a `Sync` payload is shareable...
     let _ = assert_sync::<SpinLockGuard<'static, u32>>;
     // ...but no guard is ever `Send`. There is no positive way to assert the
@@ -293,13 +301,52 @@ mod tests {
         assert_eq!(*lock.lock(), 6, "the write through the guard was lost");
     }
 
+    // Thread-local, not global: the counters are read as a baseline and then
+    // asserted to have moved by exactly one. Process-wide statics would make
+    // that assertion depend on no *other* test using `CountingIrq`
+    // concurrently, which the default parallel harness does not guarantee.
+    thread_local! {
+        static DISABLES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        static RESTORES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Counts its calls, so the *restore* half of the contract is observable.
+    ///
+    /// `NoIrq` cannot serve here: its `restore` is empty, so deleting the
+    /// `I::restore(was_enabled)` from `try_lock`'s failure arm would leave any
+    /// test built on it green.
+    struct CountingIrq;
+    impl IrqControl for CountingIrq {
+        fn disable_and_save() -> bool {
+            DISABLES.with(|c| c.set(c.get() + 1));
+            true
+        }
+        fn restore(_: bool) {
+            RESTORES.with(|c| c.set(c.get() + 1));
+        }
+    }
+
     #[test]
     fn irq_spinlock_try_lock_restores_state_when_it_fails() {
-        // The failure path calls `I::restore` before returning `None`; a
-        // version that forgot would leave interrupts masked on every miss.
-        let lock: IrqSpinLock<u32, NoIrq> = IrqSpinLock::new(0);
+        let lock: IrqSpinLock<u32, CountingIrq> = IrqSpinLock::new(0);
         let held = lock.lock();
+        let disables = DISABLES.with(|c| c.get());
+        let restores = RESTORES.with(|c| c.get());
+
         assert!(lock.try_lock().is_none());
+        // The failed attempt saved the flag and must have given it back. A
+        // version that forgot would leave interrupts masked on every miss.
+        assert_eq!(
+            DISABLES.with(|c| c.get()),
+            disables + 1,
+            "try_lock did not save the flag"
+        );
+        assert_eq!(
+            RESTORES.with(|c| c.get()),
+            restores + 1,
+            "the failed try_lock did not restore the flag it saved"
+        );
+
         drop(held);
         assert!(lock.try_lock().is_some(), "the lock stayed held after a failed try_lock");
     }

@@ -19,6 +19,83 @@ use alloc::vec::Vec;
 use qunix_hal_x86_64::paging::{AddressSpace, MapError, PageFlags};
 use qunix_mm::PAGE_SIZE;
 
+/// One past the highest address a user mapping may name.
+///
+/// Enforced here rather than at each caller because this is the layer that
+/// knows the kernel half is shared *by reference*: entries 256..512 are copied
+/// from the kernel's own root, so a "user" mapping above this bound either
+/// writes through the kernel's existing tables or installs a user-accessible
+/// leaf into tables every other address space and every CPU also walks. The
+/// second case is worse than it looks -- `Drop` then frees the frame while that
+/// global mapping is still live.
+/// Everything from here to `0xffff_7fff_ffff_ffff` is also the non-canonical
+/// hole, and touching it raises #GP -- a fault this kernel has no handler that
+/// can recover from, so the same bound keeps a process from halting the machine
+/// with a pointer that is neither kernel memory nor its own. That is why
+/// [`crate::syscall`] validates user pointers against this constant rather than
+/// against a bound of its own.
+pub const USER_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// Lowest address a user mapping may name.
+///
+/// The null page stays unmapped so that a null dereference in a user program
+/// faults. `USER_TEXT`'s placement documents that guarantee, but placement
+/// alone does not enforce it: an ELF with `p_vaddr = 0` would map page zero
+/// user-writable and quietly void it.
+///
+/// Deliberately beside [`USER_MAX`]. The bug this pair closes is that only the
+/// upper end was ever checked -- a guard applied to one of two ends is the
+/// shape of hole this kernel has already shipped, so both ends live in one
+/// place and every caller checks both.
+pub const USER_MIN: u64 = 0x1000;
+
+/// The page-table root the kernel booted on.
+///
+/// Recorded once, because CR3 is not a reliable source for it: a user thread
+/// activates its own space and never switches back, so by the time a *second*
+/// process is created the "current" root is the first process's. Copying the
+/// kernel half from that still works by accident today -- the halves are
+/// identical -- but it makes every new address space depend on a page table
+/// owned by an unrelated process, and it silently stops working the moment the
+/// kernel half is ever modified after boot.
+static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records the root CR3 held at boot, and returns it.
+///
+/// # Safety
+/// Must be called on the kernel's own tables, before anything activates a
+/// [`VmSpace`].
+pub unsafe fn record_kernel_root() -> u64 {
+    let hhdm = crate::boot::hhdm_offset();
+    // SAFETY: the caller guarantees CR3 holds the kernel's tables.
+    let root = unsafe { AddressSpace::active(hhdm).root_frame() };
+    KERNEL_ROOT.store(root, core::sync::atomic::Ordering::Release);
+    root
+}
+
+/// Switches this CPU back to the kernel's own page tables.
+///
+/// Called when a process's thread stops running on its address space. Without
+/// it the kernel keeps executing on a dead process's tables, which is only
+/// survivable while the kernel half is shared and identical.
+///
+/// # Safety
+/// The kernel half must map this code and the current stack, which is what
+/// makes the CR3 write survivable. It always does — that is the invariant
+/// `copy_kernel_half` exists to maintain.
+pub unsafe fn activate_kernel_root() {
+    let root = KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire);
+    // Not a silent return. Both callers -- `exit` and the user-fault path --
+    // continue as if the CPU had been switched off the dying process's tables,
+    // so returning here reinstates exactly the bug this function was added to
+    // prevent: the kernel running on page tables that are about to be freed.
+    assert_ne!(root, 0, "activate_kernel_root before record_kernel_root");
+    let hhdm = crate::boot::hhdm_offset();
+    // SAFETY: `root` was the live kernel root when it was recorded, and the
+    // kernel never frees it.
+    unsafe { AddressSpace::from_root(hhdm, root).activate() };
+}
+
 /// An address space this kernel allocated and is responsible for.
 pub struct VmSpace {
     space: AddressSpace,
@@ -52,8 +129,17 @@ impl VmSpace {
 
         // SAFETY: `root_pa` is an exclusively-owned, zeroed 4 KiB frame.
         let mut space = unsafe { AddressSpace::from_root(hhdm, root_pa) };
-        // SAFETY: CR3 currently holds the kernel's tables.
-        let kernel = unsafe { AddressSpace::active(hhdm) };
+        // The recorded boot root, not CR3 -- see `KERNEL_ROOT`. There is no
+        // fallback to the active root: once a user thread is running, CR3 is
+        // that process's, and copying a kernel half out of it is the dependency
+        // `KERNEL_ROOT` exists to break. This crate is a `no_std` binary with no
+        // host tests, so every `#[test_case]` runs in QEMU after `boot` has
+        // called `record_kernel_root`; nothing can legitimately reach here
+        // first.
+        let recorded = KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire);
+        assert_ne!(recorded, 0, "VmSpace::new before record_kernel_root");
+        // SAFETY: `recorded` is the kernel's own root, which is never freed.
+        let kernel = unsafe { AddressSpace::from_root(hhdm, recorded) };
         // SAFETY: `kernel` is the running kernel's address space by construction.
         unsafe { space.copy_kernel_half(&kernel) };
 
@@ -76,6 +162,16 @@ impl VmSpace {
         writable: bool,
         executable: bool,
     ) -> Result<(), MapError> {
+        // Both ends. The upper one keeps a "user" mapping out of the shared
+        // kernel half; the lower one keeps the null page unmapped. See
+        // `USER_MAX` and `USER_MIN`.
+        //
+        // `NotUserAddress`, not `Misaligned`: the latter is documented in
+        // `paging` as meaning page alignment, so reporting it here left a
+        // caller unable to tell `0x401` from a kernel address.
+        if va >= USER_MAX || va < USER_MIN {
+            return Err(MapError::NotUserAddress);
+        }
         let mut flags = PageFlags::PRESENT | PageFlags::USER;
         if writable {
             flags = flags | PageFlags::WRITABLE;

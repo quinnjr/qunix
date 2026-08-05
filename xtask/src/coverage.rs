@@ -187,22 +187,55 @@ pub fn parse_baseline(text: &str) -> BTreeMap<String, f64> {
 /// was known to be wrong, so the record of the mistake vanished rather than
 /// being corrected. CONTRIBUTING requires that reason to exist; the tool must
 /// therefore preserve it rather than rely on nobody running `--update`.
+/// The generated file header. Written by `render_baseline`, recognised
+/// line-for-line by `strip_header`, so the two cannot drift apart.
+const HEADER: &str = "\
+# Per-crate line coverage floor. A change may raise these or hold them.
+#
+# Any drop, however small, needs a `#` comment directly above that
+# crate's line *beginning* with the new figure and saying which code is
+# uncoverable and why; `cargo xtask coverage --update` refuses to write
+# one otherwise. The tolerance in xtask/src/coverage.rs applies to
+# reading a floor, so a noisy measurement does not fail a build; it
+# does not authorise lowering one.
+";
+
+/// Drops the leading lines of a comment block that are the file header.
+///
+/// Each leading line is matched against the lines of [`HEADER`] individually,
+/// rather than testing the block's first line and discarding the whole block.
+/// That test threw away a note written directly under the header with no blank
+/// line between them — the same "file can reach a state no edit fixes" the
+/// header rule was introduced to remove, since the ratchet's own error message
+/// tells users to write exactly such a note above a crate's line.
+///
+/// Matched as a set, not in order, so reflowing the header does not turn it into
+/// a note. A line that is *not* header text ends the header, and everything from
+/// there on is the crate's note.
+fn strip_header(pending: &[String]) -> &[String] {
+    let header: Vec<&str> = HEADER.lines().map(str::trim).collect();
+    let end = pending.iter().position(|l| !header.contains(&l.trim())).unwrap_or(pending.len());
+    &pending[end..]
+}
+
 fn existing_notes(text: &str) -> BTreeMap<String, Vec<String>> {
     let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pending: Vec<String> = Vec::new();
-    // The file header is the comment block at the very top. It belongs to no
-    // crate, and attributing it to the first one duplicates it on every
-    // subsequent render -- which is what happened: the header ended up inside
-    // `qunix-hal-x86_64`'s note block. A blank line normally separates them,
-    // but relying on that made the rule depend on formatting nobody enforces.
+    // The file header belongs to no crate, and attributing it to the first one
+    // duplicates it on every subsequent render -- which is what happened: the
+    // header ended up inside `qunix-hal-x86_64`'s note block. A blank line
+    // normally separates them, but relying on that made the rule depend on
+    // formatting nobody enforces. Identified by content, and only the lines
+    // that are the header: whatever follows them is a note and is kept.
     let mut at_header = true;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
             pending.push(line.to_string());
         } else if let Some((name, _)) = trimmed.split_once('=') {
-            if !pending.is_empty() && !at_header {
-                notes.insert(name.trim().trim_matches('"').to_string(), std::mem::take(&mut pending));
+            let note = if at_header { strip_header(&pending) } else { &pending[..] };
+            if !note.is_empty() {
+                notes.insert(name.trim().trim_matches('"').to_string(), note.to_vec());
             }
             pending.clear();
             at_header = false;
@@ -217,16 +250,7 @@ fn existing_notes(text: &str) -> BTreeMap<String, Vec<String>> {
 }
 
 fn render_baseline(measured: &BTreeMap<String, Lines>, notes: &BTreeMap<String, Vec<String>>) -> String {
-    let mut out = String::from(
-        "# Per-crate line coverage floor. A change may raise these or hold them,\n\
-         # never drop them by more than the tolerance in xtask/src/coverage.rs.\n\
-         #\n\
-         # Regenerate with `cargo xtask coverage --update` when coverage\n\
-         # genuinely improves, or when a crate gains code that cannot be covered\n\
-         # at all -- xtask command dispatch that only spawns cargo is the usual\n\
-         # case. The second kind of update belongs in a PR that says which code\n\
-         # is uncoverable and why.\n",
-    );
+    let mut out = String::from(HEADER);
     for (name, lines) in measured {
         out.push('\n');
         for note in notes.get(name).into_iter().flatten() {
@@ -266,7 +290,7 @@ fn lowering_without_reason(
     old: &BTreeMap<String, f64>,
     measured: &BTreeMap<String, Lines>,
     notes: &BTreeMap<String, Vec<String>>,
-) -> Vec<String> {
+) -> Vec<(String, f64, f64)> {
     measured
         .iter()
         .filter(|(name, lines)| {
@@ -280,12 +304,20 @@ fn lowering_without_reason(
             }
             // The reason has to name the number it is justifying. Without
             // that, a stale note keeps authorising every future drop.
+            // The figure must *head* the note, not merely appear in it. A
+            // substring match let `# 97.335 ...` authorise a drop to 97.33, and
+            // the house style of recording a transition (`# 25.00 -> 24.90`)
+            // meant the note kept authorising a return to the old value forever.
             let figure = format!("{:.2}", round2(lines.percent()));
-            !notes
-                .get(*name)
-                .is_some_and(|note| note.iter().any(|line| line.contains(&figure)))
+            !notes.get(*name).and_then(|note| note.first()).is_some_and(|first| {
+                let rest = first.trim_start_matches('#').trim_start();
+                // The figure must be followed by something that is not another
+                // digit, or `97.335` still satisfies a required `97.33`.
+                rest.strip_prefix(&figure)
+                    .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit()))
+            })
         })
-        .map(|(name, _)| name.clone())
+        .map(|(name, lines)| (name.clone(), round2(lines.percent()), old[name]))
         .collect()
 }
 
@@ -314,6 +346,58 @@ fn render_uncovered(regressed: &[String], uncovered: &BTreeMap<String, Vec<Strin
     detail
 }
 
+/// Crates that carry a floor but produced no measurement.
+///
+/// The comparison loop walks what was measured, so a crate missing from the
+/// report is never compared against its floor at all — the ratchet prints
+/// success for a crate it did not look at. The genuine triggers are a crate
+/// dropped from `MEASURED` (or from the workspace) while its baseline line
+/// stays, a rename, and a crate that emits no `SF:` records at all. A crate
+/// whose *tests fail to link* is not one of them: `measure` bails on a non-zero
+/// `cargo llvm-cov` exit long before this runs. Split out from `check` so the
+/// condition can be tested without running `cargo llvm-cov`.
+fn unmeasured_floors(
+    baseline: &BTreeMap<String, f64>,
+    measured: &BTreeMap<String, Lines>,
+) -> Vec<(String, f64)> {
+    baseline
+        .iter()
+        .filter(|(name, _)| !measured.contains_key(*name))
+        .map(|(name, floor)| (name.clone(), *floor))
+        .collect()
+}
+
+fn render_unmeasured(unmeasured: &[(String, f64)]) -> String {
+    unmeasured
+        .iter()
+        .map(|(name, floor)| format!("  {name:<20} floor {floor:.2}%  (no coverage reported)"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Crate names the caller explicitly authorised a floor to be deleted for.
+///
+/// `--update` rewrites the baseline from what was measured, so a crate that has
+/// vanished from the report loses its floor *and* the recorded reason for it,
+/// silently. The read-only path's error message used to recommend `--update` as
+/// the way to clear such a line, which made "the crate disappeared for a bad
+/// reason" fixable by the command the ratchet itself suggested — the same shape
+/// as widening the tolerance to make a red build green. Deleting a floor now
+/// takes naming the crate.
+///
+/// Read from the process arguments rather than added to `check`'s signature
+/// because the dispatch in `main` collapses the command line to a single
+/// `update` flag; the parsing is a pure function so the rule is testable without
+/// running a process. Only the `--drop-crate=<name>` form is accepted, so a
+/// crate name can never be swallowed from an adjacent argument.
+fn dropped_crates(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter_map(|a| a.strip_prefix("--drop-crate="))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// Measures coverage and compares it against the committed floor.
 pub fn check(root: &Path, update: bool) -> Result<()> {
     let (measured, lcov) = measure(root)?;
@@ -328,16 +412,75 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
         // lowered on a justification that turned out to be false, and nothing
         // caught it.
         let old = parse_baseline(&previous);
+        // The rewrite renders only what was measured, so a floor with no
+        // measurement disappears together with its note. That is exactly the
+        // deletion the read-only path refuses, so it is refused here too --
+        // otherwise the escape hatch the ratchet advertises is also the way
+        // round it. Naming the crate is the opt-in.
+        let unmeasured = unmeasured_floors(&old, &measured);
+        let authorised = dropped_crates(&std::env::args().collect::<Vec<_>>());
+        let unauthorised: Vec<(String, f64)> = unmeasured
+            .iter()
+            .filter(|(name, _)| !authorised.contains(name))
+            .cloned()
+            .collect();
+        if !unauthorised.is_empty() {
+            bail!(
+                "refusing to delete {n} floor(s) that produced no measurement:\n{list}\n\n\
+                 A crate usually stops being measured because something broke: it left \
+                 the workspace, it was renamed, or it emits no coverage records. Restore \
+                 it, or if it is genuinely gone, say so:\n  \
+                 cargo xtask coverage --update {flags}\n\
+                 Deleting the line also deletes the recorded reason for its floor.",
+                n = unauthorised.len(),
+                list = render_unmeasured(&unauthorised),
+                flags = unauthorised
+                    .iter()
+                    .map(|(name, _)| format!("--drop-crate={name}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         let undocumented = lowering_without_reason(&old, &measured, &notes);
         if !undocumented.is_empty() {
+            // The figures are in the message because the read-only path prints
+            // nothing for a drop inside TOLERANCE_PP, so a user blocked here
+            // would otherwise have to run `cargo llvm-cov` by hand to discover
+            // the number they are required to write down.
+            let mut detail = String::new();
+            for (name, now, floor) in &undocumented {
+                detail.push_str(&format!(
+                    "\n  {name}: {now:.2}% (floor {floor:.2}%) -- the comment above \
+                     `{name}` in {BASELINE} must begin `# {now:.2}`"
+                ));
+            }
             bail!(
-                "refusing to lower the floor for {}.\n\n\
-                 Add a `#` comment directly above that crate's line in {BASELINE} that \
-                 names the new figure and says which code is uncoverable and why, then \
-                 re-run. The reason has to mention the number so a note written for an \
-                 earlier drop cannot keep authorising later ones.",
-                undocumented.join(", ")
+                "refusing to lower a floor without a recorded reason:{detail}\n\n\
+                 The reason has to start with the new figure, so a note written for \
+                 an earlier drop cannot keep authorising later ones."
             );
+        }
+        // A note whose leading figure no longer matches is reported even when
+        // the floor *rose*. The gate above only fires on a lowering, so
+        // without this a note silently describes a number the file stopped
+        // holding -- which is how `qunix-sync` came to claim 97.33 beside a
+        // floor of 98.54.
+        for (name, lines) in &measured {
+            let figure = format!("{:.2}", round2(lines.percent()));
+            let heads_with_figure = notes
+                .get(name)
+                .and_then(|note| note.first())
+                .is_some_and(|first| {
+                    let rest = first.trim_start_matches('#').trim_start();
+                    rest.strip_prefix(&figure)
+                        .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit()))
+                });
+            if notes.contains_key(name) && !heads_with_figure {
+                println!(
+                    "coverage: the note above `{name}` does not begin `# {figure}`; \
+                     it now describes a figure the file no longer holds"
+                );
+            }
         }
         std::fs::write(&baseline_path, render_baseline(&measured, &notes))?;
         println!("coverage: baseline written to {BASELINE}");
@@ -376,6 +519,32 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
                 now - floor
             ));
         }
+    }
+
+    // The loop above walks what was *measured*, so a crate that has a floor but
+    // produced no measurement is never compared against it. That is not a
+    // hypothetical gap: a crate dropped from `MEASURED` or from the workspace,
+    // renamed, or emitting no records stops appearing in the report and its
+    // floor silently stops being enforced -- the ratchet reports success for a
+    // crate it did not look at. Named explicitly, so removing a crate means
+    // editing the baseline deliberately.
+    let unmeasured = unmeasured_floors(&baseline, &measured);
+    if !unmeasured.is_empty() {
+        bail!(
+            "{n} crate(s) have a coverage floor but produced no measurement:\n{list}\n\n\
+             A floor that is never measured is not enforced. Restore the crate: put it \
+             back in `MEASURED` and in the workspace, or fix whatever stopped it \
+             emitting coverage records. Only if it is genuinely gone, delete its floor \
+             deliberately with `cargo xtask coverage --update {flags}` -- which also \
+             deletes the recorded reason for that floor.",
+            n = unmeasured.len(),
+            list = render_unmeasured(&unmeasured),
+            flags = unmeasured
+                .iter()
+                .map(|(name, _)| format!("--drop-crate={name}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
 
     if !improvements.is_empty() {
@@ -574,6 +743,48 @@ end_of_record
     }
 
     #[test]
+    fn a_note_naming_a_longer_number_does_not_authorise_a_shorter_one() {
+        // `contains` let `97.335` authorise a drop to `97.33`.
+        let old = floors(&[("qunix-sync", 97.84)]);
+        let now = measured(&[("qunix-sync", 9733, 10000)]);
+        let mut notes = BTreeMap::new();
+        notes.insert("qunix-sync".to_string(), vec!["# 97.335 earlier".to_string()]);
+        assert!(!lowering_without_reason(&old, &now, &notes).is_empty());
+    }
+
+    #[test]
+    fn a_transition_note_does_not_authorise_a_return_to_the_old_value() {
+        // The house style records `OLD -> NEW`. Matching anywhere in the line
+        // meant such a note authorised a later drop back to OLD forever.
+        let old = floors(&[("qunix-hal-x86_64", 25.00)]);
+        let now = measured(&[("qunix-hal-x86_64", 2490, 10000)]);
+        let mut notes = BTreeMap::new();
+        notes.insert(
+            "qunix-hal-x86_64".to_string(),
+            vec!["# 25.00 -> 24.90 when the loader landed".to_string()],
+        );
+        assert!(
+            !lowering_without_reason(&old, &now, &notes).is_empty(),
+            "a note headed by the old figure authorised a drop to a new one"
+        );
+    }
+
+    #[test]
+    fn a_one_cent_drop_is_not_rounded_away() {
+        let old = floors(&[("c", 97.33)]);
+        let now = measured(&[("c", 9732, 10000)]);
+        assert!(!lowering_without_reason(&old, &now, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_note_above_the_first_crate_is_kept() {
+        // The `at_header` rule used to discard it, and the gate's own error
+        // message instructs users to write exactly this.
+        let notes = existing_notes("# 100.00 because it is pure logic\nqunix-elf = 100.00\n");
+        assert!(notes.contains_key("qunix-elf"), "a first-crate note was discarded");
+    }
+
+    #[test]
     fn a_stale_note_does_not_authorise_a_new_lowering() {
         // The defect this replaced: the gate asked only whether *some* comment
         // existed, so one written for an earlier drop kept authorising every
@@ -583,7 +794,7 @@ end_of_record
         let mut notes = BTreeMap::new();
         notes.insert("qunix-mm".to_string(), vec!["# dropped to 85.00 when X landed".to_string()]);
         assert_eq!(
-            lowering_without_reason(&old, &now, &notes),
+            lowering_without_reason(&old, &now, &notes).iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>(),
             vec!["qunix-mm".to_string()],
             "a note naming 85.00 authorised a drop to 80.00"
         );
@@ -605,10 +816,42 @@ end_of_record
         let old = floors(&[("qunix-sync", 97.84)]);
         let now = measured(&[("qunix-sync", 9750, 10000)]); // 97.50, a 0.34 pp drop
         assert_eq!(
-            lowering_without_reason(&old, &now, &BTreeMap::new()),
+            lowering_without_reason(&old, &now, &BTreeMap::new()).iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>(),
             vec!["qunix-sync".to_string()],
             "a drop inside the tolerance was written without a reason"
         );
+    }
+
+    #[test]
+    fn a_floor_with_no_measurement_is_reported() {
+        // The silent case the whole check exists for: a crate whose tests stop
+        // linking disappears from the report, and every remaining crate passes,
+        // so the ratchet says "all crates at or above their floor" having
+        // skipped one entirely.
+        let baseline = BTreeMap::from([
+            ("qunix-mm".to_string(), 98.11),
+            ("qunix-gone".to_string(), 91.00),
+        ]);
+        let measured = BTreeMap::from([("qunix-mm".to_string(), Lines { hit: 9, found: 10 })]);
+
+        let missing = unmeasured_floors(&baseline, &measured);
+        assert_eq!(missing, vec![("qunix-gone".to_string(), 91.00)], "got {missing:?}");
+        // The floor has to reach the message, or the user cannot tell what is
+        // being enforced from the failure alone.
+        let rendered = render_unmeasured(&missing);
+        assert!(rendered.contains("qunix-gone") && rendered.contains("91.00"), "{rendered}");
+    }
+
+    #[test]
+    fn every_floor_measured_reports_nothing() {
+        let baseline = BTreeMap::from([("qunix-mm".to_string(), 98.11)]);
+        let measured = BTreeMap::from([
+            ("qunix-mm".to_string(), Lines { hit: 9, found: 10 }),
+            // A crate measured without a floor is the new-crate case, handled
+            // elsewhere; it must not be mistaken for a missing measurement.
+            ("qunix-new".to_string(), Lines { hit: 1, found: 1 }),
+        ]);
+        assert!(unmeasured_floors(&baseline, &measured).is_empty());
     }
 
     #[test]
@@ -625,15 +868,59 @@ end_of_record
     }
 
     #[test]
-    fn the_header_is_not_captured_when_no_blank_line_separates_it() {
-        // How the header came to be duplicated inside a crate's note block: the
-        // earlier rule relied on a blank line to end it, and a hand-edited file
-        // had none.
-        let notes = existing_notes("# file header\n# second line\nqunix-mm = 90.00\n");
+    fn the_generated_header_is_not_captured_as_a_note() {
+        // How the header came to be duplicated inside a crate's note block. It
+        // is now recognised by its own text rather than by "the block before the
+        // first blank line", which was indistinguishable from a legitimate note
+        // above the first crate. Written from `HEADER` itself so an edit to the
+        // rendered header cannot leave this test asserting about old text.
+        let notes = existing_notes(&format!("{HEADER}qunix-mm = 90.00\n"));
         assert!(
             !notes.contains_key("qunix-mm"),
             "the file header was attributed to the first crate: {notes:?}"
         );
+    }
+
+    #[test]
+    fn a_note_written_directly_under_the_header_survives() {
+        // No blank line between them, which is what a user editing the file by
+        // hand produces. The old rule keyed off the block's first line and
+        // discarded header and note together, so the reason the ratchet demands
+        // was silently deleted and could not be re-added.
+        let text = format!("{HEADER}# 90.00 because the dispatch arm only spawns cargo\nxtask = 90.00\n");
+        let notes = existing_notes(&text);
+        assert_eq!(
+            notes.get("xtask").map(Vec::as_slice),
+            Some(&["# 90.00 because the dispatch arm only spawns cargo".to_string()][..]),
+            "a note under the header was lost, or the header came with it: {notes:?}"
+        );
+        // And the round trip must not duplicate the header inside the note.
+        let mut measured = BTreeMap::new();
+        measured.insert("xtask".to_string(), Lines { hit: 90, found: 100 });
+        let rendered = render_baseline(&measured, &notes);
+        assert_eq!(
+            rendered.matches("Per-crate line coverage floor").count(),
+            1,
+            "the header was duplicated into a note: {rendered}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_floor_takes_naming_the_crate() {
+        // `--update` renders only what was measured, so an unmeasured floor
+        // vanishes along with its recorded reason. The read-only path refuses
+        // that; the escape hatch it recommends must not be a way round it.
+        assert!(dropped_crates(&["--update".to_string()]).is_empty());
+        assert_eq!(
+            dropped_crates(&["--update".to_string(), "--drop-crate=qunix-gone".to_string()]),
+            vec!["qunix-gone".to_string()]
+        );
+        // The separated form is not accepted, so a following argument can never
+        // be swallowed as a crate name.
+        assert!(
+            dropped_crates(&["--drop-crate".to_string(), "qunix-gone".to_string()]).is_empty()
+        );
+        assert!(dropped_crates(&["--drop-crate=".to_string()]).is_empty());
     }
 
     #[test]

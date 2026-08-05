@@ -6,7 +6,7 @@ already cost someone an hour. It is not a style guide.
 ## Commands
 
 ```sh
-cargo xtask test    # 14 in-QEMU + 89 host tests + licensing and attestation checks
+cargo xtask test    # 46 in-QEMU + 165 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 cargo xtask bench   # criterion, host-buildable crates only
@@ -167,6 +167,27 @@ LeakSanitizer.
   reappear, something reintroduced a shared mutable static. Use `UnsafeCell` in
   a `Sync` newtype (see `percpu::BspCell`) when a static genuinely cannot be
   allocated, and say who the single writer is.
+- **Ring 3 can zero the hidden `GS.base`** with `mov gs, ax`. The syscall stub
+  always reloaded it with `swapgs`; the *exception* path did not, so the first
+  thing a ring-3 fault handler did was read `gs:[0x20]` at linear address 0x20
+  under the faulting process's own tables. Any new entry from ring 3 must
+  restore the base before touching per-CPU state — one of two entry paths is
+  the shape of hole this kernel keeps finding.
+- **CR3 is not a source for the kernel's page-table root.** A user thread
+  activates its own space and never switches back, so once a process is running
+  the "current" root is that process's. `vmspace::record_kernel_root` captures
+  it at boot and every new address space copies from that; reading CR3 instead
+  works only by accident, because the kernel halves happen to be identical.
+- **`TSS.rsp0` is per-thread, not per-CPU-once.** The scheduler reprograms it
+  from the incoming thread's own `kernel_stack_top` before every switch, so a
+  ring-3 trap lands on the stack of the thread that is actually running.
+  Threads that adopted the boot stack report 0 and are skipped — writing 0
+  there would point the next trap at the null page.
+- **Pruning must refuse the shared higher half.** PML4 entries 256..512 are
+  copied by *reference* into every address space, so the tables beneath them
+  belong to no single space and freeing one on teardown frees the kernel's.
+  The guard (`paging::shares_the_kernel_half`) is a single bit test, and one
+  index either way is a kernel-wide double free.
 - The HHDM covers **RAM only**. Device MMIO (the LAPIC at `0xFEE00000`) is not
   mapped and must be mapped explicitly, uncacheable.
 - Limine's stack has **no guard page**. Stack overflow scribbles through memory
@@ -207,6 +228,11 @@ threads, timer preemption, SMP bring-up, address spaces, the native syscall
 ABI, an ELF64 loader, ring 3, and a real init program loaded as a Limine
 module. A boot prints `hello from ring 3, qunix` from a process with its own
 address space.
+
+A fault taken *from ring 3* kills the offending process; only a fault from ring
+0 panics. So a userspace bug now shows up as a process that quietly exits, not
+as a stopped machine — assert that the process is gone rather than waiting for
+a panic.
 
 `kernel/user/init.s` is assembled by `xtask` (see `userland.rs`) into a
 standalone ELF placed in the ESP, not linked into the kernel. The kernel finds

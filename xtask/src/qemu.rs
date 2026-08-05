@@ -57,29 +57,28 @@ fn kvm_usable() -> bool {
     std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok()
 }
 
-fn find_ovmf() -> Option<String> {
+fn find_ovmf() -> Result<String> {
     // An explicit override that does not exist is an error, not a reason to
-    // fall back. Falling back silently boots *different* firmware than the one
-    // asked for -- on Debian, quite possibly the very file the override was
-    // meant to avoid.
+    // fall back. Returning `None` here was not enough: the caller's message is
+    // "install edk2-ovmf or set QUNIX_OVMF", which tells someone who just set
+    // it to set it, and never names the path that is missing.
     if let Ok(path) = std::env::var("QUNIX_OVMF") {
         if !Path::new(&path).exists() {
-            return None;
+            bail!("QUNIX_OVMF is set to `{path}`, which does not exist; unset it to search the usual locations");
         }
-        return Some(path);
+        return Ok(path);
     }
     OVMF_CANDIDATES
         .iter()
         .find(|p| Path::new(p).exists())
         .map(|p| (*p).to_string())
+        .context("no OVMF firmware found; install edk2-ovmf or set QUNIX_OVMF")
 }
 
 /// Boots the ESP directory under QEMU via OVMF, killing it if it outlives the
 /// timeout. Returns how the process terminated.
 pub fn run_esp(esp: &Path, headless: bool) -> Result<Exit> {
-    let Some(ovmf) = find_ovmf() else {
-        bail!("no OVMF firmware found; install edk2-ovmf or set QUNIX_OVMF");
-    };
+    let ovmf = find_ovmf()?;
 
     let mut cmd = Command::new("qemu-system-x86_64");
     // The `accel=kvm:tcg` fallback list is a `-machine` property; the standalone

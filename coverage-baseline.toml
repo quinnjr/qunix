@@ -1,44 +1,50 @@
-# Per-crate line coverage floor. A change may raise these or hold them,
-# never drop them by more than the tolerance in xtask/src/coverage.rs.
+# Per-crate line coverage floor. A change may raise these or hold them.
 #
-# Regenerate with `cargo xtask coverage --update` when coverage
-# genuinely improves, or when a crate gains code that cannot be covered
-# at all -- xtask command dispatch that only spawns cargo is the usual
-# case. The second kind of update belongs in a PR that says which code
-# is uncoverable and why.
+# Any drop, however small, needs a `#` comment directly above that
+# crate's line *beginning* with the new figure and saying which code is
+# uncoverable and why; `cargo xtask coverage --update` refuses to write
+# one otherwise. The tolerance in xtask/src/coverage.rs applies to
+# reading a floor, so a noisy measurement does not fail a build; it
+# does not authorise lowering one.
 
 qunix-elf = 100.00
 
-# 24.90, and low because most of this crate cannot execute on the host:
+# 25.93. Low because most of this crate cannot execute on the host:
 # `port.rs` is raw in/out instructions, and GDT/IDT/APIC/percpu are `wrmsr`,
 # `lgdt`, `ltr` and `gs:`-relative addressing. What this number measures is the
 # pure-logic remainder -- chiefly `PageFlags` translation and the `Context`
-# layout assertions. The hardware paths are covered by the 38 in-QEMU tests,
-# which run under QEMU where host instrumentation cannot reach.
+# layout assertions. The hardware paths are covered in QEMU, where host
+# instrumentation cannot reach.
 #
-# 25.00 -> 24.90 when the audit's fixes added three lines to `apic::reg` and
-# `percpu`, all of them MSR access that cannot run in a host process.
-qunix-hal-x86_64 = 24.90
+# Do not read small movements here as a change in how much is tested. The
+# denominator is dominated by unreachable hardware paths, so adding or removing
+# a handful of them moves the percentage without any host-testable line
+# changing state. Check which lines moved before treating a shift as a
+# regression.
+qunix-hal-x86_64 = 25.93
 
-qunix-mm = 98.11
+qunix-mm = 98.57
 
 qunix-sched = 100.00
 
-# 97.33. Three lines are uncovered and all three are unreachable on a passing
-# run: 221-222 are the compile-time auto-trait assertions inside
-# `const _: () = {}`, and 304 is the panic arm of the contention test's
-# elapsed-time assertion, which executes only when `lock()` failed to block.
-# A test whose failure branch is covered is a failing test, so this is the
-# figure a green run produces on every machine.
-qunix-sync = 98.54
+# 98.64. Three lines are uncovered and none of them can execute on a green
+# run: the two `const fn assert_*` bodies in the auto-trait assertion block,
+# which exist only to be instantiated at compile time, and the panic arm of the
+# contention test's elapsed-time assertion, which runs only when `lock()` failed
+# to block. A test whose failure branch is covered is a failing test, so this is
+# the figure a passing run produces on every machine.
+#
+# Line numbers are deliberately not cited: the last note gave three and all
+# three had moved by the time anyone read it.
+qunix-sync = 98.64
 
-# 52.08. Low because each command arm builds an argument list and then spawns
+# 54.05. Low because each command arm builds an argument list and then spawns
 # cargo, and the spawn is what cannot run under host instrumentation. The
 # argument and gate logic is extracted (`bench_args`, `fuzz_args`,
 # `fuzz_selection`, `lowering_without_reason`) and tested, which is what this
 # number actually tracks.
 #
-# 52.17 -> 52.08 when `find_ovmf` gained an explicit-override-missing branch.
-# Reaching it needs `QUNIX_OVMF` set to a path that does not exist, and mutating
-# the environment from a test races every other test in the process.
-xtask = 52.08
+# `find_ovmf`'s explicit-override branch is the one part that host tests cannot
+# reach: it needs `QUNIX_OVMF` set to a nonexistent path, and mutating the
+# environment from a test races every other test in the process.
+xtask = 54.05

@@ -65,6 +65,16 @@ pub enum MapError {
     /// A page-table entry held a non-page-aligned address. Reporting this as
     /// `NotMapped` would invite a caller to conclude the VA is free and remap it.
     CorruptEntry,
+    /// A virtual address fell outside the user half — at or above `USER_MAX`,
+    /// or below `USER_MIN` — on an operation that only accepts user addresses.
+    ///
+    /// Distinct from `Misaligned`, which this case was previously folded into.
+    /// The two suggest opposite remedies: a caller told `Misaligned` concludes
+    /// the address merely needs rounding, and can retry with an aligned address
+    /// that is still in the kernel half. That is a mapping request against
+    /// shared kernel tables dressed up as a recoverable alignment error, and
+    /// nothing downstream would flag it.
+    NotUserAddress,
 }
 
 /// Translates a `map_to` failure.
@@ -150,6 +160,22 @@ pub struct AddressSpace {
     /// would give pointers with no provenance relationship to the map.
     hhdm_base: *mut u8,
     hhdm_offset: u64,
+}
+
+/// Whether `va` falls under a PML4 entry shared across address spaces.
+///
+/// Entries 256..512 are copied by reference into every address space (see
+/// `copy_kernel_half`), so the tables beneath them belong to no single space.
+/// Split out from [`AddressSpace::unmap_and_prune`] so the boundary can be
+/// tested without constructing a page table: the guard is one comparison, and
+/// one comparison off by a single index frees the kernel's own tables. Crate
+/// visibility because that is all the split was for — nothing outside this
+/// crate asks the question, and exporting it would commit the crate to an API
+/// surface no caller wanted.
+pub(crate) const fn shares_the_kernel_half(va: u64) -> bool {
+    // Bit 47 is the top bit of the 48-bit canonical address, and equivalently
+    // the top bit of the 9-bit PML4 index. Set means index >= 256.
+    va & (1 << 47) != 0
 }
 
 impl AddressSpace {
@@ -333,17 +359,24 @@ impl AddressSpace {
     /// permanently lost per abandoned 2 MiB window.
     ///
     /// Returns the leaf physical address and the number of intermediate tables
-    /// freed (0 through 3). A caller that always sees 0 is leaking page tables
-    /// — the previous `Result<u64, _>` made that indistinguishable from a
-    /// successful prune, so a systematic failure could leak forever unnoticed.
+    /// freed (0 through 3). A caller pruning user addresses that always sees 0
+    /// is leaking page tables — the previous `Result<u64, _>` made that
+    /// indistinguishable from a successful prune, so a systematic failure could
+    /// leak forever unnoticed.
+    ///
+    /// The exception is the kernel half: a VA for which
+    /// [`shares_the_kernel_half`] holds always returns 0, by design and not by
+    /// failure, because the tables under it belong to no single address space.
+    /// A caller that only ever prunes kernel-half addresses therefore sees a
+    /// permanent 0 and is behaving correctly.
     ///
     /// # Safety
     /// As [`Self::unmap`], plus: every intermediate table along `va` (PDPT, PD,
     /// PT) must have been allocated by the same `frames` closure previously
     /// passed to [`Self::map`] or [`Self::map_2mib`] on *this* address space,
-    /// and `free` must be that allocator's matching release path. The body
-    /// hands any table it finds empty straight to `free`; it cannot tell who
-    /// allocated it.
+    /// and `free` must be that allocator's matching release path. Below the
+    /// kernel-half guard the body hands any table it finds empty straight to
+    /// `free`; it cannot tell who allocated it.
     ///
     /// Consequently this must never be called on a VA whose tables the
     /// bootloader built — which is every VA reachable through
@@ -357,6 +390,26 @@ impl AddressSpace {
     ) -> Result<(u64, u8), MapError> {
         let pa = unsafe { self.unmap(va)? };
         let addr = VirtAddr::new(va);
+
+        // The higher half is shared by reference across every address space
+        // (see `copy_kernel_half`), so a table beneath PML4 entry 256 or above
+        // does not belong to the address space doing the pruning. Emptying one
+        // here and handing it to `free` unmaps the kernel out from under every
+        // other space and every other CPU, and the frame is then reissued as
+        // ordinary memory while the CPU may still walk it.
+        //
+        // The unmap above has already happened and is not local to this space:
+        // the leaf PT is shared by reference along with the rest of the
+        // subtree, so removing the entry removes the mapping from every address
+        // space at once. That is correct only because the sole legitimate
+        // caller here is the kernel unmapping a page of its own kernel half,
+        // which every space is supposed to see. The *pruning* is refused
+        // separately, and for a different reason: the tables are referenced by
+        // roots this space does not own, so it cannot decide they are dead.
+        // That refusal is what the `0` reports.
+        if shares_the_kernel_half(va) {
+            return Ok((pa, 0));
+        }
 
         // Each level's borrow is scoped: the parent is only taken mutably once
         // its child has been proven empty, so no two tables are borrowed at
@@ -384,12 +437,12 @@ impl AddressSpace {
         // the invalidation below, and would then walk allocator metadata as a
         // page table. Unlink everything, invalidate, and only then release.
         //
-        // Flushes this CPU only. Remote paging-structure caches are not
-        // covered, so a frame freed here can still be cached as a translation
-        // on another CPU. That is safe today because application processors
-        // park without scheduling (see `kernel/src/smp.rs`), and it is the
-        // thing a cross-CPU shootdown has to fix before they do; otherwise a remote CPU's cached
-        // structure has the same lifetime hazard.
+        // The invalidation below flushes this CPU only. Remote paging-structure
+        // caches are not covered, so the same hazard survives across cores:
+        // another CPU may still hold a cached translation through a frame this
+        // one has released. Safe today only because application processors park
+        // without scheduling (see `kernel/src/smp.rs`); a cross-CPU shootdown
+        // that waits for acknowledgement is what has to land before they stop.
         let mut freed: [Option<u64>; 3] = [None; 3];
         unsafe { Self::clear_entry(p2, addr.p2_index()) };
         freed[0] = Some(p1_pa);
@@ -478,6 +531,21 @@ impl AddressSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shared_half_boundary_is_pml4_entry_256() {
+        // The exact boundary, both sides. Off by one index here either frees
+        // the kernel's own tables or refuses to reclaim a user table forever,
+        // and neither shows up as a failure anywhere else.
+        assert!(!shares_the_kernel_half(0x0000_7fff_ffff_f000), "last user page treated as shared");
+        assert!(shares_the_kernel_half(0xffff_8000_0000_0000), "first kernel page treated as owned");
+        assert!(!shares_the_kernel_half(0), "the null page treated as shared");
+        assert!(shares_the_kernel_half(u64::MAX), "the top of memory treated as owned");
+        // The HHDM and the kernel image, the two ranges the doc names as
+        // unprunable.
+        assert!(shares_the_kernel_half(0xffff_8000_1234_5000));
+        assert!(shares_the_kernel_half(0xffff_ffff_8000_0000));
+    }
 
     #[test]
     fn to_x86_maps_each_flag() {

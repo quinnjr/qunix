@@ -32,7 +32,13 @@ fn reg(offset: usize) -> Option<*mut u32> {
     // has to see the LAPIC mapping `init` established before it sees the base,
     // and program order alone only orders them on the CPU that did both. Free
     // at the ISA level on x86-64, where every load is already acquire.
-        let base = APIC_BASE.load(Ordering::Acquire);
+    //
+    // The zero check below is a branch rather than an `assert!` on purpose:
+    // this runs on every timer tick, and an assert drags `core::panicking` and
+    // a formatted message into the ISR's reachable code. `debug_assert!` would
+    // compile out and leave release writing to a raw offset as an absolute
+    // address.
+    let base = APIC_BASE.load(Ordering::Acquire);
     if base == 0 {
         return None;
     }

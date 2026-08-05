@@ -2898,6 +2898,25 @@ second pass over all segments. One pass would leave a read-only page in the way
 of a later segment that shares it, which happens whenever two segments land in
 one page.
 
+### D7 — A process's address space is leaked when the process exits (Task 10, 2026-08-05)
+
+`user_thread_entry` calls `core::mem::forget(space)` before `enter_user`. It has
+to: `enter_user` does not return, so no destructor can run at that point, and
+dropping the `VmSpace` would free the page tables the process is about to
+execute on. Nothing else owns the space afterwards, so every frame it holds —
+the PML4, the intermediate tables, and every user page — is leaked for the
+lifetime of the boot.
+
+The plan assumed this was academic because M1 did not implement process exit.
+It no longer is. Exit is routinely reachable two ways: `Sys::Exit`, and the
+ring-3 fault path (`syscall::user_fault`), which kills the faulting process
+rather than the machine. Both switch the CPU back to the kernel root and stop
+the thread, and neither has a handle to the address space to reclaim.
+
+Fixing it needs an owner that outlives `enter_user` — the process table entry
+the scheduler can reach from `exit_current` — which is a process-lifetime change
+belonging to M2's reaping work, not something the ring-3 entry path can do.
+
 ## Known Limitations Carried Into M2
 
 - **Application processors are online but idle.** They install per-CPU state

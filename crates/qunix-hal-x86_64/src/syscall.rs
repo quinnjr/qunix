@@ -142,6 +142,26 @@ unsafe extern "C" fn syscall_entry() {
         "pop r11",
         "pop rcx",
 
+        // Scrub the caller-saved registers `dispatch` was free to leave kernel
+        // values in. Ring 3 takes this path on every syscall, and after
+        // `sys_write` these hold kernel heap and HHDM addresses -- handing them
+        // back is the same leak `enter_user` clears its 15 registers to avoid,
+        // on the path that actually runs more than once.
+        //
+        // The exclusions are deliberate, and each is load-bearing:
+        //   rax           -- the syscall's return value; clearing it returns 0
+        //                    from every call.
+        //   rcx, r11      -- consumed by `sysretq` as the user RIP and RFLAGS.
+        //   rbx, rbp,     -- callee-saved, so they still hold the *user's* own
+        //   r12-r15          values, restored by `dispatch`'s epilogue. The
+        //                    process would see its own registers destroyed.
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+
         // Restore the user stack, put GS back, and return to ring 3. `sysretq`
         // (not `sysret`) for a 64-bit return; the 32-bit form drops the high
         // half of RIP.
@@ -199,6 +219,38 @@ pub unsafe fn enter_user(entry: u64, user_stack: u64) -> ! {
             "push {rflags}",
             "push {cs}",
             "push {rip}",
+            // Every general-purpose register is cleared before the ring change.
+            // Whatever the kernel last left in them is otherwise visible to the
+            // process on its first instruction, and this path runs immediately
+            // after page-table construction, so those values are kernel heap
+            // and physical-frame addresses.
+            //
+            // This block overwrites whichever registers the allocator picked
+            // for the operands, and zeroes `rbp`, which is reserved and cannot
+            // be an operand at all. Both are sound only because of
+            // `options(noreturn)`: there is no exit from this block, so there
+            // is no point at which LLVM could observe a clobbered input or need
+            // a frame pointer restored.
+            //
+            // Declaring the operands `inout(reg) _ => _` to make the clobber
+            // explicit does not compile -- `noreturn` forbids outputs, for the
+            // same reason it makes the clobber harmless. So the reasoning has
+            // to live here rather than in the operand list.
+            "xor eax, eax",
+            "xor ebx, ebx",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor ebp, ebp",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
             "iretq",
             ss = in(reg) ss,
             rsp = in(reg) user_stack,

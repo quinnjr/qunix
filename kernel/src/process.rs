@@ -9,7 +9,40 @@ use qunix_elf::{Elf64, ElfError};
 use qunix_hal_x86_64::syscall;
 use qunix_sched::{Priority, ThreadId};
 
-use crate::vmspace::VmSpace;
+use crate::vmspace::{USER_MAX, USER_MIN, VmSpace};
+
+/// Page range a segment occupies, including the partial pages at each end.
+///
+/// One function because the mapping pass and the permission pass must agree on
+/// it exactly: a page mapped by one and missed by the other keeps the
+/// write-and-execute permissions the mapping pass uses to copy the image in.
+///
+/// The rounding is checked. `next_multiple_of` overflows for an end within
+/// 4 KiB of the top of the address space, and the kernel builds without
+/// overflow checks in release, so it would wrap to zero -- making the
+/// permission pass iterate an empty range and silently leave the page RWX.
+fn segment_pages(segment: &qunix_elf::Segment<'_>) -> Result<core::ops::Range<u64>, LoadError> {
+    let start = segment.vaddr & !0xfff;
+    let end = segment
+        .vaddr
+        .checked_add(segment.mem_size)
+        .and_then(|end| end.checked_next_multiple_of(4096))
+        .ok_or(LoadError::BadAddress)?;
+    // Refused, not clamped. A segment reaching into the kernel half is not a
+    // program this kernel can run, and mapping the part that fits would give it
+    // a foothold at an address it chose.
+    if end > USER_MAX {
+        return Err(LoadError::NotUserAddress(segment.vaddr));
+    }
+    // The other end, which went unchecked while only `USER_MAX` was enforced. A
+    // `PT_LOAD` at `p_vaddr = 0` maps the null page user-writable, which voids
+    // the "a null dereference still faults" guarantee `USER_TEXT` documents and
+    // hands a program a legal address it can plant a pointer target at.
+    if start < USER_MIN {
+        return Err(LoadError::NotUserAddress(segment.vaddr));
+    }
+    Ok(start..end)
+}
 
 /// Where a user program's text is placed.
 ///
@@ -39,19 +72,18 @@ impl Process {
         let mut space = VmSpace::new().ok_or(LoadError::OutOfMemory)?;
         let hhdm = crate::boot::hhdm_offset();
 
+        // Every segment is validated before *any* memory is touched. An earlier
+        // version checked inside the permission pass, which runs after the copy
+        // -- so a segment naming the kernel half was written through the HHDM
+        // and only then refused, which is an arbitrary kernel write dressed as
+        // a clean error return. Validation must precede mutation.
         for segment in elf.segments() {
-            // A segment need not start on a page boundary; the page it lands
-            // in does. Mapping from the rounded-down address is what keeps two
-            // segments sharing a page from unmapping each other.
-            let start = segment.vaddr & !0xfff;
-            let end = segment
-                .vaddr
-                .checked_add(segment.mem_size)
-                .ok_or(LoadError::BadAddress)?;
-            let pages = (end.next_multiple_of(4096) - start) / 4096;
+            segment_pages(&segment)?;
+        }
 
-            for page in 0..pages {
-                let va = start + page * 4096;
+        for segment in elf.segments() {
+            let range = segment_pages(&segment)?;
+            for va in range.step_by(4096) {
                 // Skip a page an earlier segment already mapped, which happens
                 // whenever two segments share one page. Mapping it twice would
                 // leak the first frame and discard what was already copied.
@@ -104,12 +136,7 @@ impl Process {
         let mut pages: alloc::collections::BTreeMap<u64, (bool, bool)> =
             alloc::collections::BTreeMap::new();
         for segment in elf.segments() {
-            let start = segment.vaddr & !0xfff;
-            let end = segment
-                .vaddr
-                .checked_add(segment.mem_size)
-                .ok_or(LoadError::BadAddress)?;
-            for va in (start..end.next_multiple_of(4096)).step_by(4096) {
+            for va in segment_pages(&segment)?.step_by(4096) {
                 let entry = pages.entry(va).or_insert((false, false));
                 entry.0 |= segment.writable;
                 entry.1 |= segment.executable;
@@ -141,14 +168,22 @@ impl Process {
 
 /// Why a program could not be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoadError {
     Elf(ElfError),
     /// No frame available for the address space or a segment.
     OutOfMemory,
     /// A segment names a virtual range that overflows.
     BadAddress,
-    /// Two segments share a page and between them ask for write and execute.
-    /// Refused rather than mapped: honouring it is a W^X hole.
+    /// A segment reaches at or above [`USER_MAX`], where the kernel half is
+    /// shared by reference, or starts below
+    /// [`USER_MIN`](crate::vmspace::USER_MIN), where mapping it would make the
+    /// null page valid. The payload is the offending `p_vaddr`.
+    NotUserAddress(u64),
+    /// A page ends up both writable and executable — either from one segment
+    /// carrying `PF_W | PF_X`, or from two segments that share the page and
+    /// ask for write and execute between them. Refused rather than mapped:
+    /// honouring it is a W^X hole. The payload is the page's virtual address.
     WriteExecutePage(u64),
     Map(qunix_hal_x86_64::paging::MapError),
 }
@@ -169,17 +204,23 @@ extern "C" fn user_thread_entry(raw: u64) -> ! {
     // exactly once, to this thread.
     let process = *unsafe { alloc::boxed::Box::from_raw(raw as *mut Process) };
 
-    // The stack this thread is standing on is where the syscall stub lands when
-    // the process traps. It has to be recorded before entering ring 3, because
-    // there is no opportunity afterwards -- and a stub that lands on a null
-    // stack faults with no stack to report the fault on.
-    let mut here = 0u64;
-    let rsp = (&raw mut here) as u64;
-    // Backed off and 16-aligned so the stub's pushes land below this frame
-    // rather than on top of the locals still in use.
-    // SAFETY: this thread's stack outlives it -- the scheduler frees it only
-    // after the thread exits, and this thread never returns.
-    unsafe { syscall::set_kernel_stack((rsp - 512) & !0xf) };
+    // The kernel stack the syscall stub lands on is programmed by the scheduler
+    // on every switch, from the incoming thread's own `kernel_stack_top`. It is
+    // deliberately *not* set here: this function ran once per process and set
+    // it from a local frame, so the second user thread to start overwrote the
+    // first thread's slot and both trapped onto one stack. Per-switch is the
+    // only placement that survives more than one user thread.
+    //
+    // A real `assert_ne!`, not `debug_assert_ne!`: CI runs the in-QEMU tests in
+    // release too, where a debug assertion compiles out and leaves nothing at
+    // all checking this. The failure it catches is a ring-3 trap onto RSP 0,
+    // which is unrecoverable and does not name its cause. It runs once per
+    // process creation, not on any hot path.
+    assert_ne!(
+        qunix_hal_x86_64::percpu::current().kernel_rsp,
+        0,
+        "entered a user thread before the scheduler programmed its kernel stack"
+    );
     // SAFETY: this CPU's per-CPU block is installed and its kernel_rsp is set.
     unsafe { crate::syscall::init() };
 
@@ -189,13 +230,55 @@ extern "C" fn user_thread_entry(raw: u64) -> ! {
     unsafe { space.activate() };
     // Leaked deliberately. `enter_user` does not return, so no destructor can
     // run here, and dropping the `VmSpace` would free the page tables the
-    // process is about to execute on. The frames are reclaimed when the process
-    // exits -- which M1 does not implement, and which is recorded as a known
-    // limitation rather than pretended away.
+    // process is about to execute on. Nothing else owns the space afterwards,
+    // so every frame it holds is leaked for the rest of the boot -- and process
+    // exit is now routinely reached, both through `Sys::Exit` and through the
+    // ring-3 fault path. Recorded as Execution Deviation D7 in
+    // `docs/superpowers/plans/2026-08-04-m1-processes.md`, which says what
+    // reclaiming it requires.
     core::mem::forget(space);
 
     // SAFETY: entry and stack are mapped user-accessible in the space just
     // activated, and this CPU's kernel_rsp is set.
     unsafe { syscall::enter_user(entry, stack_top) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment_at(vaddr: u64, mem_size: u64) -> qunix_elf::Segment<'static> {
+        qunix_elf::Segment { vaddr, mem_size, data: &[], writable: false, executable: true }
+    }
+
+    #[test_case]
+    fn a_segment_below_the_user_floor_is_refused() {
+        // The end that went unchecked. A `PT_LOAD` at 0 maps the null page and
+        // silently voids the guarantee `USER_TEXT`'s placement documents, so
+        // this asserts the *refusal* -- the direction that was missing, not the
+        // acceptance that always worked.
+        assert_eq!(
+            segment_pages(&segment_at(0, 4096)),
+            Err(LoadError::NotUserAddress(0)),
+            "a segment at the null page was accepted"
+        );
+        // Rounds *down* to page zero, so checking `p_vaddr` rather than the
+        // page it lands in would let this through.
+        assert_eq!(
+            segment_pages(&segment_at(0x800, 16)),
+            Err(LoadError::NotUserAddress(0x800)),
+            "a segment inside the null page was accepted"
+        );
+        assert!(segment_pages(&segment_at(USER_MIN, 16)).is_ok(), "the first legal page was refused");
+    }
+
+    #[test_case]
+    fn a_segment_reaching_the_kernel_half_is_refused() {
+        assert_eq!(
+            segment_pages(&segment_at(USER_MAX - 4096, 8192)),
+            Err(LoadError::NotUserAddress(USER_MAX - 4096)),
+            "a segment crossing into the kernel half was accepted"
+        );
+    }
 }
 

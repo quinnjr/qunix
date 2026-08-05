@@ -28,6 +28,16 @@ pub static TICKS: AtomicU64 = AtomicU64::new(0);
 static LAPIC_MAPPED: AtomicBool = AtomicBool::new(false);
 
 extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+    // First, before `preempt` reaches `gs:`. A timer tick is the one interrupt
+    // that routinely arrives while ring 3 is running, and ring 3 can zero the
+    // hidden `GS.base` with `mov gs, ax`. `preempt` -> `schedule` ->
+    // `percpu::set_kernel_stack` dereferences `gs:[0x20]`, so without this the
+    // scheduler writes a kernel stack pointer through a base the running
+    // process chose. Unconditional rather than gated on the frame's CS: it is
+    // idempotent, and a gate is one more place to get the direction wrong.
+    // SAFETY: this CPU's per-CPU block was installed during boot.
+    unsafe { qunix_hal_x86_64::percpu::restore_gs_base() };
+
     // A bus-locked RMW, deliberately: the ~20-40 cycles it costs once per 10 ms
     // are unmeasurable, and a per-CPU timer on more than one core makes a
     // load/store pair lose counts.
@@ -136,6 +146,13 @@ pub extern "C" fn kmain() -> ! {
         "qunix: kernel heap online ({} KiB bump headroom)",
         heap::bump_remaining() / 1024
     );
+
+    // Recorded while CR3 still holds the kernel's own tables and nothing has
+    // activated a process address space. Every later address space copies its
+    // kernel half from this, rather than from whatever CR3 happens to be.
+    // SAFETY: no `VmSpace` has been activated at this point in boot.
+    let kernel_root = unsafe { vmspace::record_kernel_root() };
+    println!("qunix: kernel page-table root at {kernel_root:#x}");
 
     sched::init();
     // Not a demonstration for its own sake: this is the first code to run on a
@@ -428,14 +445,21 @@ mod tests {
         }
         assert_eq!(crate::sched::runnable_count(), 0, "could not reach an empty run queue");
 
-        let before = crate::TICKS.load(core::sync::atomic::Ordering::SeqCst);
+        // Preemption off, so a switch can only come from `yield_now` itself.
         let was = crate::sched::set_preemption(false);
         for _ in 0..3 {
             crate::sched::yield_now();
         }
         crate::sched::set_preemption(was);
         assert_eq!(crate::sched::current_id(), qunix_sched::ThreadId(0));
-        let _ = before;
+        // The property the name claims: with nothing runnable, no switch
+        // happened at all. `current_id` alone is also true of a thread that
+        // switched away and came straight back.
+        assert_eq!(
+            crate::sched::runnable_count(),
+            0,
+            "yielding with an empty queue queued something"
+        );
     }
 
     static SPIN_RAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -697,6 +721,169 @@ mod tests {
         assert_ne!(a.root_frame(), b.root_frame(), "two processes share a PML4");
     }
 
+    /// Builds a minimal ELF64 with one PT_LOAD segment at `vaddr`.
+    fn elf_with_segment(vaddr: u64, flags: u32, memsz: u64) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec![0xccu8; 64 + 56];
+        out[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        out[4] = 2; // ELFCLASS64
+        out[5] = 1; // little endian
+        out[6] = 1; // EV_CURRENT
+        out[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        out[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        out[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
+        out[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        out[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        out[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let h = 64;
+        out[h..h + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        out[h + 4..h + 8].copy_from_slice(&flags.to_le_bytes());
+        out[h + 8..h + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        out[h + 16..h + 24].copy_from_slice(&vaddr.to_le_bytes());
+        // Non-zero on purpose. With `p_filesz == 0` the loader's copy loop
+        // never executes, so a test built that way cannot observe a write that
+        // happens before the address is validated -- which is exactly how an
+        // arbitrary-kernel-write hole survived an earlier round.
+        out[h + 32..h + 40].copy_from_slice(&8u64.to_le_bytes()); // p_filesz
+        out[h + 40..h + 48].copy_from_slice(&memsz.to_le_bytes());
+        out
+    }
+
+    #[test_case]
+    fn a_faulting_user_program_dies_without_taking_the_kernel_with_it() {
+        use crate::process;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+
+        // The whole point of ring 3. Before the fault handlers distinguished
+        // the ring they were entered from, every exception panicked
+        // unconditionally -- so an unprivileged program could halt the machine
+        // by dereferencing zero, and the kernel's response to a buggy user
+        // program was to stop being a kernel.
+        //
+        // The image is executable and read-only, and its entry lands in the
+        // zero fill past `p_filesz`. Zero bytes decode as `add [rax], al`, and
+        // `enter_user` clears every GPR, so rax is 0 and the first instruction
+        // writes to the null page -- a #PF from ring 3, deterministically.
+        let image = elf_with_segment(crate::process::USER_TEXT, 1 | 4, 4096);
+        let before = crate::sched::thread_count();
+        let id = process::spawn_elf(&image).expect("the faulting image failed to load");
+
+        // Bounded. If the fault panicked instead of killing the process, this
+        // test never gets to fail -- the machine is already dead -- so the loop
+        // is here to bound the *success* path, not to catch the failure.
+        for _ in 0..1000 {
+            if crate::sched::thread_count() <= before {
+                break;
+            }
+            crate::sched::yield_now();
+        }
+
+        assert!(
+            crate::sched::thread_count() <= before,
+            "{id:?} is still alive after faulting; it was neither killed nor reaped"
+        );
+    }
+
+    #[test_case]
+    fn a_refused_kernel_half_segment_writes_nothing() {
+        use crate::process::Process;
+        use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+
+        crate::frames::init();
+        crate::heap::init();
+
+        // Asserting the error is not enough, and the test that only did so
+        // passed both with and against the fix. The hole was that the mapping
+        // pass computed its own unchecked page range, so the file's bytes were
+        // copied through the HHDM and *then* the load returned a clean
+        // `NotUserAddress`. What distinguishes the two is the memory, not the
+        // return value.
+        //
+        // A 4 KiB kernel-half mapping made here on purpose. The obvious canary
+        // -- a heap buffer -- cannot observe the bug: the HHDM is mapped with
+        // large pages, `translate` walks only to 4 KiB leaves, and the loader
+        // bails with `BadAddress` before writing anything. A page this test
+        // maps itself is the one shape that reaches the copy.
+        const CANARY_VA: u64 = 0xffff_9900_0000_0000;
+        let hhdm = crate::boot::hhdm_offset();
+        let mut kernel = unsafe { AddressSpace::active(hhdm) };
+        let pa = crate::frames::alloc(0).expect("frame allocation failed");
+        unsafe {
+            kernel
+                .map(CANARY_VA, pa, PageFlags::PRESENT | PageFlags::WRITABLE, &mut || {
+                    crate::frames::alloc(0)
+                })
+                .expect("mapping the canary failed");
+            core::ptr::write_bytes((hhdm + pa) as *mut u8, 0xAA, 4096);
+        }
+
+        // Mapped before the load, so `VmSpace::new`'s copy of the kernel half
+        // carries it and the loader's `is_mapped`/`translate` both resolve.
+        let image = elf_with_segment(CANARY_VA, 4, 4096);
+        assert!(Process::from_elf(&image).is_err(), "a kernel-half segment was loaded");
+
+        let observed = unsafe { core::slice::from_raw_parts((hhdm + pa) as *const u8, 4096) };
+        assert!(
+            observed.iter().all(|&b| b == 0xAA),
+            "the loader wrote {:#04x} into kernel memory before refusing the segment",
+            observed.iter().find(|&&b| b != 0xAA).copied().unwrap_or(0)
+        );
+
+        unsafe {
+            kernel.unmap(CANARY_VA).expect("unmapping the canary failed");
+            crate::frames::free(pa, 0);
+        }
+    }
+
+    #[test_case]
+    fn a_segment_in_the_kernel_half_is_refused() {
+        use crate::process::{LoadError, Process};
+        crate::frames::init();
+        crate::heap::init();
+
+        // The kernel half is shared by reference into every address space, so a
+        // "user" segment there would either be copied over live kernel memory
+        // or install a user-accessible leaf into tables every CPU walks. Either
+        // is an arbitrary kernel write from a file on the ESP.
+        let image = elf_with_segment(0xffff_8000_0000_0000, 4, 4096);
+        assert_eq!(
+            Process::from_elf(&image).err(),
+            Some(LoadError::NotUserAddress(0xffff_8000_0000_0000)),
+            "a kernel-half segment was loaded"
+        );
+
+        // The lowest canonical kernel address. Note the segment carries real
+        // file bytes, so if the loader copied before validating, this would
+        // overwrite kernel text rather than return an error.
+        let image = elf_with_segment(0xffff_ffff_8000_0000, 4, 4096);
+        assert!(matches!(
+            Process::from_elf(&image).err(),
+            Some(LoadError::NotUserAddress(_))
+        ));
+    }
+
+    #[test_case]
+    fn a_write_execute_segment_is_refused() {
+        use crate::process::{LoadError, Process};
+        crate::frames::init();
+        crate::heap::init();
+
+        // PF_X | PF_W on one segment. Some linkers emit this; honouring it puts
+        // a writable page in the instruction stream of the first process.
+        let image = elf_with_segment(0x40_0000, 1 | 2, 4096);
+        assert_eq!(
+            Process::from_elf(&image).err(),
+            Some(LoadError::WriteExecutePage(0x40_0000)),
+            "a writable+executable segment was mapped"
+        );
+
+        // The positive direction, so the refusal is not just "everything fails".
+        let image = elf_with_segment(0x40_0000, 1, 4096);
+        assert!(Process::from_elf(&image).is_ok(), "a plain executable segment was refused");
+    }
+
     #[test_case]
     fn a_non_elf_module_is_refused_rather_than_executed() {
         crate::frames::init();
@@ -935,7 +1122,11 @@ mod tests {
         let mut space = unsafe { AddressSpace::active(hhdm) };
         // A virgin 512 GiB slot, so the mapping has to create a fresh
         // PDPT + PD + PT that pruning must give back.
-        const SCRATCH_VA: u64 = 0xffff_9800_0000_0000;
+        //
+        // Lower half deliberately. This test used a higher-half address, where
+        // pruning is now refused outright -- the tables up there are shared by
+        // every address space and are not this one's to free.
+        const SCRATCH_VA: u64 = 0x0000_5000_0000_0000;
 
         let before = crate::frames::free_bytes();
         let pa = crate::frames::alloc(0).expect("frame allocation failed");
@@ -970,6 +1161,48 @@ mod tests {
             before - crate::frames::free_bytes()
         );
         assert!(space.translate(SCRATCH_VA).is_none());
+    }
+
+    #[test_case]
+    fn pruning_refuses_to_free_a_shared_higher_half_table() {
+        use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+
+        crate::frames::init();
+        let hhdm = crate::boot::hhdm_offset();
+        let mut space = unsafe { AddressSpace::active(hhdm) };
+        // A virgin higher-half slot. The tables beneath it are shared by every
+        // address space, so emptying them is not this space's to do.
+        const SHARED_VA: u64 = 0xffff_9800_0000_0000;
+
+        let pa = crate::frames::alloc(0).expect("frame allocation failed");
+        unsafe {
+            space
+                .map(SHARED_VA, pa, PageFlags::PRESENT | PageFlags::WRITABLE, &mut || {
+                    crate::frames::alloc(0)
+                })
+                .expect("mapping failed");
+        }
+        let after_map = crate::frames::free_bytes();
+
+        let (got, pruned) = unsafe {
+            space
+                .unmap_and_prune(SHARED_VA, &mut |frame| crate::frames::free(frame, 0))
+                .expect("unmap failed")
+        };
+
+        assert_eq!(got, pa);
+        // The unmap is honoured; the pruning is not. A non-zero count here
+        // means three tables every other address space still walks were handed
+        // back to the frame allocator.
+        assert_eq!(pruned, 0, "pruned {pruned} shared higher-half tables");
+        assert_eq!(
+            crate::frames::free_bytes(),
+            after_map,
+            "a shared higher-half table was freed"
+        );
+        assert!(space.translate(SHARED_VA).is_none(), "the leaf was not unmapped");
+
+        unsafe { crate::frames::free(pa, 0) };
     }
 
     #[test_case]
