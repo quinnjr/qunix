@@ -89,7 +89,12 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-fuzz
+      # The `@cargo-fuzz` shorthand tag does not exist -- only some tools have
+      # one -- and the action then installs nothing while still succeeding, so
+      # the failure surfaces later as `no such command: fuzz`.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Install clang and LLD
         run: |
