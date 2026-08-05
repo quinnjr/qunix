@@ -175,6 +175,11 @@ pub extern "C" fn kmain() -> ! {
     unsafe { qunix_hal_x86_64::apic::init(boot::hhdm_offset()) };
     qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
     x86_64::instructions::interrupts::enable();
+    // The BSP can service an IPI from here on: IDT loaded, LAPIC enabled,
+    // interrupts unmasked. Before this point a shootdown initiated by any other
+    // CPU would wait on an acknowledgement the BSP could not send — which is
+    // why the mask is set here and not in `install_bsp`.
+    qunix_hal_x86_64::percpu::mark_online();
     // Only now: preemption before this point would let a tick switch threads
     // while the scheduler still had no thread table, and before the APIC timer
     // exists there is nothing to drive it anyway.
@@ -593,6 +598,118 @@ mod tests {
         );
         // The BSP must still be reading its own block, not an AP's.
         assert_eq!(percpu::cpu_id(), 0, "the BSP's GS was repointed by AP bring-up");
+    }
+
+    #[test_case]
+    fn a_shootdown_returns_only_after_every_other_cpu_has_invalidated() {
+        use qunix_hal_x86_64::percpu::{self, MAX_CPUS};
+        use qunix_hal_x86_64::tlb;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::smp::start_all();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        let me = percpu::cpu_id();
+        let remote = percpu::online_mask() & !(1u64 << me);
+        // A vacuous pass is the failure mode here, exactly as it is for the AP
+        // bring-up test: with nothing in the remote set, every assertion below
+        // is equally true of a shootdown that does nothing at all.
+        assert!(
+            remote.count_ones() >= 1,
+            "no remote cpu is in the shootdown mask; nothing below would be tested"
+        );
+
+        let mut before = [0u64; MAX_CPUS as usize];
+        for (cpu, slot) in before.iter_mut().enumerate() {
+            *slot = tlb::serviced(cpu as u32);
+        }
+
+        tlb::shootdown_all();
+
+        // Sampled with nothing at all between it and the return, because this
+        // is the assertion that separates a shootdown from a notification. The
+        // remote CPUs are parked in `hlt`: waking one, dispatching the vector
+        // and running the handler is hundreds of cycles, so an initiator that
+        // sent the IPI and returned would be caught here with the counters
+        // still at their old values.
+        let mut after = [0u64; MAX_CPUS as usize];
+        for (cpu, slot) in after.iter_mut().enumerate() {
+            *slot = tlb::serviced(cpu as u32);
+        }
+        let outstanding = tlb::pending();
+
+        for cpu in 0..MAX_CPUS {
+            if remote & (1u64 << cpu) == 0 {
+                continue;
+            }
+            assert!(
+                after[cpu as usize] > before[cpu as usize],
+                "cpu {cpu} had not invalidated when the shootdown returned"
+            );
+        }
+        assert_eq!(outstanding, 0, "the shootdown returned with acknowledgements outstanding");
+        // The initiator must never be in its own outstanding set. It waits
+        // before it is in any position to service anything, so a mask that
+        // included it would hang rather than merely run slowly, and no test
+        // after this one would ever report.
+        assert_eq!(
+            after[me as usize], before[me as usize],
+            "the initiator serviced its own shootdown; it would have waited on itself"
+        );
+    }
+
+    #[test_case]
+    fn a_remapped_page_is_not_read_through_the_old_translation() {
+        use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+
+        crate::frames::init();
+        let hhdm = crate::boot::hhdm_offset();
+        let mut space = unsafe { AddressSpace::active(hhdm) };
+        const VA: u64 = 0xffff_9a00_0000_0000;
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+
+        // This is the failure a shootdown exists to prevent, constructed on the
+        // CPU that performs the remap. It covers the *local* invalidation only:
+        // asserting that a remote CPU reads the new frame needs a remote CPU
+        // executing kernel code, and application processors park in `hlt`
+        // without scheduling. The remote half of this property is covered by
+        // `a_shootdown_returns_only_after_every_other_cpu_has_invalidated`,
+        // which asserts that each of them ran the invalidation before the
+        // initiator returned — not that the resulting translation is gone.
+        let old = crate::frames::alloc(0).expect("frame allocation failed");
+        let new = crate::frames::alloc(0).expect("frame allocation failed");
+        assert_ne!(old, new, "the allocator handed out one frame twice");
+        unsafe {
+            core::ptr::write_bytes((hhdm + old) as *mut u8, 0xA5, 4096);
+            core::ptr::write_bytes((hhdm + new) as *mut u8, 0x5A, 4096);
+            space.map(VA, old, flags, &mut || crate::frames::alloc(0)).expect("map failed");
+        }
+
+        // Read before the remap, so the translation is actually cached in this
+        // CPU's TLB. Without it the assertion below passes on a kernel that
+        // never invalidates anything, because the walk would be fresh either
+        // way -- which is the shape of test this project has already shipped.
+        assert_eq!(unsafe { (VA as *const u8).read_volatile() }, 0xA5, "the old frame was not mapped");
+
+        unsafe {
+            space.unmap(VA).expect("unmap failed");
+            space.map(VA, new, flags, &mut || crate::frames::alloc(0)).expect("remap failed");
+        }
+        assert_eq!(
+            unsafe { (VA as *const u8).read_volatile() },
+            0x5A,
+            "the cpu resolved the old frame through a stale translation"
+        );
+
+        unsafe {
+            space.unmap(VA).expect("teardown unmap failed");
+            crate::frames::free(old, 0);
+            crate::frames::free(new, 0);
+        }
     }
 
     #[test_case]

@@ -7,9 +7,22 @@ const IA32_APIC_BASE_MSR: u32 = 0x1B;
 // Register offsets, in bytes, from the local APIC base.
 const REG_SPURIOUS: usize = 0xF0;
 const REG_EOI: usize = 0xB0;
+/// Interrupt Command Register, low half. Writing it is what sends the IPI, so
+/// any high-half destination must already be in place — which the shorthand
+/// below makes unnecessary.
+const REG_ICR_LOW: usize = 0x300;
 const REG_LVT_TIMER: usize = 0x320;
 const REG_TIMER_INITIAL: usize = 0x380;
 const REG_TIMER_DIVIDE: usize = 0x3E0;
+
+/// Set by the APIC while an IPI is still being delivered; the next write to the
+/// ICR must wait for it to clear or the pending one is lost.
+const ICR_DELIVERY_STATUS: u32 = 1 << 12;
+/// Level=assert. Required for every delivery mode except INIT de-assert, which
+/// this kernel never sends.
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+/// Destination shorthand 0b11: every CPU on the bus except the sender.
+const ICR_ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
 
 const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 const SPURIOUS_ENABLE: u32 = 1 << 8;
@@ -94,6 +107,36 @@ pub fn start_timer(divide: u32, initial_count: u32) {
     write(REG_TIMER_DIVIDE, divide);
     write(REG_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
     write(REG_TIMER_INITIAL, initial_count);
+}
+
+/// Sends a fixed IPI on `vector` to every CPU on the bus except this one.
+///
+/// Returns whether it was sent: `false` means this CPU has no local APIC base
+/// yet, which is the only reason the write can be skipped. Callers that wait
+/// for a response must treat that as an error rather than as a delivered
+/// message — a silently unsent IPI is an unbounded wait.
+///
+/// The *shorthand* rather than an explicit destination, because this kernel
+/// tracks CPUs by the firmware's `processor_id` and not by LAPIC id, so it has
+/// no list of destinations to iterate. The shorthand also reaches CPUs that are
+/// not yet in the shootdown mask; those either have the vector installed (in
+/// which case the handler finds no bit set for them and does nothing) or have
+/// interrupts masked in the bootloader's holding pen, where the IPI stays
+/// pending until they have loaded an IDT of their own.
+pub fn send_ipi_all_excluding_self(vector: u8) -> bool {
+    let Some(icr) = reg(REG_ICR_LOW) else {
+        return false;
+    };
+    // SAFETY: `reg` returns an address inside the LAPIC MMIO page the caller of
+    // `init` mapped uncacheable.
+    unsafe {
+        // A previous IPI still in delivery would be overwritten by this write.
+        while icr.read_volatile() & ICR_DELIVERY_STATUS != 0 {
+            core::hint::spin_loop();
+        }
+        icr.write_volatile(ICR_ALL_EXCLUDING_SELF | ICR_LEVEL_ASSERT | vector as u32);
+    }
+    true
 }
 
 /// Signals end-of-interrupt. Must be called from every APIC interrupt handler.

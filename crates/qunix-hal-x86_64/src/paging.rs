@@ -336,6 +336,12 @@ impl AddressSpace {
 
     /// Removes a 4 KiB mapping and returns the physical address it pointed at.
     ///
+    /// Invalidates the translation on this CPU *and* on every other online CPU
+    /// before returning, so the caller may free the frame the moment it has it.
+    /// The remote half is what makes that true on more than one CPU: a local
+    /// `invlpg` leaves every other core resolving the address through the frame
+    /// the allocator is about to write free-list links into.
+    ///
     /// # Safety
     /// Nothing may hold a reference derived from `va` after this returns.
     pub unsafe fn unmap(&mut self, va: u64) -> Result<u64, MapError> {
@@ -345,6 +351,9 @@ impl AddressSpace {
         match mapper.unmap(page) {
             Ok((frame, flush)) => {
                 flush.flush();
+                // Waits for every other CPU to acknowledge. Returning before
+                // they have is the same bug as not shooting down at all.
+                crate::tlb::shootdown_page(va);
                 Ok(frame.start_address().as_u64())
             }
             Err(err) => Err(unmap_error(err)),
@@ -432,17 +441,17 @@ impl AddressSpace {
         }
 
         // Frames are collected rather than freed inline: the buddy allocator
-        // writes free-list links into a frame the instant it is released, but
-        // the CPU may still hold that frame in a paging-structure cache until
-        // the invalidation below, and would then walk allocator metadata as a
-        // page table. Unlink everything, invalidate, and only then release.
+        // writes free-list links into a frame the instant it is released, but a
+        // CPU may still hold that frame in a paging-structure cache until the
+        // invalidation below, and would then walk allocator metadata as a page
+        // table. Unlink everything, invalidate, and only then release.
         //
-        // The invalidation below flushes this CPU only. Remote paging-structure
-        // caches are not covered, so the same hazard survives across cores:
-        // another CPU may still hold a cached translation through a frame this
-        // one has released. Safe today only because application processors park
-        // without scheduling (see `kernel/src/smp.rs`); a cross-CPU shootdown
-        // that waits for acknowledgement is what has to land before they stop.
+        // The invalidation below covers every online CPU, not just this one,
+        // and does not return until each has acknowledged — which is what makes
+        // the release afterwards safe with application processors running. A
+        // whole-TLB flush rather than the leaf `invlpg` `unmap` already issued:
+        // an unlinked table invalidates an unknown set of addresses, and the
+        // paging-structure caches holding it are not addressed by the leaf.
         let mut freed: [Option<u64>; 3] = [None; 3];
         unsafe { Self::clear_entry(p2, addr.p2_index()) };
         freed[0] = Some(p1_pa);
@@ -458,8 +467,9 @@ impl AddressSpace {
         }
 
         // Structures changed above the leaf, so the per-page flush `unmap`
-        // already issued does not cover it.
+        // already issued does not cover it — on this CPU or on any other.
         x86_64::instructions::tlb::flush_all();
+        crate::tlb::shootdown_all();
 
         let mut count = 0u8;
         for frame_pa in freed.into_iter().flatten() {

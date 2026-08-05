@@ -30,7 +30,7 @@
 //! silently, so it is a compile error instead.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use x86_64::structures::gdt::GlobalDescriptorTable;
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::tss::TaskStateSegment;
@@ -152,9 +152,47 @@ static BSP: BspCell = BspCell(UnsafeCell::new(PerCpu::new(0)));
 /// CPUs that have completed `install`. Bring-up ordering, not a lock.
 static INSTALLED: AtomicU32 = AtomicU32::new(0);
 
+/// Widest `cpu_id` the online mask can represent.
+///
+/// One atomic word, because a TLB shootdown has to test and clear a single
+/// CPU's bit from an interrupt handler and a multi-word set could not be
+/// updated atomically. A machine reporting a larger id is refused loudly at
+/// [`mark_online`] rather than silently dropped from every shootdown, which
+/// would be a correctness hole rather than a capacity limit.
+pub const MAX_CPUS: u32 = 64;
+
+/// CPUs that can service an inter-processor interrupt, one bit per `cpu_id`.
+///
+/// Deliberately *not* set by `install`. A per-CPU block is not enough to
+/// respond to an IPI: the CPU also needs its local APIC software-enabled and
+/// interrupts unmasked. A CPU in this mask that cannot take the IPI would make
+/// every TLB shootdown initiator wait forever for an acknowledgement it is
+/// unable to send, so the mask means "can acknowledge", not "exists".
+static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+
 /// Number of CPUs whose per-CPU block is live.
 pub fn installed_count() -> u32 {
     INSTALLED.load(Ordering::Acquire)
+}
+
+/// CPUs able to service an IPI, one bit per `cpu_id`.
+pub fn online_mask() -> u64 {
+    ONLINE_MASK.load(Ordering::Acquire)
+}
+
+/// Declares that this CPU can now service inter-processor interrupts.
+///
+/// Idempotent. Must be called *after* this CPU has loaded its IDT, enabled its
+/// local APIC and unmasked interrupts — see [`ONLINE_MASK`] for what goes wrong
+/// when it is called earlier.
+pub fn mark_online() {
+    let cpu = cpu_id();
+    assert!(
+        cpu < MAX_CPUS,
+        "cpu id {cpu} exceeds the {MAX_CPUS}-cpu online mask; it could not be waited for \
+         by a tlb shootdown"
+    );
+    ONLINE_MASK.fetch_or(1u64 << cpu, Ordering::AcqRel);
 }
 
 /// Installs the bootstrap processor's block.

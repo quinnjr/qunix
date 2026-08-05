@@ -8,7 +8,8 @@
 //! # What an AP does, and what it does not
 //!
 //! Each AP installs its own per-CPU block — its own GDT, TSS, IDT and
-//! double-fault stack — and then parks. It does **not** run scheduler threads.
+//! double-fault stack — enables its local APIC, unmasks interrupts, and then
+//! parks in `hlt`. It does **not** run scheduler threads.
 //!
 //! That is a real limit, not an oversight, and it has a specific cause:
 //! `sched::Scheduler::current` is a single field naming one running thread. On
@@ -18,6 +19,13 @@
 //! a `current_thread` slot for exactly this, and moving `current` into it is
 //! what makes APs schedulable. Until that happens, parking is the honest
 //! behaviour: an AP that took work would corrupt the CPU that gave it.
+//!
+//! Parking with interrupts *enabled* is not a step towards that. It is what a
+//! TLB shootdown requires: `hlt` with `IF` clear is not woken by a maskable
+//! interrupt at all, so an AP parked the way M1 parked them could never
+//! acknowledge an invalidation, and every initiator would spin forever. An AP
+//! here still takes no scheduling work — its LAPIC timer was never started, so
+//! the only interrupt that can reach it is an IPI.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use limine::mp::MpInfo;
@@ -115,16 +123,31 @@ unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // wait for the heap, but an AP always can.
     unsafe { qunix_hal_x86_64::percpu::install_ap(cpu_id) };
 
+    // A local APIC that is not software-enabled does not accept fixed
+    // interrupts, so without this the AP would sit in the shootdown mask and
+    // never take the IPI. The MMIO page was mapped by the BSP into the kernel
+    // half every address space shares, so it is already reachable here, and
+    // `init` is idempotent — it stores the same base this CPU's `IA32_APIC_BASE`
+    // reports.
+    // SAFETY: `map_lapic` ran on the BSP before any AP was started, mapping
+    // exactly this page uncacheable.
+    unsafe { qunix_hal_x86_64::apic::init(crate::boot::hhdm_offset()) };
+
+    // Interrupts on before the mask, not after. `mark_online` is a promise that
+    // this CPU can acknowledge a TLB shootdown, and a CPU that is in the mask
+    // but cannot take the IPI hangs every initiator. The LAPIC timer is
+    // deliberately not started here: an AP has no run queue, so a tick would
+    // only lead into `preempt`.
+    x86_64::instructions::interrupts::enable();
+    qunix_hal_x86_64::percpu::mark_online();
+
     ONLINE.fetch_add(1, Ordering::AcqRel);
 
     // Parked. See the module docs: taking scheduler work from here would
     // corrupt the CPU that queued it, because `sched.current` is not per-CPU
-    // yet. `hlt` in a loop rather than a spin so the core is not burned.
+    // yet. `hlt` in a loop rather than a spin so the core is not burned, and
+    // with interrupts enabled so a shootdown IPI actually wakes it.
     loop {
-        // Interrupts are still disabled on this CPU, so nothing will wake it.
-        // That is deliberate: an AP with no run queue has nothing to service,
-        // and enabling interrupts would only invite a timer tick into
-        // `preempt`, which would try to schedule.
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
 }

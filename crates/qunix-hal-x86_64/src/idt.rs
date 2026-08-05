@@ -25,6 +25,12 @@ pub unsafe fn build_and_load(idt: &mut InterruptDescriptorTable) {
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
     idt.general_protection_fault.set_handler_fn(gp_fault_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
+    // Installed here rather than by the kernel, so that every CPU has it by
+    // construction. A CPU that came online without it would either triple-fault
+    // on the first shootdown or never acknowledge one, and the initiator's wait
+    // is unbounded — "install it on each CPU" is exactly the obligation
+    // `set_handler` leaves to its callers, and this one cannot be missed.
+    idt[crate::tlb::SHOOTDOWN_VECTOR].set_handler_fn(crate::tlb::shootdown_handler);
     // SAFETY: the caller guarantees the table outlives this CPU.
     unsafe {
         idt.double_fault
