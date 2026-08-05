@@ -89,6 +89,24 @@ Two traps, both already hit here:
   measured 9-17% *slower* and was reverted. Criterion's change detection is the
   reason that was noticed rather than shipped.
 
+## The coverage ratchet is not deterministic
+
+`qunix-sync` measured 97.84% here and 96.76% on a CI runner for the *same
+commit*, failed the ratchet, and then passed on a re-run with no code change.
+The backoff loop in `SpinLock::lock` is only executed when threads genuinely
+overlap, and how often that happens is a property of the runner's core count
+and scheduling, not of the code — the same reason recorded under Tests.
+
+So a ratchet failure in `qunix-sync` is not automatically a regression. Re-run
+it once before believing it. When it does fail, the error now lists the
+uncovered lines of each regressed crate; compare those against a local run
+rather than assuming the percentage means what it says.
+
+Do not "fix" this by widening `TOLERANCE_PP` — that weakens the ratchet for
+every crate to accommodate one. The lines at `lib.rs:221-222` are compile-time
+assertions inside `const _: () = {}` and are uncovered on every machine; they
+are not the flaky ones.
+
 ## Fuzzing
 
 `cargo xtask fuzz` runs cargo-fuzz over the buddy allocator and the slab heap.
