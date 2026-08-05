@@ -22,6 +22,8 @@
 //! scaffolding.
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicBool, Ordering};
+use qunix_sync::IrqControl;
 use qunix_hal_x86_64::context::{self, Context};
 use qunix_sched::{Priority, RunQueue, ThreadId};
 use qunix_sync::IrqSpinLock;
@@ -64,7 +66,40 @@ impl Scheduler {
 /// spin forever against itself.
 static SCHED: IrqSpinLock<Scheduler, qunix_hal_x86_64::Irq> = IrqSpinLock::new(Scheduler::new());
 
-static INITIALISED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static INITIALISED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a timer tick may switch threads.
+///
+/// Off until something explicitly turns it on. Early boot, and any window that
+/// is not prepared to lose the CPU, would otherwise be preempted the moment the
+/// APIC timer starts -- which on this kernel is before the scheduler has a
+/// thread table.
+static PREEMPT: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables timer-driven preemption, returning the previous setting.
+pub fn set_preemption(enabled: bool) -> bool {
+    PREEMPT.swap(enabled, Ordering::AcqRel)
+}
+
+pub fn preemption_enabled() -> bool {
+    PREEMPT.load(Ordering::Acquire)
+}
+
+/// Timer-tick entry point.
+///
+/// Separate from [`yield_now`] because the constraints differ: this runs in
+/// interrupt context, must do nothing at all when the scheduler is not ready,
+/// and must never panic -- a panic here fires on every subsequent tick.
+///
+/// The caller must have signalled EOI already. Switching first would leave the
+/// LAPIC waiting for an EOI that only arrives when this thread is scheduled
+/// again, so the CPU would take no further timer interrupts in the meantime.
+pub fn preempt() {
+    if !PREEMPT.load(Ordering::Acquire) || !INITIALISED.load(Ordering::Acquire) {
+        return;
+    }
+    schedule(ThreadState::Ready);
+}
 
 /// Adopts the currently-executing context as thread 0.
 ///
@@ -84,11 +119,33 @@ pub fn init() {
     sched.current = boot;
 }
 
+/// What a new thread should run, handed to [`thread_entry`] through the single
+/// `u64` the context switch can carry.
+struct ThreadStart {
+    entry: extern "C" fn(u64) -> !,
+    arg: u64,
+}
+
+/// Every kernel thread's real first instruction.
+///
+/// `schedule` leaves interrupts disabled across a switch and restores them
+/// after it returns; a thread running for the first time never reaches that
+/// restore, so it would run with interrupts masked forever -- no preemption,
+/// no timer, and a `yield_now` that can never be interrupted. Enabling them
+/// here is what makes a fresh thread indistinguishable from a resumed one.
+extern "C" fn thread_entry(raw: u64) -> ! {
+    let start = unsafe { alloc::boxed::Box::from_raw(raw as *mut ThreadStart) };
+    let ThreadStart { entry, arg } = *start;
+    x86_64::instructions::interrupts::enable();
+    entry(arg)
+}
+
 /// Creates a runnable kernel thread.
 pub fn spawn_kernel(entry: extern "C" fn(u64) -> !, arg: u64, prio: Priority) -> ThreadId {
+    let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(ThreadStart { entry, arg }));
     let mut sched = SCHED.lock();
     let id = sched.allocate_id();
-    let thread = Thread::new_kernel(entry, arg, prio);
+    let thread = Thread::new_kernel(thread_entry, start as u64, prio);
     sched.threads.insert(id, thread);
     sched.queue.push(id, prio);
     id
@@ -130,6 +187,19 @@ pub fn exit_current() -> ! {
 
 /// The core switch. `outgoing_state` is what the *calling* thread becomes.
 fn schedule(outgoing_state: ThreadState) {
+    // Interrupts off across the *whole* decision, not just while the lock is
+    // held. The lock must be dropped before the switch (see the module docs),
+    // and that window is not safe to be preempted in: by then `sched.current`
+    // already names the incoming thread, which is not yet running, so a tick
+    // landing here would save the outgoing thread's stack pointer into the
+    // incoming thread's context and hand two threads the same stack.
+    //
+    // Restored after the switch returns -- which is when *this* thread is
+    // scheduled again, using the flag state this thread saved. A thread
+    // starting for the first time never reaches that restore, which is why
+    // `thread_entry` enables interrupts itself.
+    let irq = qunix_hal_x86_64::Irq::disable_and_save();
+
     // Raw pointers are copied out under the lock and used after it is dropped;
     // see the module docs on why the lock cannot span the switch.
     let (from_slot, to_ctx): (*mut *mut Context, *mut Context);
@@ -143,10 +213,12 @@ fn schedule(outgoing_state: ThreadState) {
             // is left to `exit_current` to panic; a yielding one simply carries
             // on, which is the right answer for the boot thread.
             if outgoing_state == ThreadState::Exited {
+                qunix_hal_x86_64::Irq::restore(irq);
                 return;
             }
             drop(sched);
             reap();
+            qunix_hal_x86_64::Irq::restore(irq);
             return;
         };
 
@@ -193,8 +265,10 @@ fn schedule(outgoing_state: ThreadState) {
     // resume until something switches back to it.
     unsafe { context::switch(from_slot, to_ctx) };
 
-    // Reached only when this thread is scheduled again. Whatever ran in between
-    // may have exited, so this is the natural place to collect it.
+    // Reached only when this thread is scheduled again.
+    qunix_hal_x86_64::Irq::restore(irq);
+    // Whatever ran in between may have exited, so this is the natural place to
+    // collect it.
     reap();
 }
 

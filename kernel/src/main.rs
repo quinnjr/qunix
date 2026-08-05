@@ -28,7 +28,12 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // are unmeasurable, and a per-CPU timer on more than one core makes a
     // load/store pair lose counts.
     TICKS.fetch_add(1, Ordering::Relaxed);
+    // EOI before any switch. Switching first would leave the LAPIC waiting for
+    // an EOI that only arrives when this thread runs again, so the CPU would
+    // take no further timer interrupts until then -- which, if the thread is
+    // waiting on something a timer drives, is never.
     qunix_hal_x86_64::apic::eoi();
+    crate::sched::preempt();
 }
 
 /// Maps the local APIC's MMIO page into the HHDM range, uncacheable.
@@ -149,7 +154,11 @@ pub extern "C" fn kmain() -> ! {
     unsafe { qunix_hal_x86_64::apic::init(boot::hhdm_offset()) };
     qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
     x86_64::instructions::interrupts::enable();
-    println!("qunix: apic timer running");
+    // Only now: preemption before this point would let a tick switch threads
+    // while the scheduler still had no thread table, and before the APIC timer
+    // exists there is nothing to drive it anyway.
+    sched::set_preemption(true);
+    println!("qunix: apic timer running, preemption enabled");
 
     #[cfg(test)]
     test_main();
@@ -384,6 +393,89 @@ mod tests {
             crate::sched::yield_now();
         }
         assert_eq!(crate::sched::current_id(), qunix_sched::ThreadId(0));
+    }
+
+    static SPIN_RAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static SPIN_STOP: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Never calls `yield_now`, so the only thing that can take the CPU from it
+    /// is a timer tick.
+    ///
+    /// It does watch a stop flag, which is not a weakening of the test: the
+    /// in-QEMU harness runs every test against one kernel and one scheduler, so
+    /// a thread that truly never terminates is inherited by every later test.
+    /// An earlier version of this omitted the flag and hung the next test.
+    extern "C" fn spinner(_: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        while !SPIN_STOP.load(Ordering::SeqCst) {
+            SPIN_RAN.fetch_add(1, Ordering::SeqCst);
+            core::hint::spin_loop();
+        }
+        crate::sched::exit_current();
+    }
+
+    #[test_case]
+    fn the_timer_preempts_a_thread_that_never_yields() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        SPIN_RAN.store(0, Ordering::SeqCst);
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        let before = crate::sched::thread_count();
+
+        let was = crate::sched::set_preemption(true);
+        crate::sched::spawn_kernel(spinner, 0, Priority::Normal);
+
+        // Hand the CPU over once. From here the spinner never yields, so only
+        // a timer tick can bring control back to this thread.
+        let ticks_before = crate::TICKS.load(Ordering::SeqCst);
+        crate::sched::yield_now();
+
+        assert!(
+            SPIN_RAN.load(Ordering::SeqCst) > 0,
+            "the spinner never ran"
+        );
+        assert!(
+            crate::TICKS.load(Ordering::SeqCst) > ticks_before,
+            "no timer tick was taken; preemption cannot be what returned control"
+        );
+        // The spinner is still runnable and must not have been reaped.
+        assert!(
+            crate::sched::thread_count() > before,
+            "the preempted thread disappeared instead of staying runnable"
+        );
+
+        // Wind it down, or every later test inherits a thread that never ends.
+        SPIN_STOP.store(true, Ordering::SeqCst);
+        for _ in 0..16 {
+            if crate::sched::thread_count() == before {
+                break;
+            }
+            crate::sched::yield_now();
+        }
+        crate::sched::set_preemption(was);
+        assert_eq!(
+            crate::sched::thread_count(),
+            before,
+            "the spinner did not exit; later tests would inherit it"
+        );
+    }
+
+    #[test_case]
+    fn preemption_is_off_by_default_and_toggles() {
+        // The negative direction: a tick arriving before the scheduler has a
+        // thread table must do nothing at all, so the default has to be off.
+        let previous = crate::sched::set_preemption(false);
+        assert!(!crate::sched::preemption_enabled(), "disabling did not take effect");
+        // Returns the *previous* setting, which is what makes it usable for
+        // save-and-restore around a critical section.
+        assert!(!crate::sched::set_preemption(true), "set_preemption returned the new value");
+        assert!(crate::sched::preemption_enabled(), "enabling did not take effect");
+        assert!(crate::sched::set_preemption(previous), "the previous setting was not reported");
     }
 
     #[test_case]
