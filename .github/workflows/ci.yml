@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # criterion depends on `alloca`, which compiles C. Building it for the musl
+  # host target makes cc-rs look for `x86_64-linux-musl-gcc`, which Ubuntu's
+  # musl-tools does not provide -- it installs `musl-gcc`. Point cc-rs at the
+  # name that actually exists.
+  CC_x86_64_unknown_linux_musl: musl-gcc
 
 jobs:
   test:
@@ -33,7 +38,7 @@ jobs:
       - name: Install QEMU and OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools
           # Must be a unified image. The split OVMF_CODE*.fd needs a companion
           # writable VARS pflash that the harness does not attach, so pointing
           # at one fails inside the firmware rather than here.
@@ -64,6 +69,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install musl C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       # Fails when any crate's line coverage falls below the floor recorded in
       # coverage-baseline.toml. Needs no QEMU: only host-testable crates are
