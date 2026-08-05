@@ -190,15 +190,24 @@ pub fn parse_baseline(text: &str) -> BTreeMap<String, f64> {
 fn existing_notes(text: &str) -> BTreeMap<String, Vec<String>> {
     let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pending: Vec<String> = Vec::new();
+    // The file header is the comment block at the very top. It belongs to no
+    // crate, and attributing it to the first one duplicates it on every
+    // subsequent render -- which is what happened: the header ended up inside
+    // `qunix-hal-x86_64`'s note block. A blank line normally separates them,
+    // but relying on that made the rule depend on formatting nobody enforces.
+    let mut at_header = true;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
             pending.push(line.to_string());
         } else if let Some((name, _)) = trimmed.split_once('=') {
-            if !pending.is_empty() {
+            if !pending.is_empty() && !at_header {
                 notes.insert(name.trim().trim_matches('"').to_string(), std::mem::take(&mut pending));
             }
+            pending.clear();
+            at_header = false;
         } else if trimmed.is_empty() {
+            at_header = false;
             // A blank line ends a block, so the file header is not attributed
             // to whichever crate happens to be listed first.
             pending.clear();
@@ -227,6 +236,57 @@ fn render_baseline(measured: &BTreeMap<String, Lines>, notes: &BTreeMap<String, 
         out.push_str(&format!("{name} = {:.2}\n", lines.percent()));
     }
     out
+}
+
+/// Rounds to the two decimals the baseline file stores.
+///
+/// Every comparison against a committed floor has to go through this, because
+/// the file is the source of truth and it holds two decimals. Comparing a
+/// full-precision measurement against a rounded floor reports a crate that did
+/// not move as having dropped.
+fn round2(percent: f64) -> f64 {
+    (percent * 100.0).round() / 100.0
+}
+
+/// Crates whose floor `--update` would lower without a stated reason.
+///
+/// Three things this checks that an earlier version did not, each of which let
+/// a floor slide:
+///
+/// * **Any** lowering counts, not only one larger than [`TOLERANCE_PP`]. The
+///   tolerance exists so a *read* of a noisy measurement does not fail the
+///   build; applying it to the *write* let every floor walk down 0.5 pp per
+///   `--update`, indefinitely.
+/// * A reason must mention the new figure. Requiring merely that some comment
+///   exists is satisfied forever by a comment written years earlier for a
+///   different number, which is what "documented" degenerated to.
+/// * The comparison is against the committed floor, so a crate with no floor
+///   yet (a new crate) is never treated as a lowering.
+fn lowering_without_reason(
+    old: &BTreeMap<String, f64>,
+    measured: &BTreeMap<String, Lines>,
+    notes: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    measured
+        .iter()
+        .filter(|(name, lines)| {
+            let Some(&floor) = old.get(*name) else { return false };
+            // Compared at the precision the file stores, not at full precision.
+            // The baseline holds two decimals, so 97.3262 is written as 97.33
+            // and then reads back as *higher* than itself -- which made an
+            // unchanged crate look like a lowering and blocked every update.
+            if round2(lines.percent()) >= round2(floor) {
+                return false;
+            }
+            // The reason has to name the number it is justifying. Without
+            // that, a stale note keeps authorising every future drop.
+            let figure = format!("{:.2}", round2(lines.percent()));
+            !notes
+                .get(*name)
+                .is_some_and(|note| note.iter().any(|line| line.contains(&figure)))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Formats the uncovered lines of each regressed crate.
@@ -268,20 +328,14 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
         // lowered on a justification that turned out to be false, and nothing
         // caught it.
         let old = parse_baseline(&previous);
-        let undocumented: Vec<String> = measured
-            .iter()
-            .filter(|(name, lines)| {
-                old.get(*name).is_some_and(|floor| lines.percent() + TOLERANCE_PP < *floor)
-                    && !notes.contains_key(*name)
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
+        let undocumented = lowering_without_reason(&old, &measured, &notes);
         if !undocumented.is_empty() {
             bail!(
-                "refusing to lower the floor for {} without a reason.\n\n\
-                 Add a `#` comment directly above that crate's line in {BASELINE} saying \
-                 which code is uncoverable and why, then re-run. Lowering a floor is a \
-                 decision to argue for, not a side effect of running --update.",
+                "refusing to lower the floor for {}.\n\n\
+                 Add a `#` comment directly above that crate's line in {BASELINE} that \
+                 names the new figure and says which code is uncoverable and why, then \
+                 re-run. The reason has to mention the number so a note written for an \
+                 earlier drop cannot keep authorising later ones.",
                 undocumented.join(", ")
             );
         }
@@ -497,6 +551,89 @@ end_of_record
         );
         // Dependencies are not the contributor's problem.
         assert_eq!(uncovered.len(), 1);
+    }
+
+    fn floors(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
+        pairs.iter().map(|(n, v)| ((*n).to_string(), *v)).collect()
+    }
+
+    fn measured(pairs: &[(&str, u64, u64)]) -> BTreeMap<String, Lines> {
+        pairs.iter().map(|(n, hit, found)| ((*n).to_string(), Lines { hit: *hit, found: *found })).collect()
+    }
+
+    #[test]
+    fn a_measurement_that_rounds_to_its_floor_is_not_a_lowering() {
+        // 9733/10000 is 97.33 exactly; 730/750 is 97.3333..., which is written
+        // as 97.33 and must not then read back as a drop against itself.
+        let old = floors(&[("qunix-sync", 97.33)]);
+        let now = measured(&[("qunix-sync", 730, 750)]);
+        assert!(
+            lowering_without_reason(&old, &now, &BTreeMap::new()).is_empty(),
+            "a crate that did not move was reported as lowering its floor"
+        );
+    }
+
+    #[test]
+    fn a_stale_note_does_not_authorise_a_new_lowering() {
+        // The defect this replaced: the gate asked only whether *some* comment
+        // existed, so one written for an earlier drop kept authorising every
+        // later one, forever.
+        let old = floors(&[("qunix-mm", 90.0)]);
+        let now = measured(&[("qunix-mm", 80, 100)]);
+        let mut notes = BTreeMap::new();
+        notes.insert("qunix-mm".to_string(), vec!["# dropped to 85.00 when X landed".to_string()]);
+        assert_eq!(
+            lowering_without_reason(&old, &now, &notes),
+            vec!["qunix-mm".to_string()],
+            "a note naming 85.00 authorised a drop to 80.00"
+        );
+    }
+
+    #[test]
+    fn a_note_naming_the_new_figure_authorises_the_lowering() {
+        let old = floors(&[("qunix-mm", 90.0)]);
+        let now = measured(&[("qunix-mm", 80, 100)]);
+        let mut notes = BTreeMap::new();
+        notes.insert("qunix-mm".to_string(), vec!["# 80.00 because the codegen path is host-unreachable".to_string()]);
+        assert!(lowering_without_reason(&old, &now, &notes).is_empty());
+    }
+
+    #[test]
+    fn a_sub_tolerance_drop_still_needs_a_reason() {
+        // TOLERANCE_PP exists so a noisy *read* does not fail the build. Applying
+        // it to the *write* let every floor walk down 0.5 pp per --update run.
+        let old = floors(&[("qunix-sync", 97.84)]);
+        let now = measured(&[("qunix-sync", 9750, 10000)]); // 97.50, a 0.34 pp drop
+        assert_eq!(
+            lowering_without_reason(&old, &now, &BTreeMap::new()),
+            vec!["qunix-sync".to_string()],
+            "a drop inside the tolerance was written without a reason"
+        );
+    }
+
+    #[test]
+    fn a_crate_with_no_floor_yet_is_not_a_lowering() {
+        let now = measured(&[("qunix-elf", 100, 100)]);
+        assert!(lowering_without_reason(&BTreeMap::new(), &now, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_rise_is_never_a_lowering() {
+        let old = floors(&[("qunix-mm", 90.0)]);
+        let now = measured(&[("qunix-mm", 96, 100)]);
+        assert!(lowering_without_reason(&old, &now, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn the_header_is_not_captured_when_no_blank_line_separates_it() {
+        // How the header came to be duplicated inside a crate's note block: the
+        // earlier rule relied on a blank line to end it, and a hand-edited file
+        // had none.
+        let notes = existing_notes("# file header\n# second line\nqunix-mm = 90.00\n");
+        assert!(
+            !notes.contains_key("qunix-mm"),
+            "the file header was attributed to the first crate: {notes:?}"
+        );
     }
 
     #[test]

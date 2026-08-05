@@ -16,10 +16,12 @@
 //!
 //! # One CPU for now
 //!
-//! There is a single global run queue and one lock. Task 6 makes the queue
-//! per-CPU; until then a global one is honest about the fact that only the BSP
-//! is running, and a per-CPU queue with one CPU in it would be untested
-//! scaffolding.
+//! There is a single global run queue and one lock, because only the bootstrap
+//! processor schedules. Application processors come online and park: `current`
+//! below is one field shared by every CPU, so two CPUs scheduling through it
+//! would have one save its stack pointer into the other's context. Moving
+//! `current` into `percpu::PerCpu` is what makes them schedulable; see
+//! Execution Deviation D3 in the M1 plan.
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -212,12 +214,18 @@ fn schedule(outgoing_state: ThreadState) {
             // Nothing else to run. An exiting thread has no way forward, so it
             // is left to `exit_current` to panic; a yielding one simply carries
             // on, which is the right answer for the boot thread.
-            if outgoing_state == ThreadState::Exited {
-                qunix_hal_x86_64::Irq::restore(irq);
-                return;
-            }
+            // The guard is dropped *before* the flag is restored, on both
+            // paths. Restoring first re-enables interrupts while `SCHED` is
+            // still held on this CPU, and the guard's own restore cannot undo
+            // it -- `IrqSpinLock::lock` captured `was_enabled = false`, because
+            // `schedule` had already masked. A tick landing in that window
+            // re-enters `preempt` -> `schedule` -> `SCHED.lock()` and spins
+            // against a lock this CPU owns, which is exactly the self-deadlock
+            // the `IrqSpinLock` choice is documented to prevent.
             drop(sched);
-            reap();
+            if outgoing_state != ThreadState::Exited {
+                reap();
+            }
             qunix_hal_x86_64::Irq::restore(irq);
             return;
         };

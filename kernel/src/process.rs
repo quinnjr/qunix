@@ -64,26 +64,66 @@ impl Process {
             // Copied through the HHDM: the user mapping is only reachable once
             // CR3 points at this address space, and it must not, yet. The
             // frames were zeroed on allocation, so `.bss` needs no extra work.
-            for (i, byte) in segment.data.iter().enumerate() {
-                let va = segment.vaddr + i as u64;
+            //
+            // Translated once per page rather than once per byte. A four-level
+            // walk for every byte made a 64 KiB segment ~262,000 dependent
+            // loads instead of 16 walks and 16 block copies, and the length is
+            // caller-controlled the moment anything but `init` is loaded.
+            let mut copied = 0usize;
+            while copied < segment.data.len() {
+                let va = segment.vaddr + copied as u64;
                 let pa = space.translate(va).ok_or(LoadError::BadAddress)?;
-                // SAFETY: `pa` is a frame this address space owns, reachable
-                // through the HHDM like all RAM.
-                unsafe { ((hhdm + pa) as *mut u8).write(*byte) };
+                // Stop at the page boundary: the next page is a different
+                // frame and needs its own translation.
+                let in_page = 4096 - (va & 0xfff) as usize;
+                let run = in_page.min(segment.data.len() - copied);
+                // SAFETY: `pa` backs `va` in an address space this owns, and
+                // `run` stays inside the page `pa` names.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        segment.data[copied..copied + run].as_ptr(),
+                        (hhdm + pa) as *mut u8,
+                        run,
+                    )
+                };
+                copied += run;
             }
         }
 
-        // Permissions applied only after every byte is in place. Doing it per
-        // segment as they are copied would leave a read-only page in the way
-        // of a later segment that shares it.
+        // Permissions are applied per *page*, not per segment, and only after
+        // every byte is in place.
+        //
+        // Two segments can share a page -- a linker routinely places the tail
+        // of `.text` and the head of `.rodata` in one. Applying each segment's
+        // permissions in turn lets the last one win, which either strips
+        // execute from real instructions or leaves a writable page executable.
+        // Neither faults here; the first shows up as a #PF on an instruction
+        // that exists, the second is a W^X hole. So the permissions of every
+        // segment touching a page are combined first, and the union is applied
+        // once.
+        let mut pages: alloc::collections::BTreeMap<u64, (bool, bool)> =
+            alloc::collections::BTreeMap::new();
         for segment in elf.segments() {
             let start = segment.vaddr & !0xfff;
-            let end = segment.vaddr + segment.mem_size;
+            let end = segment
+                .vaddr
+                .checked_add(segment.mem_size)
+                .ok_or(LoadError::BadAddress)?;
             for va in (start..end.next_multiple_of(4096)).step_by(4096) {
-                space
-                    .set_permissions(va, segment.writable, segment.executable)
-                    .map_err(LoadError::Map)?;
+                let entry = pages.entry(va).or_insert((false, false));
+                entry.0 |= segment.writable;
+                entry.1 |= segment.executable;
             }
+        }
+        for (va, (writable, executable)) in pages {
+            // A page that ends up both writable and executable is refused
+            // rather than mapped. It can only arise from a program whose
+            // segments genuinely overlap that way, and silently honouring it
+            // would put a W^X hole in the first process the kernel runs.
+            if writable && executable {
+                return Err(LoadError::WriteExecutePage(va));
+            }
+            space.set_permissions(va, writable, executable).map_err(LoadError::Map)?;
         }
 
         for page in 0..USER_STACK_PAGES {
@@ -107,6 +147,9 @@ pub enum LoadError {
     OutOfMemory,
     /// A segment names a virtual range that overflows.
     BadAddress,
+    /// Two segments share a page and between them ask for write and execute.
+    /// Refused rather than mapped: honouring it is a W^X hole.
+    WriteExecutePage(u64),
     Map(qunix_hal_x86_64::paging::MapError),
 }
 
