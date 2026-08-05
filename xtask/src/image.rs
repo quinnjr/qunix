@@ -78,7 +78,12 @@ fn git(cwd: &Path, args: &[&str], extra: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Copies `src` to `dst` only when they differ in length or mtime.
+/// Copies `src` to `dst` unless a recorded stamp says the destination already
+/// came from this exact source.
+///
+/// Not a comparison of `src` against `dst`: the stamp records the source path,
+/// length and mtime, and `dst`'s length is checked separately. The reason is in
+/// the comments below -- provenance, not just freshness.
 ///
 /// The kernel ELF is tens of MiB with debug info, and BOOTX64.EFI plus
 /// limine.conf never change during a dev session; re-copying all three on every
@@ -159,8 +164,13 @@ pub fn build_esp(root: &Path, target_dir: &Path, kernel: &Path) -> Result<PathBu
     Ok(esp)
 }
 
-/// Removes anything in the ESP that is not one of the three files we place
-/// there, so a stale artefact cannot reach the guest through VVFAT.
+/// Removes anything in the ESP that `build_esp` did not place there, so a stale
+/// artefact cannot reach the guest through VVFAT.
+///
+/// `EXPECTED` is coupled to `build_esp` by hand: a `copy_if_changed`
+/// destination that is not listed here is written and then deleted in the same
+/// call, and the failure surfaces as a bootloader error rather than a build
+/// one. Keep the two in step.
 fn prune_unexpected(esp: &Path) -> Result<()> {
     const EXPECTED: &[&str] = &[
         "EFI",

@@ -76,10 +76,13 @@ pub struct SpinLockGuard<'a, T: ?Sized> {
     _not_send: PhantomData<*const ()>,
 }
 
-// Without this, the guard would auto-derive `Sync` from `&SpinLock<T>`, i.e.
-// whenever `T: Send`. Two threads sharing `&guard` could then both `deref()`
-// and hold `&T` concurrently, which is unsound for `Send + !Sync` types such as
-// `Cell`. The bound must be `T: Sync`, matching `std::sync::MutexGuard`.
+// This impl *grants* `Sync`, it does not narrow an auto-derive. The
+// `PhantomData<*const ()>` above makes the guard neither `Send` nor `Sync`, so
+// without this line it would be unconditionally `!Sync` and `&guard` could not
+// be shared at all. The bound is `T: Sync` rather than `T: Send` because two
+// threads holding `&guard` can both `deref()` and hold `&T` concurrently, which
+// is unsound for `Send + !Sync` types such as `Cell`. Same bound as
+// `std::sync::MutexGuard`, for the same reason.
 unsafe impl<T: ?Sized + Sync> Sync for SpinLockGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for SpinLockGuard<'_, T> {
@@ -185,6 +188,8 @@ pub struct IrqSpinLockGuard<'a, T: ?Sized, I: IrqControl> {
     _not_send: PhantomData<*const ()>,
 }
 
+// As `SpinLockGuard`: grants `Sync` that the `PhantomData<*const ()>` above
+// otherwise denies, at the bound that keeps `&T` sharing sound.
 unsafe impl<T: ?Sized + Sync, I: IrqControl> Sync for IrqSpinLockGuard<'_, T, I> {}
 
 impl<T: ?Sized, I: IrqControl> Deref for IrqSpinLockGuard<'_, T, I> {
@@ -217,6 +222,20 @@ impl<T: ?Sized, I: IrqControl> Drop for IrqSpinLockGuard<'_, T, I> {
 /// in ordinary tests: an accidental auto-derive would compile and pass every
 /// runtime test while allowing a data race. Kept outside `#[cfg(test)]` so they
 /// are checked on every build, including the kernel target.
+/// `IrqControl` that masks nothing.
+///
+/// Used by the auto-trait assertions below, and by the host tests: it makes
+/// `IrqSpinLock`'s own logic — the guard lifecycle, the `try_lock` restore
+/// path — testable off the machine, which is otherwise reachable only from the
+/// kernel where a failure is a hang rather than an assertion.
+pub struct NoIrq;
+impl IrqControl for NoIrq {
+    fn disable_and_save() -> bool {
+        false
+    }
+    fn restore(_: bool) {}
+}
+
 const _: () = {
     const fn assert_sync<T: Sync>() {}
     const fn assert_send<T: Send>() {}
@@ -224,6 +243,11 @@ const _: () = {
     // The locks themselves are shareable and sendable for `T: Send`.
     let _ = assert_sync::<SpinLock<u32>>;
     let _ = assert_send::<SpinLock<u32>>;
+    // The IRQ guard's `!Send` requirement is sharper than the plain guard's --
+    // dropping it on another CPU would restore an interrupt flag captured
+    // elsewhere -- so it is asserted too rather than assumed to follow.
+    let _ = assert_sync::<IrqSpinLockGuard<'static, u32, NoIrq>>;
+    let _ = assert_send::<IrqSpinLock<u32, NoIrq>>;
     // A guard over a `Sync` payload is shareable...
     let _ = assert_sync::<SpinLockGuard<'static, u32>>;
     // ...but no guard is ever `Send`. There is no positive way to assert the
@@ -254,6 +278,30 @@ mod tests {
         let lock = SpinLock::new(0);
         drop(lock.lock());
         assert!(lock.try_lock().is_some());
+    }
+
+    #[test]
+    fn irq_spinlock_guards_the_value_and_releases_on_drop() {
+        let lock: IrqSpinLock<u32, NoIrq> = IrqSpinLock::new(5);
+        {
+            let mut guard = lock.lock();
+            *guard += 1;
+            // Held: a second attempt must fail rather than hand out a second
+            // `&mut` to the same value.
+            assert!(lock.try_lock().is_none(), "try_lock succeeded while the lock was held");
+        }
+        assert_eq!(*lock.lock(), 6, "the write through the guard was lost");
+    }
+
+    #[test]
+    fn irq_spinlock_try_lock_restores_state_when_it_fails() {
+        // The failure path calls `I::restore` before returning `None`; a
+        // version that forgot would leave interrupts masked on every miss.
+        let lock: IrqSpinLock<u32, NoIrq> = IrqSpinLock::new(0);
+        let held = lock.lock();
+        assert!(lock.try_lock().is_none());
+        drop(held);
+        assert!(lock.try_lock().is_some(), "the lock stayed held after a failed try_lock");
     }
 
     #[test]

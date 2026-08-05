@@ -28,18 +28,11 @@ fn read_msr(msr: u32) -> u64 {
 
 /// Address of a local APIC register, or `None` before [`init`] has run.
 fn reg(offset: usize) -> Option<*mut u32> {
-    // MUST revisit this Relaxed load, paired with `init`'s Release store, when
-    // SMP lands in M1 -- under M0 the storing and loading CPU are the same one,
-    // so program order alone orders them, but an AP would need the acquire side
-    // to see the mapping `init` established before it sees the base.
-    //
-    // A branch rather than an `assert!`: `eoi` runs on every timer tick, and a
-    // runtime assert drags core::panicking plus a formatted message into the
-    // ISR's reachable code and icache footprint. This predicate is never taken
-    // once `init` has run, so it costs a perfectly predicted branch, while
-    // `debug_assert!` would compile out in release and leave a safe `eoi()`
-    // writing to the raw offset as an absolute address.
-    let base = APIC_BASE.load(Ordering::Relaxed);
+    // `Acquire`, pairing with `init`'s `Release` store: an application processor
+    // has to see the LAPIC mapping `init` established before it sees the base,
+    // and program order alone only orders them on the CPU that did both. Free
+    // at the ISA level on x86-64, where every load is already acquire.
+        let base = APIC_BASE.load(Ordering::Acquire);
     if base == 0 {
         return None;
     }

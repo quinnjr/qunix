@@ -415,12 +415,27 @@ mod tests {
         crate::frames::init();
         crate::heap::init();
         crate::sched::init();
-        // Nothing else runnable. The boot thread must carry on, not block --
-        // this is the common case during bring-up.
+        // Drain first: the harness shares one scheduler with `kmain`, which has
+        // already spawned threads, so "nothing else runnable" has to be
+        // established rather than assumed. Without this the test passes even
+        // when `yield_now` switched away and came back, which is the case the
+        // name says is absent.
+        for _ in 0..16 {
+            if crate::sched::runnable_count() == 0 {
+                break;
+            }
+            crate::sched::yield_now();
+        }
+        assert_eq!(crate::sched::runnable_count(), 0, "could not reach an empty run queue");
+
+        let before = crate::TICKS.load(core::sync::atomic::Ordering::SeqCst);
+        let was = crate::sched::set_preemption(false);
         for _ in 0..3 {
             crate::sched::yield_now();
         }
+        crate::sched::set_preemption(was);
         assert_eq!(crate::sched::current_id(), qunix_sched::ThreadId(0));
+        let _ = before;
     }
 
     static SPIN_RAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -494,9 +509,11 @@ mod tests {
     }
 
     #[test_case]
-    fn preemption_is_off_by_default_and_toggles() {
-        // The negative direction: a tick arriving before the scheduler has a
-        // thread table must do nothing at all, so the default has to be off.
+    fn preemption_toggles_and_reports_the_previous_setting() {
+        // Deliberately not asserting the *default*: `kmain` enables preemption
+        // before `test_main` runs, so the initial value is unobservable from
+        // here and an assertion about it would only be restating the `false`
+        // this test just wrote.
         let previous = crate::sched::set_preemption(false);
         assert!(!crate::sched::preemption_enabled(), "disabling did not take effect");
         // Returns the *previous* setting, which is what makes it usable for
@@ -699,9 +716,13 @@ mod tests {
 
         // Writing through the block must be visible on the next read, which is
         // what proves `gs:` is pointing at the block rather than at zero.
+        // Saved and restored, not zeroed. `kernel_rsp` is the stack the syscall
+        // stub lands on; leaving it null means a later trap from ring 3 faults
+        // with no stack to report the fault on.
+        let saved = qunix_hal_x86_64::percpu::current().kernel_rsp;
         unsafe { qunix_hal_x86_64::percpu::current_mut().kernel_rsp = 0xffff_ffff_dead_0000 };
         assert_eq!(qunix_hal_x86_64::percpu::current().kernel_rsp, 0xffff_ffff_dead_0000);
-        unsafe { qunix_hal_x86_64::percpu::current_mut().kernel_rsp = 0 };
+        unsafe { qunix_hal_x86_64::percpu::current_mut().kernel_rsp = saved };
     }
 
     #[test_case]
@@ -773,10 +794,6 @@ mod tests {
         );
     }
 
-    #[test_case]
-    fn harness_runs_at_all() {
-        assert_eq!(1 + 1, 2);
-    }
 
     #[test_case]
     fn gdt_installs_expected_kernel_code_selector() {

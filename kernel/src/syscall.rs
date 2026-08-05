@@ -66,6 +66,27 @@ fn sys_write(ptr: u64, len: u64) -> i64 {
     len as i64
 }
 
+/// One past the highest address a user pointer may name.
+///
+/// The *canonical* lower half, not the start of the kernel's higher half.
+/// Everything from here to `0xffff_7fff_ffff_ffff` is the non-canonical hole,
+/// and touching it raises #GP -- which this kernel has no handler that can
+/// recover from, so a process could halt the machine with a pointer that is
+/// neither kernel memory nor its own.
+const USER_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// Whether `[ptr, ptr + len)` lies wholly inside the canonical lower half.
+///
+/// Split out from [`copy_user_slice`] so the bound can be tested without
+/// dereferencing anything: `copy_user_slice` validates *and copies*, so a test
+/// asserting that a legal address is accepted would fault on it, the address
+/// being legal but unmapped. That is the difference this function makes
+/// testable, and it is the one the doc below is careful about.
+fn user_range_ok(ptr: u64, len: u64) -> bool {
+    let Some(end) = ptr.checked_add(len) else { return false };
+    ptr < USER_MAX && end <= USER_MAX
+}
+
 /// Copies `len` bytes from a user address, or `None` if the range is not a
 /// plausible user buffer.
 ///
@@ -84,15 +105,10 @@ fn sys_write(ptr: u64, len: u64) -> i64 {
 /// # Safety
 /// The active address space must be the calling process's.
 unsafe fn copy_user_slice(ptr: u64, len: u64) -> Option<alloc::vec::Vec<u8>> {
-    /// Lowest address the kernel occupies. Everything at or above it is off
-    /// limits to a user pointer.
-    const HIGHER_HALF: u64 = 0xffff_8000_0000_0000;
-
     if len == 0 {
         return Some(alloc::vec::Vec::new());
     }
-    let end = ptr.checked_add(len)?;
-    if ptr >= HIGHER_HALF || end > HIGHER_HALF {
+    if !user_range_ok(ptr, len) {
         return None;
     }
 
@@ -107,6 +123,26 @@ unsafe fn copy_user_slice(ptr: u64, len: u64) -> Option<alloc::vec::Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case]
+    fn the_user_range_bound_is_the_canonical_half_not_the_kernel_half() {
+        // Tested through `user_range_ok` rather than `copy_user_slice`, because
+        // the latter copies: asserting that a legal address is accepted would
+        // dereference it, and a legal-but-unmapped address faults.
+        //
+        // The gap the old higher-half bound left: addresses between the two
+        // canonical halves are neither kernel nor user memory, and touching one
+        // raises #GP with nothing to recover it. A process could have halted
+        // the machine with `write(0x0000_8000_0000_0000, 1)`.
+        assert!(!user_range_ok(0x0000_8000_0000_0000, 8), "non-canonical accepted");
+        assert!(!user_range_ok(0x0000_9000_0000_0000, 1), "non-canonical accepted");
+        assert!(!user_range_ok(0x0000_7fff_ffff_fff0, 64), "range ending in the hole accepted");
+        assert!(!user_range_ok(0xffff_8000_0000_0000, 8), "kernel address accepted");
+        assert!(!user_range_ok(u64::MAX - 4, 64), "wrapping range accepted");
+        // Pinned from below too, so the bound cannot drift downward unnoticed.
+        assert!(user_range_ok(0x0000_7fff_ffff_fff8, 8), "the last legal byte was refused");
+        assert!(user_range_ok(0x40_0000, 4096), "an ordinary user buffer was refused");
+    }
 
     #[test_case]
     fn a_kernel_pointer_is_refused() {
@@ -127,6 +163,7 @@ mod tests {
         // Starts legal, ends kernel-side. Checking only the start would let a
         // process read across the boundary.
         assert!(unsafe { copy_user_slice(0xffff_7fff_ffff_fff0, 32) }.is_none());
+
     }
 
     #[test_case]

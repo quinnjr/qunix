@@ -115,7 +115,7 @@ mod tests {
 
     /// Mirrors the predicate in `check`, so the parsing rule is pinned even
     /// though the surrounding function needs a real repository.
-    fn attested(body: &str) -> bool {
+    pub fn attested(body: &str) -> bool {
         body.lines()
             .map(str::trim)
             .any(|line| line.starts_with(TRAILER) && !line[TRAILER.len()..].trim().is_empty())

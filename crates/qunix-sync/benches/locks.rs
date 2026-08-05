@@ -2,7 +2,7 @@
 //!
 //! Every allocation, every frame operation and every console byte in the
 //! kernel passes through one of these. The uncontended path is what matters
-//! on a single CPU — contention only becomes interesting at M1's SMP.
+//! on a single CPU — contention is the harder thing to measure meaningfully and is not benched here.
 //!
 //! `NoopIrq` stands in for the real `IrqControl`, so the `IrqSpinLock` numbers
 //! measure the wrapper's overhead (the guard, the `ManuallyDrop` drop order)

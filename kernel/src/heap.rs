@@ -38,10 +38,6 @@ static HEAP: LockedHeap = LockedHeap(IrqSpinLock::new(SlabHeap::new()));
 // no window to observe, so a flag is all it needs.
 static INITIALISED: IrqSpinLock<bool, qunix_hal_x86_64::Irq> = IrqSpinLock::new(false);
 
-/// Bytes left in the heap's bump region.
-///
-/// This is the number that predicts heap death: `allocated_bytes` cannot,
-/// because alignment padding is consumed without being credited.
 /// Bytes currently handed out, in the extents the heap actually charged.
 ///
 /// Unlike [`bump_remaining`] this is unaffected by whether a block came from
@@ -51,6 +47,10 @@ pub fn allocated_bytes() -> usize {
     HEAP.0.lock().allocated_bytes()
 }
 
+/// Bytes left in the heap's bump region.
+///
+/// This is the number that predicts heap death: `allocated_bytes` cannot,
+/// because alignment padding is consumed without being credited.
 pub fn bump_remaining() -> usize {
     HEAP.0.lock().bump_remaining()
 }

@@ -17,12 +17,15 @@
 //!
 //! # Fixed offsets
 //!
-//! The first five fields are at architecturally fixed offsets because the
-//! `SYSCALL` entry stub in M1 Task 8 reaches them with `gs:[N]` before any Rust
-//! runs and before a stack is available. `OFFSET_*` and the accompanying
-//! `const` assertions are what keep the assembly and this struct in agreement;
-//! reordering the fields breaks the stub silently, so the assertions are a
-//! compile error rather than a comment.
+//! Three of these fields are reached from assembly by `gs:[N]`, before any Rust
+//! runs and before a stack exists: `kernel_rsp` and `user_rsp` by the `SYSCALL`
+//! entry stub, and `self_ptr` by `self_ptr()` below. `cpu_id` and
+//! `current_thread` are pinned alongside them so the scheduler can reach them
+//! the same way without a later reshuffle.
+//!
+//! `OFFSET_*` and the `const` assertions are what keep the assembly and this
+//! struct in agreement; reordering the fields would otherwise break the stub
+//! silently, so it is a compile error instead.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -206,9 +209,12 @@ unsafe fn finish_install(block: &mut PerCpu, cpu_id: u32) {
     let base = block as *mut PerCpu as u64;
     unsafe {
         write_msr(IA32_GS_BASE, base);
-        // Kept identical to `GS_BASE` until Task 8 introduces `swapgs`. A stray
-        // `swapgs` before then leaves the block reachable rather than pointing
-        // `gs:` at zero, which would fault inside the fault handler.
+        // Both MSRs hold the block address, and that is now a requirement
+        // rather than a transitional convenience: `enter_user` does not
+        // `swapgs` before `iretq`, so ring 3 runs with `GS_BASE` still naming
+        // the kernel block, and the entry stub's `swapgs` pair only works
+        // because the two are equal. Changing either means changing
+        // `enter_user`.
         write_msr(IA32_KERNEL_GS_BASE, base);
     }
 
@@ -252,10 +258,11 @@ pub fn current() -> &'static PerCpu {
 /// This CPU's block, mutably.
 ///
 /// # Safety
-/// The caller must ensure no other reference to this CPU's block is live. Note
-/// interrupt handlers on *this* CPU also reach it, so a caller holding this
-/// across a point where interrupts are enabled must be certain no handler in
-/// that window touches the block.
+/// No `&PerCpu` from [`current`] may be live, and the returned reference must
+/// not be held across any point where a *fault* can be taken. Masking
+/// interrupts is not sufficient: the double-fault handler reads this block
+/// through `gdt::ist_canary_intact`, and `#DF`/`#PF`/NMI are not maskable. The
+/// obligation is about exception context, not about the interrupt flag.
 #[allow(clippy::mut_from_ref)]
 pub unsafe fn current_mut() -> &'static mut PerCpu {
     let ptr = self_ptr();

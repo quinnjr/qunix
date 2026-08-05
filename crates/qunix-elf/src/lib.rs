@@ -42,7 +42,6 @@ pub enum ElfError {
     SegmentTooLarge,
 }
 
-const EI_NIDENT: usize = 16;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
@@ -82,8 +81,9 @@ mod phdr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment<'a> {
     pub vaddr: u64,
-    /// Bytes to reserve at `vaddr`. May exceed `data.len()`; the difference is
-    /// `.bss` and must be zeroed by the loader.
+    /// Bytes to reserve at `vaddr`. For a `Segment` from [`Elf64::segments`]
+    /// this is always at least `data.len()` -- `parse` refuses a file where it
+    /// is not -- and the difference is `.bss`, which the loader must zero.
     pub mem_size: u64,
     /// The file image. Borrowed from the input, never copied.
     pub data: &'a [u8],
@@ -98,7 +98,12 @@ impl Segment<'_> {
     /// file supplied leaves the rest holding whatever the frame previously
     /// contained, which is an information leak across the ring boundary.
     pub fn zero_fill(&self) -> u64 {
-        self.mem_size - self.data.len() as u64
+        // Saturating, not plain subtraction. `parse` rejects `filesz > memsz`
+        // so a `Segment` this crate produced can never underflow here -- but
+        // the fields are `pub`, and a caller-built one that did would return
+        // ~16 exabytes in release, where the kernel builds without overflow
+        // checks. A loader trusting that would zero the address space.
+        self.mem_size.saturating_sub(self.data.len() as u64)
     }
 }
 
@@ -135,7 +140,6 @@ impl<'a> Elf64<'a> {
         if bytes[4] != ELFCLASS64 || bytes[5] != ELFDATA2LSB || bytes[6] != EV_CURRENT {
             return Err(ElfError::NotElf64);
         }
-        debug_assert_eq!(EI_NIDENT, 16, "e_ident is 16 bytes and e_type follows it");
 
         if read_u16(bytes, ehdr::MACHINE) != EM_X86_64 {
             return Err(ElfError::NotX86_64);
@@ -392,8 +396,11 @@ mod tests {
 
     #[test]
     fn a_program_header_count_that_overflows_is_refused() {
-        // phnum * phentsize must not wrap; if it does, the table appears to
-        // end before it starts and the bounds check passes.
+        // A header count that puts the table past the end of the file. The
+        // `checked_mul` in `parse` cannot actually wrap here, since both
+        // operands come from `read_u16` and their product fits comfortably in
+        // a `usize` on any 64-bit target; it is belt-and-braces for a narrower
+        // host. What this exercises is the `table_end > bytes.len()` bound.
         let mut bytes = minimal();
         bytes[ehdr::PHNUM..ehdr::PHNUM + 2].copy_from_slice(&u16::MAX.to_le_bytes());
         assert_eq!(Elf64::parse(&bytes), Err(ElfError::BadProgramHeader));
@@ -447,6 +454,14 @@ mod tests {
         bytes[h + phdr::TYPE..h + phdr::TYPE + 4].copy_from_slice(&4u32.to_le_bytes());
         let elf = Elf64::parse(&bytes).unwrap();
         assert_eq!(elf.segments().count(), 0, "a non-PT_LOAD header was mapped");
+    }
+
+    #[test]
+    fn zero_fill_saturates_rather_than_underflowing() {
+        // Not reachable through `parse`, which refuses `filesz > memsz`. The
+        // fields are public, so the guard is about a caller-built `Segment`.
+        let seg = Segment { vaddr: 0, mem_size: 0, data: &[0u8; 8], writable: false, executable: false };
+        assert_eq!(seg.zero_fill(), 0, "zero_fill underflowed to a huge range");
     }
 
     #[test]

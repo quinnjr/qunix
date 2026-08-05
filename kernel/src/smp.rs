@@ -26,6 +26,7 @@ use limine::request::MpRequest;
 /// Asks Limine to start the APs and hold them for us.
 ///
 /// In the same `.requests` section as the other requests — see `boot.rs`.
+#[used]
 #[unsafe(link_section = ".requests")]
 static MP_REQUEST: MpRequest = MpRequest::new(0);
 

@@ -95,18 +95,14 @@ impl SlabHeap {
         // handed out from the first while leaving the free lists pointing into
         // it. `bump_end` catches a repeat call even when nothing was allocated.
         assert!(self.bump_end == 0 && self.allocated == 0, "backing replaced after allocations");
-        match va.checked_add(len) {
-            Some(end) => {
-                self.bump_next = va;
-                self.bump_end = end;
-            }
-            // A region that wraps the address space cannot be real; take
-            // nothing rather than hand out wrapped addresses.
-            None => {
-                self.bump_next = 0;
-                self.bump_end = 0;
-            }
-        }
+        // Asserted rather than absorbed, matching the sibling check above. A
+        // wrapping range is a caller error under this function's `# Safety`
+        // clause, and taking nothing instead left the heap permanently empty --
+        // surfacing much later as an allocation failure with no connection to
+        // its cause.
+        let end = va.checked_add(len).expect("heap backing wraps the address space");
+        self.bump_next = va;
+        self.bump_end = end;
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -268,6 +264,33 @@ mod tests {
     /// This is the load-bearing half of the argument for dropping `unsafe`: if
     /// any branch of `class_for` reached a free-list read before consulting
     /// `bump_end`, safe code could dereference a null head. One case per branch.
+    #[test]
+    #[should_panic(expected = "wraps the address space")]
+    fn set_backing_refuses_a_wrapping_range() {
+        let mut heap = SlabHeap::new();
+        unsafe { heap.set_backing(usize::MAX - 16, 4096) };
+    }
+
+    #[test]
+    fn a_zero_size_layout_round_trips_through_the_smallest_class() {
+        // The doc on `alloc` claims a zero-size request is served an 8-byte
+        // block and that `dealloc` classifies it identically. Only the
+        // no-backing path was covered, so neither half was pinned.
+        let mut backing = std::vec![0u8; 64 * 1024];
+        let base = backing.as_mut_ptr() as usize;
+        let mut heap = SlabHeap::new();
+        unsafe { heap.set_backing(base, 64 * 1024) };
+
+        let layout = Layout::from_size_align(0, 1).unwrap();
+        let first = heap.alloc(layout);
+        assert!(!first.is_null(), "a zero-size request was refused");
+        assert_eq!(heap.allocated_bytes(), 8, "a zero-size request was not charged one class");
+        unsafe { heap.dealloc(first, layout) };
+        assert_eq!(heap.allocated_bytes(), 0, "a zero-size block did not round-trip");
+        // And it comes back from the free list rather than the bump region.
+        assert_eq!(heap.alloc(layout), first, "the recycled block was not reused");
+    }
+
     #[test]
     fn alloc_before_set_backing_returns_null_on_every_path() {
         let mut heap = SlabHeap::new();

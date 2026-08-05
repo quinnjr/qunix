@@ -58,9 +58,14 @@ fn kvm_usable() -> bool {
 }
 
 fn find_ovmf() -> Option<String> {
-    if let Ok(path) = std::env::var("QUNIX_OVMF")
-        && Path::new(&path).exists()
-    {
+    // An explicit override that does not exist is an error, not a reason to
+    // fall back. Falling back silently boots *different* firmware than the one
+    // asked for -- on Debian, quite possibly the very file the override was
+    // meant to avoid.
+    if let Ok(path) = std::env::var("QUNIX_OVMF") {
+        if !Path::new(&path).exists() {
+            return None;
+        }
         return Some(path);
     }
     OVMF_CANDIDATES

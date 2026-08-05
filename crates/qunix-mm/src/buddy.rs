@@ -16,8 +16,9 @@ const TAG_SEED: u64 = 0x5155_4E49_585F_4652;
 
 /// Real UEFI firmware breaks conventional memory into runs separated by
 /// boot-services, ACPI and reserved descriptors; 20-40 usable runs is realistic
-/// on large machines. Overflowing this silently discards the remainder, so the
-/// headroom is deliberately generous — 128 entries costs 2 KiB.
+/// on large machines. Overflowing this discards the remainder — counted in
+/// `refused_regions` and `refused_region_bytes`, not silently — so the headroom
+/// is deliberately generous: 128 entries costs 2 KiB.
 const MAX_REGIONS: usize = 128;
 
 // `nonempty` is a u32 indexed by order.
@@ -148,11 +149,17 @@ impl<B: FrameBacking> BuddyAllocator<B> {
 
     /// The region containing `block`, if any.
     ///
-    /// Called once per `free`, not once per coalescing level: regions are
-    /// disjoint intervals and a merged block is the union of two adjacent
-    /// sub-intervals, so every ancestor of a block lies in the same region it
-    /// does. Scanning inside the loop would cost `MAX_ORDER * region_count`
-    /// comparisons per free for no additional information.
+    /// Called once per `free` for the block being freed: regions are disjoint
+    /// intervals and a merged block is the union of two adjacent sub-intervals,
+    /// so every ancestor lies in the same region its child does, and re-looking
+    /// it up per level would buy nothing.
+    ///
+    /// It is *also* called from `plausible_link`, which runs up to twice per
+    /// coalescing level, so a full 18-level merge against populated free lists
+    /// does scan the region table repeatedly. That cost is the price of
+    /// validating a link before splicing through it; `plausible_link` short
+    /// circuits on `NIL`, so the common case of a short list pays almost none
+    /// of it.
     fn region_of(&self, block: u64) -> Option<(u64, u64)> {
         self.regions[..self.region_count]
             .iter()
@@ -238,10 +245,10 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         // happens to hold a matching word gets us here with `prev`/`next` fully
         // attacker-chosen. Validating both before any write downgrades the
         // splice from an arbitrary 8-byte write to a write inside RAM this
-        // allocator already manages. That is a mitigation, not a fix: the real
-        // answer is out-of-band membership state (a per-order bitmap) so that
-        // no word in caller memory can authorise anything. Deferred because it
-        // changes the allocator's storage model, not just this function.
+        // allocator already manages. It is a mitigation rather than a removal
+        // of the hazard: membership is still authorised by a word that lives in
+        // memory the caller once owned, and only out-of-band state (a per-order
+        // bitmap) would change that.
         if !self.plausible_link(prev, order) || !self.plausible_link(next, order) {
             self.rejected_unlinks += 1;
             return false;
@@ -262,6 +269,14 @@ impl<B: FrameBacking> BuddyAllocator<B> {
     }
 
     /// Adds a usable physical region to the allocator.
+    ///
+    /// May accept nothing, and says so only through the counters. A range that
+    /// overflows the address space, one with no whole page in it, or one
+    /// arriving after `MAX_REGIONS` is full is dropped and billed to
+    /// `malformed_region_bytes` or `refused_region_bytes`. Check
+    /// `dropped_bytes()` once the memory map has been consumed; a caller that
+    /// assumes acceptance will go on to `free` into a region the allocator
+    /// never took, which trips the pre-init assert.
     ///
     /// # Safety
     /// The region must be genuinely free physical memory that nothing else
@@ -289,7 +304,7 @@ impl<B: FrameBacking> BuddyAllocator<B> {
 
         if self.region_count == MAX_REGIONS {
             // Refusing is the safe failure: a region that is not recorded here
-            // would never satisfy `within_a_region`, so its blocks could never
+            // would never satisfy `region_of`, so its blocks could never
             // coalesce, and `free` would silently stop merging.
             self.refused_region_bytes += end - addr;
             self.refused_regions += 1;
@@ -437,6 +452,14 @@ mod tests {
     use super::*;
 
     /// Host-side backing: a flat byte buffer standing in for physical memory.
+    ///
+    /// Deliberately bounds-checked slicing rather than the raw volatile access
+    /// `FrameBacking` documents as required, so an out-of-region access panics
+    /// with an index instead of quietly corrupting the buffer. That is right
+    /// for a unit test and wrong everywhere else, which is why the two other
+    /// copies differ: `benches/buddy.rs` uses raw volatile because this
+    /// checking dominated the measurement, and `fuzz/fuzz_targets/buddy.rs`
+    /// uses raw volatile plus an arena-bounds assert. Do not unify them.
     struct VecBacking {
         base: u64,
         mem: std::cell::UnsafeCell<Vec<u8>>,
@@ -609,6 +632,61 @@ mod tests {
 
         // The two order-0 buddies must still merge into an order-1 block.
         assert!(a.alloc(1).is_some(), "coalescing broke after a refused free");
+    }
+
+    /// A forged free tag whose links point outside every region must be
+    /// refused, and must not become allocatable.
+    ///
+    /// This is the case `plausible_link` exists for and the one nothing
+    /// covered: the existing forged-tag test supplies tags that fail the
+    /// *first* comparison, so `plausible_link` was never reached and
+    /// `rejected_unlinks` was asserted nowhere. CLAUDE.md names "a forged tag
+    /// is rejected" as one of the negative directions whose absence let two
+    /// memory-corruption bugs ship.
+    #[test]
+    fn unlink_refuses_a_forged_tag_whose_links_are_implausible() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 8 * 4096));
+        unsafe { a.add_region(base, 8 * 4096) };
+
+        // Two order-0 buddies. `live` stays allocated; `other` is freed, which
+        // makes the allocator try to coalesce with `live`.
+        let live = a.alloc(0).unwrap();
+        let other = live ^ PAGE_SIZE;
+        while a.alloc(0).map(|p| p != other).unwrap_or(false) {}
+
+        // Forge the tag the coalescer checks, and point the links at an
+        // address in no region at all.
+        let forged = BuddyAllocator::<VecBacking>::free_tag(live, 0);
+        unsafe {
+            a.backing.write_link(live + OFF_TAG, forged);
+            a.backing.write_link(live + OFF_PREV, 0xdead_0000);
+            a.backing.write_link(live + OFF_NEXT, 0xdead_0000);
+        }
+
+        let before = a.rejected_unlinks();
+        unsafe { a.free(other, 0) };
+
+        assert_eq!(
+            a.rejected_unlinks(),
+            before + 1,
+            "an implausible link was spliced instead of refused"
+        );
+        // The consequence: the live block must never be handed out again.
+        while let Some(pa) = a.alloc(0) {
+            assert_ne!(pa, live, "a live block was handed out via a forged tag");
+        }
+    }
+
+    /// `set_backing` after a region exists must panic rather than silently
+    /// leave the free lists pointing through the old backing.
+    #[test]
+    #[should_panic(expected = "backing changed after regions were added")]
+    fn set_backing_refuses_a_swap_after_regions_exist() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 4 * 4096));
+        unsafe { a.add_region(base, 4 * 4096) };
+        a.set_backing(VecBacking::new(base, 4 * 4096));
     }
 
     /// The 129th region must be refused, and its memory must never be handed

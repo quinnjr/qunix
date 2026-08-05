@@ -9,15 +9,18 @@
 
 qunix-elf = 100.00
 
-# 25.00, and low because most of this crate cannot execute on the host:
+# 24.90, and low because most of this crate cannot execute on the host:
 # `port.rs` is raw in/out instructions, and GDT/IDT/APIC/percpu are `wrmsr`,
 # `lgdt`, `ltr` and `gs:`-relative addressing. What this number measures is the
 # pure-logic remainder -- chiefly `PageFlags` translation and the `Context`
 # layout assertions. The hardware paths are covered by the 38 in-QEMU tests,
 # which run under QEMU where host instrumentation cannot reach.
-qunix-hal-x86_64 = 25.00
+#
+# 25.00 -> 24.90 when the audit's fixes added three lines to `apic::reg` and
+# `percpu`, all of them MSR access that cannot run in a host process.
+qunix-hal-x86_64 = 24.90
 
-qunix-mm = 96.30
+qunix-mm = 98.11
 
 qunix-sched = 100.00
 
@@ -27,11 +30,15 @@ qunix-sched = 100.00
 # elapsed-time assertion, which executes only when `lock()` failed to block.
 # A test whose failure branch is covered is a failing test, so this is the
 # figure a green run produces on every machine.
-qunix-sync = 97.33
+qunix-sync = 98.54
 
-# 52.17. Low because each command arm builds an argument list and then spawns
+# 52.08. Low because each command arm builds an argument list and then spawns
 # cargo, and the spawn is what cannot run under host instrumentation. The
 # argument and gate logic is extracted (`bench_args`, `fuzz_args`,
 # `fuzz_selection`, `lowering_without_reason`) and tested, which is what this
 # number actually tracks.
-xtask = 52.17
+#
+# 52.17 -> 52.08 when `find_ovmf` gained an explicit-override-missing branch.
+# Reaching it needs `QUNIX_OVMF` set to a path that does not exist, and mutating
+# the environment from a test races every other test in the process.
+xtask = 52.08

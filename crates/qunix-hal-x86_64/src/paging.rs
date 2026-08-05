@@ -384,9 +384,11 @@ impl AddressSpace {
         // the invalidation below, and would then walk allocator metadata as a
         // page table. Unlink everything, invalidate, and only then release.
         //
-        // This is single-CPU correct only. M1 must replace `flush_all` with a
-        // cross-CPU shootdown that waits for every other CPU to acknowledge
-        // before the frames reach `free`; otherwise a remote CPU's cached
+        // Flushes this CPU only. Remote paging-structure caches are not
+        // covered, so a frame freed here can still be cached as a translation
+        // on another CPU. That is safe today because application processors
+        // park without scheduling (see `kernel/src/smp.rs`), and it is the
+        // thing a cross-CPU shootdown has to fix before they do; otherwise a remote CPU's cached
         // structure has the same lifetime hazard.
         let mut freed: [Option<u64>; 3] = [None; 3];
         unsafe { Self::clear_entry(p2, addr.p2_index()) };

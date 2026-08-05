@@ -30,10 +30,10 @@ pub struct MemoryRegion {
     pub usable: bool,
 }
 
-/// Offset of the higher-half direct map installed by Limine.
 /// Modules the bootloader loaded alongside the kernel.
 ///
 /// In the same `.requests` section as the other requests.
+#[used]
 #[unsafe(link_section = ".requests")]
 static MODULES: limine::request::ModulesRequest = limine::request::ModulesRequest::new();
 
@@ -51,6 +51,7 @@ pub fn module(name: &str) -> Option<&'static [u8]> {
         .map(|file| file.data())
 }
 
+/// Offset of the higher-half direct map installed by Limine.
 pub fn hhdm_offset() -> u64 {
     HHDM.response().expect("limine provided no HHDM response").offset
 }

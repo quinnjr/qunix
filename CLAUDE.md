@@ -34,8 +34,9 @@ Host crates test against **musl**, not glibc:
 
 - **`no_std`** everywhere except `xtask` and `fuzz/`. Both are host-only tools.
   `fuzz/` is additionally its own workspace, so it is outside `cargo xtask
-  test`, the licensing check and the coverage ratchet — `cargo xtask fuzz` is
-  the only thing that builds it.
+  test` and the coverage ratchet — `cargo xtask fuzz` is the only thing that
+  builds it. The licensing check *does* reach it, because that walks the
+  workspace root rather than the member list.
 - **No floating point in kernel crates.** The target disables SSE and uses
   soft-float; an `f32` is a bug, not a style choice.
 - **Edition 2024 unsafe attributes**: `#[unsafe(no_mangle)]`,
