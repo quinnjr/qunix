@@ -20,7 +20,7 @@ existing applications port easily or run unmodified.
 
 ```sh
 cargo xtask run     # boot under QEMU
-cargo xtask test    # 78 tests: 14 in-QEMU, 64 on the host
+cargo xtask test    # 103 tests: 14 in-QEMU, 89 on the host
 cargo xtask build   # kernel ELF only
 ```
 

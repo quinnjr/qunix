@@ -5,6 +5,14 @@ on:
     branches: [develop, main]
   push:
     branches: [develop, main]
+  schedule:
+    # The PR gate is a smoke test; this is where bugs are actually found.
+    - cron: '0 4 * * *'
+
+# No job here writes to the repository; the fuzz job in particular builds and
+# executes attacker-shaped input, so it should not hold a writable token.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,6 +90,9 @@ jobs:
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest
+    # -max_total_time bounds libFuzzer but not the sanitizer build; without this
+    # a hang there burns the six-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -92,9 +103,12 @@ jobs:
       # The `@cargo-fuzz` shorthand tag does not exist -- only some tools have
       # one -- and the action then installs nothing while still succeeding, so
       # the failure surfaces later as `no such command: fuzz`.
+      # Pinned tool version, not "latest at run time": this action downloads a
+      # prebuilt binary and runs it, which is the same class of trust the
+      # bootloader SHA-256 pin exists for.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.1
 
       - name: Install clang and LLD
         run: |
@@ -102,9 +116,72 @@ jobs:
           sudo apt-get install -y clang lld
 
       # Deliberately short, and honest about what that buys: it proves the
-      # harnesses still build and that 60s of fuzzing from an empty corpus
-      # finds nothing. It is not a search for new bugs. No corpus is committed,
-      # so each run starts cold and re-treads shallow ground; finding anything
-      # new needs hours and belongs in a scheduled job, not a PR gate.
+      # harnesses still build and that 60s from a cold corpus finds nothing. The
+      # actual search is the `fuzz-nightly` job below, which runs an hour per
+      # target on a schedule and caches its corpus between runs.
+      # `cargo fuzz run` has its own CLI and rejects `--locked`, so the
+      # committed lock is enforced here instead: this fails if resolving would
+      # change it, which is what stops a new build-script-bearing crate from
+      # appearing silently in a binary that executes fuzzed input.
+      - name: Lockfile is up to date
+        run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+
       - name: Fuzz both targets briefly
         run: cargo xtask fuzz --seconds=60
+
+      # The failing input *is* the finding. Without it a red run leaves a stack
+      # trace and a cold corpus, and re-running is unlikely to re-find it --
+      # which is how a harness defect gets mistaken for a real bug, three times
+      # so far.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  fuzz-nightly:
+    name: fuzz (scheduled, deep)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [buddy, slab]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.1
+
+      - name: Install clang and LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      # Carried between runs so the search compounds instead of restarting cold
+      # every night, which is the whole difference from the PR gate.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        run: cargo xtask fuzz ${{ matrix.target }} --seconds=3600
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

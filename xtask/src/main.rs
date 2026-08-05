@@ -89,6 +89,10 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
     // triple makes the build identical however cargo-fuzz was installed.
     args.push("--target".to_string());
     args.push("x86_64-unknown-linux-gnu".to_string());
+    // No `--locked` here: `cargo fuzz run` has its own CLI and rejects it
+    // ("unexpected argument"). The committed `fuzz/Cargo.lock` is enforced by
+    // the `lockfile` CI step instead, which runs `cargo metadata --locked`
+    // against the fuzz manifest.
     args.push("--".to_string());
     args.push(format!("-max_total_time={seconds}"));
     // libFuzzer's default 2 GiB ceiling counts the sanitizer's shadow memory,
@@ -100,6 +104,59 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
 
 /// Fuzz targets run by a bare `xtask fuzz`.
 const FUZZ_TARGETS: &[&str] = &["buddy", "slab"];
+
+/// Resolves `xtask fuzz` arguments into (targets, seconds, libFuzzer passthrough).
+///
+/// Extracted from the dispatch arm because these are decisions, not a spawn:
+/// the "command dispatch is uncoverable" exemption does not cover them, and
+/// each of the three rejections below is a bug that shipped silently before.
+fn fuzz_selection(args: &[String]) -> Result<(Vec<&'static str>, u32, Vec<String>)> {
+    // A malformed budget is refused rather than defaulted. Silently running 60s
+    // when the user asked for 600 produces a run they will believe was ten
+    // minutes -- CONTRIBUTING tells contributors to do exactly that before a PR.
+    let seconds = match args.iter().find_map(|a| a.strip_prefix("--seconds=")) {
+        Some(value) => {
+            let parsed: u32 = value
+                .parse()
+                .with_context(|| format!("--seconds={value} is not a whole number of seconds"))?;
+            // libFuzzer reads `-max_total_time=0` as *no limit*, so a zero
+            // budget is the one value that produces the hang every other part
+            // of this function exists to prevent.
+            if parsed == 0 {
+                bail!("--seconds=0 means unlimited to libFuzzer; pass a positive budget");
+            }
+            parsed
+        }
+        None => 60,
+    };
+
+    let named: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let targets: Vec<&'static str> = match named.first() {
+        Some(name) => {
+            // Checked here so a typo reads as a typo, rather than surfacing as
+            // "fuzz target `budy` failed" after a full sanitizer build.
+            let found = FUZZ_TARGETS.iter().find(|t| *t == &name.as_str());
+            match found {
+                Some(t) => vec![*t],
+                None => bail!(
+                    "unknown fuzz target `{name}`; known targets: {}",
+                    FUZZ_TARGETS.join(", ")
+                ),
+            }
+        }
+        None => FUZZ_TARGETS.to_vec(),
+    };
+
+    // Everything else goes to libFuzzer, matching what `bench` does for
+    // criterion. Without this the `extra` parameter is reachable only from its
+    // own unit test, which is not a test of anything.
+    let extra: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--seconds=") && Some(*a) != named.first().copied())
+        .cloned()
+        .collect();
+    Ok((targets, seconds, extra))
+}
 
 mod attest;
 mod coverage;
@@ -213,26 +270,27 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("fuzz") => {
-            // A short default: long enough to re-cover the known corpus, short
-            // enough that running it before a PR is not a decision.
-            let seconds: u32 = args
-                .iter()
-                .find_map(|a| a.strip_prefix("--seconds=").and_then(|v| v.parse().ok()))
-                .unwrap_or(60);
-            let selected: Vec<&str> = match args.get(1).map(String::as_str) {
-                Some(t) if !t.starts_with("--") => vec![t],
-                _ => FUZZ_TARGETS.to_vec(),
-            };
+            let (selected, seconds, extra) = fuzz_selection(&args[1..])?;
+            let mut failed: Vec<&str> = Vec::new();
             for target in selected {
                 println!("fuzz: {target} for {seconds}s");
                 let mut cmd = Command::new(env!("CARGO"));
                 cmd.current_dir(&root);
-                cmd.args(fuzz_args(target, seconds, &[]));
-                if !cmd.status().context(
-                    "failed to run cargo fuzz; install it with `cargo install cargo-fuzz`",
-                )?.success() {
-                    bail!("fuzz target `{target}` failed");
+                cmd.args(fuzz_args(target, seconds, &extra));
+                // The hint belongs on the failure that actually happens. The
+                // spawn is of cargo itself and essentially cannot fail; a
+                // missing cargo-fuzz makes cargo exit non-zero with "no such
+                // command: fuzz", which is this branch, not the spawn error.
+                if !cmd.status().context("failed to spawn cargo")?.success() {
+                    failed.push(target);
                 }
+            }
+            if !failed.is_empty() {
+                bail!(
+                    "fuzz target(s) failed: {} \
+                     (if this was `no such command: fuzz`, run `cargo install cargo-fuzz`)",
+                    failed.join(", ")
+                );
             }
             Ok(())
         }
@@ -244,7 +302,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FUZZ_TARGETS, bench_args, fuzz_args, workspace_root};
+    use super::{FUZZ_TARGETS, bench_args, fuzz_args, fuzz_selection, workspace_root};
 
     #[test]
     fn bench_selects_only_host_buildable_crates() {
@@ -266,10 +324,58 @@ mod tests {
     }
 
     #[test]
-    fn bench_forwards_extra_arguments() {
-        let extra = ["--".to_string(), "alloc_free".to_string()];
-        let args = bench_args(&extra);
-        assert_eq!(&args[args.len() - 2..], &extra[..]);
+    fn bench_forwards_extra_arguments_after_the_separator() {
+        let args = bench_args(&["--".to_string(), "alloc_free".to_string()]);
+        // The property that matters is placement, not presence: before `--`
+        // cargo consumes them, after it criterion does. Asserting only that the
+        // last two elements equal the input is true of any `extend`.
+        let sep = args.iter().position(|a| a == "--").expect("no -- separator");
+        assert!(args[sep + 1..].iter().any(|a| a == "alloc_free"));
+    }
+
+    #[test]
+    fn bench_pins_the_host_triple_and_locks_nothing_else() {
+        let args = bench_args(&[]);
+        assert!(args.windows(2).any(|w| w[0] == "--target"));
+    }
+
+    #[test]
+    fn fuzz_selection_defaults_to_every_listed_target() {
+        let (targets, seconds, extra) = fuzz_selection(&[]).unwrap();
+        assert_eq!(targets, FUZZ_TARGETS);
+        assert_eq!(seconds, 60);
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn fuzz_selection_rejects_an_unparsable_budget() {
+        // Must error, not silently fall back to 60 -- a typo in `--seconds=600`
+        // would otherwise produce a run the user believes was ten minutes.
+        let err = fuzz_selection(&["--seconds=abc".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("--seconds=abc"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn fuzz_selection_rejects_a_zero_budget() {
+        // `-max_total_time=0` is libFuzzer's *unlimited* sentinel.
+        let err = fuzz_selection(&["--seconds=0".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("unlimited"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn fuzz_selection_rejects_an_unknown_target() {
+        let err = fuzz_selection(&["budy".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("unknown fuzz target"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn fuzz_selection_forwards_libfuzzer_flags_from_the_command_line() {
+        // Regression guard: `extra` was accepted by `fuzz_args` but the dispatch
+        // arm hard-coded `&[]`, so no user input could ever reach it.
+        let (targets, _, extra) =
+            fuzz_selection(&["buddy".to_string(), "-runs=1".to_string()]).unwrap();
+        assert_eq!(targets, vec!["buddy"]);
+        assert!(extra.iter().any(|a| a == "-runs=1"), "libFuzzer flag was dropped: {extra:?}");
     }
 
     #[test]
@@ -285,6 +391,10 @@ mod tests {
         // Unbounded, libFuzzer never returns, which would hang CI.
         assert!(args.iter().any(|a| a == "-max_total_time=90"), "no time bound: {args:?}");
         assert!(args.iter().any(|a| a.starts_with("-rss_limit_mb=")));
+        // `cargo fuzz run` rejects cargo flags it does not define, so nothing
+        // may be added here that has not been checked against its CLI.
+        let sep = args.iter().position(|a| a == "--").expect("no -- separator");
+        assert!(!args[..sep].iter().any(|a| a == "--locked"), "cargo fuzz rejects --locked");
     }
 
     #[test]
@@ -296,10 +406,27 @@ mod tests {
     }
 
     #[test]
-    fn every_listed_fuzz_target_has_a_source_file() {
+    fn fuzz_targets_sources_and_manifest_all_agree() {
+        let root = workspace_root();
+        let manifest = std::fs::read_to_string(root.join("fuzz/Cargo.toml")).unwrap();
         for target in FUZZ_TARGETS {
-            let path = workspace_root().join("fuzz/fuzz_targets").join(format!("{target}.rs"));
+            let path = root.join("fuzz/fuzz_targets").join(format!("{target}.rs"));
             assert!(path.exists(), "{target} is listed but {} is missing", path.display());
+            // cargo-fuzz dispatches on the `[[bin]]` name, so a source file
+            // alone is not enough -- the mismatch would only appear in CI.
+            assert!(
+                manifest.contains(&format!("name = \"{target}\"")),
+                "{target} is listed but has no [[bin]] in fuzz/Cargo.toml"
+            );
+        }
+        // The direction that degrades silently: a target added on disk but not
+        // listed here is never run, and CI stays green.
+        for entry in std::fs::read_dir(root.join("fuzz/fuzz_targets")).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().replace(".rs", "");
+            assert!(
+                FUZZ_TARGETS.contains(&name.as_str()),
+                "fuzz_targets/{name}.rs exists but is not in FUZZ_TARGETS, so nothing runs it"
+            );
         }
     }
 }

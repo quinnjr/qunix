@@ -1,7 +1,2 @@
 /.limine
 /target
-
-# cargo-fuzz build output and findings
-fuzz/target/
-fuzz/artifacts/
-fuzz/corpus/

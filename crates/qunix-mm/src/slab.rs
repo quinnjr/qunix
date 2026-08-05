@@ -153,17 +153,24 @@ impl SlabHeap {
 
     /// Allocates a block, or returns null when the heap cannot satisfy it.
     ///
-    /// Safe, deliberately. There is nothing for the caller to uphold: the
-    /// free-list reads below are justified by this heap's own invariants —
-    /// blocks are only on a list because `dealloc` put them there — and by
-    /// [`set_backing`](Self::set_backing), whose contract is where the real
-    /// obligation lives. Before `set_backing`, `bump_end` is zero and every
-    /// path returns null rather than touching memory.
+    /// Safe, deliberately. There is nothing *this call* asks of the caller: the
+    /// free-list reads below are sound as long as the heap's invariants hold,
+    /// and those are established by [`set_backing`](Self::set_backing) and
+    /// preserved by [`dealloc`](Self::dealloc). Both are `unsafe`, which is
+    /// where the obligations are stated — the obligation is transferred, not
+    /// absent, and breaking either poisons a list this safe `alloc` will read.
+    /// Before `set_backing`, `bump_end` is zero and every path returns null
+    /// rather than touching memory
+    /// (`alloc_before_set_backing_returns_null_on_every_path`).
+    ///
+    /// A zero-size layout is accepted, not rejected: `class_for` floors the
+    /// size at `CLASSES[0]`, so it is served an 8-byte block, and `dealloc`
+    /// classifies it identically, so it round-trips.
     ///
     /// Returning a raw pointer is not itself unsafe; *dereferencing* it is, and
-    /// that is the caller's act. Marking this `unsafe` implied an obligation
-    /// the caller could neither discover nor discharge, which devalues the
-    /// marker on the calls that genuinely carry one — `dealloc` below.
+    /// that is the caller's act. Marking this `unsafe` implied an obligation at
+    /// this call site that the caller could neither discover nor discharge,
+    /// which devalues the marker on the calls that genuinely carry one.
     pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
         match Self::class_for(layout) {
             Some(class) => {
@@ -254,6 +261,31 @@ mod tests {
         let mut heap = SlabHeap::new();
         unsafe { heap.set_backing(aligned, bytes) };
         (heap, backing)
+    }
+
+    /// The claim that makes `alloc` safe to call before `set_backing`.
+    ///
+    /// This is the load-bearing half of the argument for dropping `unsafe`: if
+    /// any branch of `class_for` reached a free-list read before consulting
+    /// `bump_end`, safe code could dereference a null head. One case per branch.
+    #[test]
+    fn alloc_before_set_backing_returns_null_on_every_path() {
+        let mut heap = SlabHeap::new();
+        for (size, align) in [
+            (8usize, 1usize),      // smallest size class
+            (2048, 16),            // largest size class, strongest class align
+            (32, 4096),            // classless via alignment
+            (1 << 20, 8),          // classless via size
+            (8 << 20, 8),          // beyond the largest large-list entry
+            (0, 1),                // zero-size
+        ] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            assert!(
+                heap.alloc(layout).is_null(),
+                "alloc({size}, {align}) returned non-null with no backing"
+            );
+        }
+        assert_eq!(heap.allocated_bytes(), 0, "a refused alloc was still charged");
     }
 
     #[test]

@@ -288,7 +288,21 @@ mod tests {
 
         ready.wait();
         // Blocks until the holder drops its guard, spinning in the backoff loop.
+        //
+        // The elapsed-time assertion is the point of the test, not decoration.
+        // The barrier orders *entry* -- it guarantees the lock is held when this
+        // thread wakes -- but if this thread were descheduled past the holder's
+        // sleep, `try_lock` would succeed on the first attempt, the backoff loop
+        // would never run, and without this the test would still pass green
+        // while the coverage it exists to produce silently disappeared. That is
+        // exactly the failure that made the ratchet flake on CI.
+        let started = std::time::Instant::now();
         let guard = lock.lock();
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "lock() returned in {:?} without blocking; the backoff loop was not exercised",
+            started.elapsed()
+        );
         assert_eq!(*guard, 7, "acquired before the holder finished writing");
         drop(guard);
         holder.join().unwrap();

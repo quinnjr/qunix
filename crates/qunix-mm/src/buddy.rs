@@ -35,10 +35,14 @@ pub struct BuddyAllocator<B: FrameBacking> {
     /// walking the head array.
     nonempty: u32,
     free_bytes: u64,
-    /// Bytes offered to `free` that lie in no recorded region, and were
-    /// therefore refused. Absorbing them would mean writing 24 bytes of link
-    /// through a backing that does not own the address and then handing that
-    /// memory out.
+    /// Bytes offered to `free` and refused as not being a block this allocator
+    /// owns, for any of three reasons: the address lies in no recorded region,
+    /// its extent runs past the end of the region it starts in, or it is not
+    /// aligned to its own order. Absorbing any of them would mean writing 24
+    /// bytes of link through memory the allocator was never given, and then
+    /// handing that memory out.
+    ///
+    /// Bytes, not a count of events, despite the name.
     foreign_frees: u64,
     /// Coalescing attempts refused because the buddy's `prev`/`next` links did
     /// not name plausible blocks. Non-zero means either corruption or a caller
@@ -126,7 +130,13 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         self.malformed_region_bytes
     }
 
-    /// Bytes passed to `free` that lie in no recorded region.
+    /// Bytes passed to `free` that this allocator does not own — lying in no
+    /// recorded region, overrunning the end of their region, or misaligned for
+    /// their order. Non-zero means either a caller is returning memory that was
+    /// never handed out (which `paging::unmap_and_prune` does by design), or one
+    /// is freeing at the wrong order.
+    ///
+    /// Bytes, not a count of events, despite the name.
     pub fn foreign_frees(&self) -> u64 {
         self.foreign_frees
     }
@@ -345,27 +355,49 @@ impl<B: FrameBacking> BuddyAllocator<B> {
 
         let mut pa = pa;
         let mut order = order;
+
+        // Three ways a block can fail to be one this allocator owns, all
+        // refused identically: undo the speculative `free_bytes` above and bill
+        // it to `foreign_frees`. Written once rather than three times because
+        // an accounting change applied to only some of them would leave
+        // `free_bytes` permanently inflated, and `free_bytes` is what the
+        // kernel uses to decide it is out of memory.
+        macro_rules! refuse {
+            () => {{
+                self.free_bytes -= Self::block_size(order);
+                self.foreign_frees += Self::block_size(order);
+                return;
+            }};
+        }
+
         // One region lookup for the whole merge chain.
         let Some((region_start, region_end)) = self.region_of(pa) else {
             // Not ours: reject rather than absorb. Pushing it would write links
             // into memory in no region and then hand that memory out — the
             // bootloader's own page tables reach here via
             // `paging::unmap_and_prune`.
-            self.free_bytes -= Self::block_size(order);
-            self.foreign_frees += Self::block_size(order);
-            return;
+            refuse!()
         };
         // `region_of` locates `pa` only, so a block whose start is inside the
-        // region but whose extent runs past its end has so far been accepted.
-        // Pushing it puts memory the allocator was never given on a free list,
-        // and the next `alloc` of that order hands it out. The merge loop below
-        // already applies exactly this test to the *buddy*
+        // region but whose extent runs past its end would otherwise be
+        // accepted. Pushing it puts memory the allocator was never given on a
+        // free list, and the next `alloc` of that order hands it out. The merge
+        // loop below already applies exactly this test to the *buddy*
         // (`region_end - buddy < size`); this is the same test for the block
         // being freed, which it was missing.
         if region_end - pa < Self::block_size(order) {
-            self.free_bytes -= Self::block_size(order);
-            self.foreign_frees += Self::block_size(order);
-            return;
+            refuse!()
+        }
+        // Extent alone is not enough. `buddy = pa ^ size` is only the real buddy
+        // when `pa` is a multiple of `size`; for a misaligned `pa` the merge
+        // loop walks unrelated blocks, and the block pushed at the end straddles
+        // two naturally-aligned blocks, so a later `alloc` hands out memory that
+        // overlaps a live allocation. That is the same aliasing this whole guard
+        // exists to prevent, reached one step further along, and a fuzz harness
+        // that derives addresses by rounding down to a multiple of the block
+        // size cannot generate it.
+        if !pa.is_multiple_of(Self::block_size(order)) {
+            refuse!()
         }
         // One read `push` is about to do anyway. Without it a second `free` of
         // the same block re-pushes it, `push` writes `next(pa) = pa` when `pa`
@@ -441,6 +473,26 @@ mod tests {
         assert_eq!(a.free_bytes(), 0);
     }
 
+    /// Drains every order-0 block and asserts each lies inside `region`.
+    ///
+    /// The point of a refusal is not that a counter moved — it is that the
+    /// refused memory never becomes allocatable at *any* order. Asserting
+    /// `alloc(n) == None` for a single `n` is far weaker: on a region too small
+    /// to hold an order-`n` block it is true no matter what `free` did.
+    fn drain_and_check<B: FrameBacking>(a: &mut BuddyAllocator<B>, region: (u64, u64)) -> usize {
+        let mut handed = 0;
+        while let Some(pa) = a.alloc(0) {
+            assert!(
+                pa >= region.0 && pa + PAGE_SIZE <= region.1,
+                "alloc handed out {pa:#x}, outside the region {:#x}..{:#x}",
+                region.0,
+                region.1
+            );
+            handed += 1;
+        }
+        handed
+    }
+
     /// A block whose *start* is inside a region but whose *extent* runs past
     /// the end of it must be refused.
     ///
@@ -469,8 +521,125 @@ mod tests {
             foreign_before + (PAGE_SIZE << 2),
             "an overrunning free was not counted as rejected"
         );
-        // The consequence that matters: it must not become allocatable.
-        assert_eq!(a.alloc(2), None, "an overrunning block was handed out by alloc");
+        // The consequence that matters: the refused page must not become
+        // allocatable at any order, and the region must still yield exactly the
+        // three pages it really has.
+        assert_eq!(drain_and_check(&mut a, (base, base + 3 * PAGE_SIZE)), 3);
+    }
+
+    /// The overrun need not start at the region base.
+    ///
+    /// A guard written against `region_start` instead of `region_end` would
+    /// pass the base-aligned case above and fail this one.
+    #[test]
+    fn free_refuses_an_overrunning_block_at_a_nonzero_offset() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 6 * 4096));
+        unsafe { a.add_region(base, 6 * 4096) };
+        let free_before = a.free_bytes();
+        let foreign_before = a.foreign_frees();
+
+        // 4 pages starting one order-2 block in: base+4 pages .. base+8 pages,
+        // against a region that ends at base+6 pages.
+        unsafe { a.free(base + 4 * PAGE_SIZE, 2) };
+
+        assert_eq!(a.free_bytes(), free_before);
+        assert_eq!(a.foreign_frees(), foreign_before + (PAGE_SIZE << 2));
+        assert_eq!(drain_and_check(&mut a, (base, base + 6 * PAGE_SIZE)), 6);
+    }
+
+    /// A block whose start is *before* every region takes the other rejection
+    /// arm (`region_of` returns `None`), which nothing else covers.
+    #[test]
+    fn free_refuses_a_block_that_starts_before_its_region() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 4 * 4096));
+        unsafe { a.add_region(base, 4 * 4096) };
+        let free_before = a.free_bytes();
+        let foreign_before = a.foreign_frees();
+
+        unsafe { a.free(base - PAGE_SIZE, 0) };
+
+        assert_eq!(a.free_bytes(), free_before);
+        assert_eq!(a.foreign_frees(), foreign_before + PAGE_SIZE);
+        assert_eq!(drain_and_check(&mut a, (base, base + 4 * PAGE_SIZE)), 4);
+    }
+
+    /// A block that fits its region but is not aligned to its own order must be
+    /// refused: `pa ^ size` is not the buddy, so the merge loop walks unrelated
+    /// blocks and the block finally pushed straddles two aligned ones.
+    ///
+    /// Before this check, `free(base + PAGE_SIZE, 1)` on a 4-page region was
+    /// accepted and the next `alloc(1)` returned `base + PAGE_SIZE`, overlapping
+    /// the order-1 block at `base`.
+    #[test]
+    fn free_refuses_a_block_not_aligned_to_its_order() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 4 * 4096));
+        unsafe { a.add_region(base, 4 * 4096) };
+        // Drain first, so anything that becomes allocatable below came from the
+        // misaligned free rather than from the region itself.
+        while a.alloc(0).is_some() {}
+        let free_before = a.free_bytes();
+        let foreign_before = a.foreign_frees();
+
+        unsafe { a.free(base + PAGE_SIZE, 1) };
+
+        assert_eq!(a.free_bytes(), free_before, "a misaligned free added memory to the heap");
+        assert_eq!(a.foreign_frees(), foreign_before + (PAGE_SIZE << 1));
+        assert_eq!(a.alloc(1), None, "a misaligned block was handed out by alloc");
+        assert_eq!(a.alloc(0), None, "a misaligned block was split and handed out");
+    }
+
+    /// A refusal must leave the allocator's own structures untouched, not just
+    /// decline to add memory. A refusal that wrote a tag or mangled a list would
+    /// pass every assertion above and break the next merge.
+    #[test]
+    fn a_refused_free_leaves_coalescing_intact() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 4 * 4096));
+        unsafe { a.add_region(base, 4 * 4096) };
+
+        let a0 = a.alloc(0).unwrap();
+        let a1 = a.alloc(0).unwrap();
+        // Refuse something in between the two live blocks' lifetimes.
+        unsafe { a.free(base + PAGE_SIZE, 1) };
+        unsafe { a.free(a0, 0) };
+        unsafe { a.free(a1, 0) };
+
+        // The two order-0 buddies must still merge into an order-1 block.
+        assert!(a.alloc(1).is_some(), "coalescing broke after a refused free");
+    }
+
+    /// The 129th region must be refused, and its memory must never be handed
+    /// out afterwards — the negative direction of `MAX_REGIONS`, which the fuzz
+    /// target cannot reach because it can only fit a handful of regions.
+    #[test]
+    fn add_region_refuses_past_max_regions_and_never_hands_it_out() {
+        let base = 0x100000;
+        // One page per region, two pages apart so no two are adjacent.
+        let span = (MAX_REGIONS as u64 + 2) * 2 * PAGE_SIZE;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, span as usize));
+        for i in 0..MAX_REGIONS as u64 {
+            unsafe { a.add_region(base + i * 2 * PAGE_SIZE, PAGE_SIZE) };
+        }
+        let free_before = a.free_bytes();
+
+        let overflow = base + MAX_REGIONS as u64 * 2 * PAGE_SIZE;
+        unsafe { a.add_region(overflow, PAGE_SIZE) };
+
+        assert_eq!(a.refused_regions(), 1, "the 129th region was not refused");
+        assert_eq!(a.refused_region_bytes(), PAGE_SIZE);
+        assert_eq!(a.free_bytes(), free_before, "a refused region added memory");
+
+        // Negative direction: a refused region is not recorded, so freeing into
+        // it is foreign, and draining must never return one of its addresses.
+        let foreign_before = a.foreign_frees();
+        unsafe { a.free(overflow, 0) };
+        assert_eq!(a.foreign_frees(), foreign_before + PAGE_SIZE);
+        while let Some(pa) = a.alloc(0) {
+            assert_ne!(pa, overflow, "a refused region was handed out");
+        }
     }
 
     #[test]

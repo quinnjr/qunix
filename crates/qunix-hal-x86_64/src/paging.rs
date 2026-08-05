@@ -374,14 +374,20 @@ impl AddressSpace {
     /// absent or maps a huge page (which owns no child table).
     ///
     /// # Safety
-    /// `table` must point at a live page table reachable through the HHDM, and
-    /// no other reference to it may be alive for the duration of the call.
+    /// `table` must be `table_at(pa)` for a `pa` the caller has established
+    /// lies inside the HHDM-mapped range — `table_at` derives a pointer from a
+    /// raw entry address without bounds-checking it — and no other reference to
+    /// that table may be alive for the duration of the call.
     ///
-    /// These three helpers take a raw pointer rather than `&PageTable` on
-    /// purpose. The caller walks several levels at once, and holding long-lived
-    /// references to them would be undefined behaviour the moment two levels
-    /// aliased -- which a self-referencing entry in a table this kernel did not
-    /// build would produce. A raw pointer tolerates that; `&mut` does not.
+    /// These three helpers take a raw pointer rather than `&PageTable` because
+    /// the caller walks several levels at once. A raw parameter keeps each
+    /// reference scoped to a single call, so no two levels are ever borrowed
+    /// simultaneously. It does *not* make aliased tables safe: the bodies still
+    /// materialise a reference, and two levels that alias — which a
+    /// self-referencing entry in a table this kernel did not build would
+    /// produce — would also make `unmap_and_prune` free the same frame twice.
+    /// Aliased tables remain forbidden by that function's own contract; the raw
+    /// pointer shortens the borrow, it does not remove it.
     unsafe fn child_of(&self, table: *mut PageTable, index: PageTableIndex) -> Option<u64> {
         let table: &PageTable = unsafe { &*table };
         let entry = &table[index];

@@ -86,7 +86,7 @@ pub fn check(root: &Path, range: Option<&str>) -> Result<()> {
         let attested = body
             .lines()
             .map(str::trim)
-            .any(|line| line.starts_with(TRAILER) && line[TRAILER.len()..].trim().len() > 0);
+            .any(|line| line.starts_with(TRAILER) && !line[TRAILER.len()..].trim().is_empty());
         if !attested {
             let subject = git(root, &["show", "-s", "--format=%s", hash])?;
             missing.push(format!("  {} {}", &hash[..8.min(hash.len())], subject));
@@ -118,7 +118,7 @@ mod tests {
     fn attested(body: &str) -> bool {
         body.lines()
             .map(str::trim)
-            .any(|line| line.starts_with(TRAILER) && line[TRAILER.len()..].trim().len() > 0)
+            .any(|line| line.starts_with(TRAILER) && !line[TRAILER.len()..].trim().is_empty())
     }
 
     #[test]

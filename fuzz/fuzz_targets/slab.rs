@@ -8,6 +8,9 @@
 //!
 //! The heap writes its free-list links *into* freed blocks, so the arena here
 //! is real, owned, writable memory — see `ARENA` — not a fake address range.
+//! Accounting is asserted exactly, against the extent the heap actually
+//! charged, because every inequality this file used to assert was slack enough
+//! to hold for an allocator that was losing memory.
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
@@ -46,8 +49,22 @@ fuzz_target!(|ops: Vec<Op>| {
     let mut heap = SlabHeap::new();
     unsafe { heap.set_backing(base, ARENA_LEN) };
 
-    // (ptr, layout) for every block currently handed out.
-    let mut live: Vec<(*mut u8, Layout)> = Vec::new();
+    // Poisoned each run so a stale free-list link left by a previous run reads
+    // as garbage rather than as a plausible pointer into the same arena.
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0x5A, ARENA_LEN) };
+
+    // Anchors the run. Without it, a `set_backing` that silently took nothing
+    // would make every op below a no-op and the run would still pass.
+    let probe_layout = Layout::from_size_align(16, 16).unwrap();
+    let probe = heap.alloc(probe_layout);
+    assert!(!probe.is_null(), "a fresh arena refused a 16-byte allocation");
+    unsafe { heap.dealloc(probe, probe_layout) };
+
+    // (ptr, layout, charged) for every block currently handed out. `charged` is
+    // what the heap actually billed -- a class or power-of-two extent, always
+    // >= layout.size() -- so accounting can be asserted exactly rather than as
+    // an inequality that is permanently slack by the rounding on every block.
+    let mut live: Vec<(*mut u8, Layout, usize)> = Vec::new();
 
     for op in ops {
         match op {
@@ -55,10 +72,14 @@ fuzz_target!(|ops: Vec<Op>| {
                 // Bounded well below the arena so exhaustion is reachable but
                 // not immediate; alignment capped at 4 KiB, the largest the
                 // kernel ever asks for.
-                let size = (size as usize % (64 * 1024)).max(1);
+                // Up to twice the arena, so exhaustion and the >4 MiB
+                // never-recycled branch are both reachable; a 64 KiB cap made
+                // the large-block leak path unreachable by construction.
+                let size = (size as usize % (ARENA_LEN * 2)).max(1);
                 let align = 1usize << (align_shift % 13);
                 let Ok(layout) = Layout::from_size_align(size, align) else { continue };
 
+                let before = heap.allocated_bytes();
                 let ptr = heap.alloc(layout);
                 if ptr.is_null() {
                     // Exhaustion is a legitimate answer, not a failure.
@@ -72,46 +93,59 @@ fuzz_target!(|ops: Vec<Op>| {
                     "alloc({size}, {align}) returned {addr:#x}..{:#x}, outside the arena",
                     addr + size
                 );
-                for &(other, other_layout) in &live {
+                let charged = heap.allocated_bytes() - before;
+                assert!(charged >= size, "charged {charged} for a {size}-byte request");
+                // Overlap is checked over the *reserved* extent, not the
+                // requested size: two blocks whose reserved tails overlap but
+                // whose requested prefixes do not would otherwise pass, and a
+                // size-class off-by-one presents exactly that way.
+                for &(other, _, other_charged) in &live {
                     let other_addr = other as usize;
                     assert!(
-                        addr + size <= other_addr || other_addr + other_layout.size() <= addr,
-                        "alloc({size}, {align}) returned {addr:#x}..{:#x}, overlapping live \
+                        addr + charged <= other_addr || other_addr + other_charged <= addr,
+                        "alloc({size}, {align}) reserved {addr:#x}..{:#x}, overlapping live \
                          {other_addr:#x}..{:#x}",
-                        addr + size,
-                        other_addr + other_layout.size()
+                        addr + charged,
+                        other_addr + other_charged
                     );
                 }
 
-                // Writing the whole block proves it is really owned and mapped.
-                // A block that overlaps another allocation will corrupt it, and
-                // the overlap check above will catch it on the next alloc.
+                // Puts the block's full extent under ASan, so one that runs
+                // past the arena or past its own size class faults here.
+                // Aliasing itself is caught by the model check above, which does
+                // not depend on this write.
                 unsafe { std::ptr::write_bytes(ptr, 0xAB, size) };
 
-                live.push((ptr, layout));
+                live.push((ptr, layout, charged));
             }
 
             Op::Dealloc { which } => {
                 if live.is_empty() {
                     continue;
                 }
-                let (ptr, layout) = live.swap_remove(which as usize % live.len());
+                let (ptr, layout, charged) = live.swap_remove(which as usize % live.len());
                 let before = heap.allocated_bytes();
                 unsafe { heap.dealloc(ptr, layout) };
-                assert!(
-                    heap.allocated_bytes() < before,
-                    "dealloc of {} bytes did not reduce allocated_bytes ({before})",
+                // Exact: `< before` passed when a 64 KiB block was credited
+                // back 8 bytes.
+                assert_eq!(
+                    heap.allocated_bytes(),
+                    before - charged,
+                    "dealloc credited back the wrong amount for a {}-byte request",
                     layout.size()
                 );
             }
         }
     }
 
-    // Everything still outstanding is accounted for.
-    let outstanding: usize = live.iter().map(|(_, l)| l.size()).sum();
-    assert!(
-        heap.allocated_bytes() >= outstanding,
-        "allocated_bytes {} is less than the {outstanding} bytes still live",
-        heap.allocated_bytes()
+    // Drain everything and require the counter to land exactly on zero. This is
+    // the invariant the previous `>=` was reaching for and could not express.
+    for (ptr, layout, _) in live.drain(..) {
+        unsafe { heap.dealloc(ptr, layout) };
+    }
+    assert_eq!(
+        heap.allocated_bytes(),
+        0,
+        "bytes still charged after every block was freed"
     );
 });
