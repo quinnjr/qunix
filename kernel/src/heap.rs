@@ -42,6 +42,15 @@ static INITIALISED: IrqSpinLock<bool, qunix_hal_x86_64::Irq> = IrqSpinLock::new(
 ///
 /// This is the number that predicts heap death: `allocated_bytes` cannot,
 /// because alignment padding is consumed without being credited.
+/// Bytes currently handed out, in the extents the heap actually charged.
+///
+/// Unlike [`bump_remaining`] this is unaffected by whether a block came from
+/// the bump region or from a large-block free list, which is what makes it
+/// usable as an assertion that does not depend on what ran earlier.
+pub fn allocated_bytes() -> usize {
+    HEAP.0.lock().allocated_bytes()
+}
+
 pub fn bump_remaining() -> usize {
     HEAP.0.lock().bump_remaining()
 }

@@ -11,6 +11,8 @@ mod boot;
 mod frames;
 mod heap;
 mod panic;
+mod sched;
+mod thread;
 mod testing;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -251,6 +253,117 @@ mod tests {
         assert_eq!(SWITCH_CHILD_RAN.load(Ordering::SeqCst), 1, "the child never ran");
         assert_eq!(a, 0x1111, "r12 was not preserved across the switch");
         assert_eq!(b, 0x2222, "r13 was not preserved across the switch");
+    }
+
+    static SPAWN_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    extern "C" fn sched_worker(arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        // Each worker sets its own bit, so the assertion can tell "all ran"
+        // from "one ran three times".
+        SPAWN_LOG.fetch_or(1u64 << arg, Ordering::SeqCst);
+        crate::sched::exit_current();
+    }
+
+    extern "C" fn sched_yielder(arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        // Yields back before finishing, so the test exercises a thread being
+        // requeued and resumed rather than only run-to-completion.
+        SPAWN_LOG.fetch_or(1u64 << arg, Ordering::SeqCst);
+        crate::sched::yield_now();
+        SPAWN_LOG.fetch_or(1u64 << (arg + 8), Ordering::SeqCst);
+        crate::sched::exit_current();
+    }
+
+    #[test_case]
+    fn scheduler_runs_every_spawned_thread_exactly_once() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        SPAWN_LOG.store(0, Ordering::SeqCst);
+
+        for i in 0..3u64 {
+            crate::sched::spawn_kernel(sched_worker, i, Priority::Normal);
+        }
+        // Each yield runs one worker to completion and comes back here.
+        for _ in 0..8 {
+            crate::sched::yield_now();
+        }
+
+        assert_eq!(
+            SPAWN_LOG.load(Ordering::SeqCst),
+            0b111,
+            "not every spawned thread ran, or one ran twice"
+        );
+    }
+
+    #[test_case]
+    fn a_yielding_thread_is_requeued_and_resumed() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        SPAWN_LOG.store(0, Ordering::SeqCst);
+
+        crate::sched::spawn_kernel(sched_yielder, 0, Priority::Normal);
+        for _ in 0..8 {
+            crate::sched::yield_now();
+        }
+
+        // Bit 0 is "started", bit 8 is "resumed after yielding". A scheduler
+        // that dropped the thread on yield would set only the first.
+        assert_eq!(SPAWN_LOG.load(Ordering::SeqCst) & 1, 1, "the thread never started");
+        assert_eq!(
+            SPAWN_LOG.load(Ordering::SeqCst) & (1 << 8),
+            1 << 8,
+            "a yielding thread was never resumed"
+        );
+    }
+
+    #[test_case]
+    fn exited_threads_are_reaped_so_their_stacks_are_freed() {
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+
+        let before = crate::sched::thread_count();
+        for i in 0..4u64 {
+            crate::sched::spawn_kernel(sched_worker, i, Priority::Normal);
+        }
+        assert_eq!(crate::sched::thread_count(), before + 4);
+
+        for _ in 0..12 {
+            crate::sched::yield_now();
+        }
+
+        // The negative direction: exited threads must actually leave the table.
+        // A scheduler that only marked them would grow without bound and leak a
+        // 16 KiB stack per thread.
+        assert_eq!(
+            crate::sched::thread_count(),
+            before,
+            "exited threads were not reaped; their stacks are still allocated"
+        );
+    }
+
+    #[test_case]
+    fn yield_without_other_threads_returns_rather_than_hanging() {
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        // Nothing else runnable. The boot thread must carry on, not block --
+        // this is the common case during bring-up.
+        for _ in 0..3 {
+            crate::sched::yield_now();
+        }
+        assert_eq!(crate::sched::current_id(), qunix_sched::ThreadId(0));
     }
 
     #[test_case]
@@ -532,6 +645,7 @@ mod tests {
         // either way, but growth by doubling would carve three separate
         // extents (4+8+16 KiB) instead of one.
         let before = crate::heap::bump_remaining();
+        let allocated_before = crate::heap::allocated_bytes();
         let mut v: Vec<u64> = Vec::with_capacity(2048);
         for i in 0..2048 {
             v.push(i);
@@ -540,14 +654,24 @@ mod tests {
         assert_eq!(v[2047], 2047);
         assert_eq!(v.iter().sum::<u64>(), (0..2048u64).sum::<u64>());
 
-        // 2048 u64s is 16 KiB, and the large-block path carves it straight out
-        // of the bump region, so the headroom must have moved by at least that
-        // much. Equality is not asserted: alignment padding is charged to the
-        // bump region too, and is not visible from here.
+        // 2048 u64s is 16 KiB. The heap must have charged at least that much,
+        // whichever path served it.
+        //
+        // This deliberately does *not* assert that the bump region moved. It
+        // used to, and that assertion held only because no earlier test had
+        // freed a 16 KiB block: once M1's scheduler began allocating and
+        // freeing 16 KiB thread stacks, the large-block free list satisfied
+        // this allocation and the bump region correctly stayed put. The old
+        // assertion was measuring which test ran first, not the allocator.
         let after = crate::heap::bump_remaining();
+        let charged = crate::heap::allocated_bytes() - allocated_before;
         assert!(
-            before - after >= 16 * 1024,
-            "bump region moved by only {} bytes for a 16 KiB allocation",
+            charged >= 16 * 1024,
+            "a 16 KiB allocation was charged only {charged} bytes"
+        );
+        assert!(
+            before - after >= 16 * 1024 || before == after,
+            "the bump region moved by {} bytes -- neither a fresh carve nor a recycle",
             before - after
         );
     }
