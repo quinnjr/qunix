@@ -6,7 +6,7 @@ already cost someone an hour. It is not a style guide.
 ## Commands
 
 ```sh
-cargo xtask test    # 46 in-QEMU + 165 host tests + licensing and attestation checks
+cargo xtask test    # 55 in-QEMU + 173 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 cargo xtask bench   # criterion, host-buildable crates only
@@ -178,6 +178,20 @@ LeakSanitizer.
   the "current" root is that process's. `vmspace::record_kernel_root` captures
   it at boot and every new address space copies from that; reading CR3 instead
   works only by accident, because the kernel halves happen to be identical.
+- **A process's address space is owned by its `Thread`.** `enter_user` never
+  returns, so the frame that built the `VmSpace` cannot own it; it used to be
+  `forget`-ten, which leaked the PML4, every table and every user page on every
+  process death. `sched::reap` drops it, from a different thread, after the
+  lock is released — dropping it under the scheduler lock would enter the frame
+  allocator underneath it.
+- **CR3 is reprogrammed on every dispatch**, from the incoming thread's own
+  address space or from the recorded kernel root. Not belt-and-braces: a CPU
+  that ran a user thread and then a kernel one kept the process root in CR3 and
+  nothing noticed, because the kernel half is identical — right up to the point
+  that process was reaped. Once threads move between CPUs the exit path alone
+  cannot guarantee the switch away happened, so each dispatch states its root.
+  The write is skipped when CR3 already holds it, because a CR3 write is a full
+  non-global TLB flush.
 - **`TSS.rsp0` is per-thread, not per-CPU-once.** The scheduler reprograms it
   from the incoming thread's own `kernel_stack_top` before every switch, so a
   ring-3 trap lands on the stack of the thread that is actually running.
@@ -239,7 +253,47 @@ standalone ELF placed in the ESP, not linked into the kernel. The kernel finds
 it by module cmdline (`init`), not by index, so adding a second module cannot
 silently change which one runs.
 
-QEMU runs with `-smp 4`. The APs come online and park — they do not schedule,
-because `sched::Scheduler::current` is one field shared by all CPUs and two
-CPUs scheduling through it would put two threads on one stack. Deviation D3 in
-the M1 plan says what moving it involves.
+QEMU runs with `-smp 4` and **every one of them schedules.** `current` and the
+run queue live in `percpu::PerCpu`, one of each per CPU; the thread table and
+the reapable list stay shared behind one lock. Four things about that are worth
+knowing before touching the scheduler:
+
+- **A thread is removed from a run queue before it is dispatched** — `pop`
+  locally, `steal` remotely — and that removal is the only thing stopping two
+  CPUs resuming one context.
+- **The outgoing thread is not requeued before the switch.** Between a push and
+  `context::switch` storing its stack pointer, another CPU may pop it and
+  resume a context that does not exist yet. It is handed to whatever runs on
+  the CPU next, through `HANDOFF_ID`, which by construction runs after the save.
+- **Idle threads are never stolen.** An idle thread adopted the stack its own
+  CPU booted on, so running it elsewhere puts two CPUs on one stack.
+  `RunQueue::runnable_len` excludes the idle band and the steal path checks it.
+- **The boot thread is an *idle*-band thread**, including while it is running
+  the test suite. A Normal-band thread that never exits starves it, so a test
+  that spins rather than yields must mask interrupts for the duration or it is
+  never scheduled again.
+
+Lock order: the thread table may be taken with no run-queue lock held, and a
+run queue is a leaf. Nothing takes the table while holding a queue, which is
+what lets two CPUs steal from each other without deadlocking.
+
+An idle CPU halts rather than spins, and is woken by an IPI that `spawn_kernel`
+sends after queueing. The check and the `hlt` are one masked region ending in a
+single `sti; hlt`, because a wakeup delivered between the two would leave the
+CPU halted with a full run queue.
+
+**TLB shootdown is IPI-based and the initiator waits for every other CPU to
+acknowledge.** A shootdown that does not wait is the same bug as no shootdown:
+the caller frees the frame while a remote CPU still resolves an address through
+it. The outstanding set is a bitmask rather than a count because `unmap` is
+reachable with interrupts masked, and a CPU spinning to start its own shootdown
+must be able to ask whether the set includes *it* and do the invalidation
+inline. The IPI handler and that spin loop run the same idempotent function.
+
+APs park in `hlt` only before they enter the scheduler, and always with
+interrupts enabled — `hlt` with `IF` clear is not woken by a maskable interrupt
+at all, so an AP parked with them masked can never acknowledge a shootdown.
+
+Anything per-CPU has to be installed *on* each CPU: the IDT vectors, the
+`SYSCALL` MSRs, the LAPIC's software-enable bit and its timer. `ap_entry`
+documents the order and why each step is where it is.

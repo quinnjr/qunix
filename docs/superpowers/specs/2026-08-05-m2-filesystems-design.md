@@ -59,9 +59,27 @@ This is the same failure M1 hit and recorded as Execution Deviation D1: M0's
 had to be reconciled mid-milestone. Catching it during the spec costs an hour;
 catching it during Task 6 costs a deviation.
 
-In scope here: no TLB shootdown, APs idle, single global run queue, no process
-reaping. Out of scope and still true: no FPU/SSE context switching, and a
-process's address space is leaked on exit (Deviation D7).
+In scope here, as of the approved scope: no TLB shootdown, APs idle, single
+global run queue, no process reaping. Out of scope: no FPU/SSE context
+switching.
+
+**Updated 2026-08-05, after T1 and T2 landed.** Three of the four statements in
+the paragraph above are no longer true of the code, and one of them was wrong
+to make in the first place:
+
+- TLB shootdown exists (T1) and the initiator waits for every other CPU to
+  acknowledge.
+- The APs schedule, each with its own run queue and `current`, stealing from
+  each other (T2).
+- **The address-space leak was fixed rather than deferred**, and listing it as
+  out of scope was the mistake. It is not an independent tidy-up: T2 is what
+  makes a process's frames reclaimable at all — a `VmSpace` freed while another
+  processor still held its root in CR3 would be the very corruption T1 exists
+  to prevent — and leaving it in place would have meant shipping per-CPU
+  scheduling on top of a known leak in exactly the path it makes reachable.
+  Recorded at Execution Deviation D7 in the M1 plan.
+
+What remains out of scope here is unchanged: FPU/SSE context switching.
 
 ## Design decisions
 
@@ -181,9 +199,11 @@ that moving the run queue per-CPU exists to remove.
 
 ## Task sequence
 
-1. **T1 — TLB shootdown.** IPI-based, sender waits for acknowledgement.
-2. **T2 — Per-CPU scheduling.** Run queue and `current` into `PerCpu`, work
-   stealing via the existing `RunQueue::steal`, process reaping.
+1. **T1 — TLB shootdown.** *Done.* IPI-based, sender waits for acknowledgement.
+2. **T2 — Per-CPU scheduling.** *Done*, except for process reaping. Run queue
+   and `current` in `PerCpu`, work stealing via the existing
+   `RunQueue::steal`. `PROCESSES` still grows without bound; thread reaping
+   (stacks and address spaces) is complete.
 3. **T3 — Async runtime.** Per-CPU executor, park/unpark, ISR-safe wakers.
 4. **T4 — virtio-blk.** PCI enumeration, virtqueues, MSI-X, completion futures.
 5. **T5 — Buffer cache.** Page-granular, dirty tracking, writeback.
@@ -232,7 +252,19 @@ like a bug.
 
 **Shootdown is tested for what it prevents.** Asserting that an IPI was sent
 tests nothing. The failure is a CPU that still resolves a stale translation
-after the sender returns, so that is what the test constructs.
+after the sender returns, so that is what the test constructs. As built: a
+kernel-half page is mapped, a thread on another processor reads it so the
+translation is cached, the initiator remaps the address to a different frame,
+and the remote thread's next read must find the new one. Expressed as a remap
+rather than an unmap because a stale *read* is observable and a stale *fault*
+is not — a #PF in ring 0 panics the kernel, so a test built on one could never
+report its own result. Removing the shootdown from `unmap` makes it fail with
+the old frame's contents.
+
+The one thing it cannot guarantee is that the remote entry was still cached at
+the second read; a TLB that evicted it in between would pass the test for the
+wrong reason. Nothing in the guest can rule that out, so it is stated rather
+than claimed away.
 
 **Work stealing gets forced contention.** Per CLAUDE.md, a path that only runs
 under contention is covered as a property of the host's core count unless the
@@ -259,7 +291,6 @@ produces one.
 ## Out of scope
 
 - FPU/SSE context switching (carried from M1)
-- Address-space reclamation on process exit (Deviation D7)
 - Loadable filesystem modules — precluded by the enum dispatch decision, and
   deliberately
 - Block device partitioning, LVM, RAID
