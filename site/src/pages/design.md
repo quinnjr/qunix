@@ -5,19 +5,19 @@ kicker: Architecture
 headline: qunix design decisions, and the reasoning behind each one
 tagline: >-
   Every non-obvious choice in the kernel, written down with the constraint that produced it. Where
-  a decision was later proved wrong by a test or a review, that is recorded too.
+  a decision was later shown to be incomplete by a test or a review, that is recorded too.
 description: >-
   The architecture of qunix, a Rust macrokernel for x86_64: buddy and slab allocators, per-CPU
-  state through GS, SMP bring-up, preemptive scheduling, owned address spaces, and a native
-  SYSCALL ABI — each with the reasoning and the failures behind it.
+  state through GS, SMP bring-up, preemptive scheduling, owned address spaces and a native
+  SYSCALL ABI, each with the reasoning behind it.
 faq:
   - q: Why is qunix a monolithic kernel rather than a microkernel?
     a: >-
       Because the research question is about Rust's limits under pressure, and a microkernel
-      relieves exactly the pressure that is interesting. The hard parts of kernel work in Rust —
-      hardware-aliased page tables, interrupt reentrancy, a thread stack that must be freed by
-      another thread — mostly live in the parts a microkernel moves to userspace. A macrokernel
-      keeps them in Rust, which is the point.
+      relieves the pressure that makes it interesting. The hard parts of kernel work in Rust, such
+      as hardware-aliased page tables, interrupt reentrancy and a thread stack that has to be freed
+      by another thread, mostly live in the parts a microkernel moves to userspace. A macrokernel
+      keeps them in Rust.
   - q: Why does qunix use a buddy allocator with intrusive free lists?
     a: >-
       A buddy allocator gives contiguous physical allocations for DMA and huge pages, which a
@@ -39,8 +39,8 @@ faq:
       one translation unit inside a fuzzing dependency, compiled with clang.
 ---
 
-This page documents what qunix does and why. It is organised by subsystem, and each section states
-the constraint first — the decision usually follows from it.
+This page documents what qunix does and why. It is organised by subsystem. Each section states the
+constraint first, since the decision usually follows from it.
 
 ## Toolchain and boot
 
@@ -75,9 +75,9 @@ the guest firmware forever.
 The kernel needs physically contiguous memory for DMA buffers and huge pages. A bitmap allocator
 makes "find 2 MiB of contiguous free frames" a scan; a buddy allocator makes it a list pop.
 
-`MAX_ORDER` is 18 — 1 GiB blocks. Capping at order 10 (4 MiB) would shard a large machine's memory
-into blocks that can never merge: 64 GiB becomes 16,384 order-10 blocks, and 1 GiB huge pages
-become impossible to satisfy. The cost of raising it is one `u64` of list head per order.
+`MAX_ORDER` is 18, so blocks go up to 1 GiB. Capping at order 10 (4 MiB) would shard a large
+machine's memory into blocks that can never merge. 64 GiB becomes 16,384 order-10 blocks, and 1 GiB
+huge pages become impossible to satisfy. Raising it costs one `u64` of list head per order.
 
 ### Why free-list metadata lives inside free frames
 
@@ -90,14 +90,14 @@ allocator. So the tag mixes address and order with a constant, and coalescing va
 trusting a neighbour is free. A block free at order 2 cannot be mistaken for a free order-0 block
 at the same address.
 
-### The two bugs that shaped the free path
+### The two findings that shaped the free path
 
-Both were memory corruption. Neither crashed.
+Neither produced a symptom at the point of failure.
 
 **Extent.** `free` looked up the region containing an address but never checked that the whole
-block *fit* inside it — while the coalescing loop directly below applied exactly that test to the
-buddy. A block starting inside a region and ending past it went onto a free list, and the next
-allocation of that order handed out memory the allocator never owned.
+block fit inside it, while the coalescing loop directly below applied exactly that test to the
+neighbouring block. A block starting inside a region and ending past it went onto a free list, and
+the next allocation of that order handed out memory the allocator never owned.
 
 **Alignment.** After the extent fix, a review found the same hole one step over. `buddy = pa ^
 size` is only the real buddy when `pa` is a multiple of `size`. A misaligned free was accepted,
@@ -105,15 +105,15 @@ and the next allocation returned a block overlapping a live one. The fuzzer coul
 it: the harness rounded addresses down to a block-size multiple, so misaligned input was
 unreachable by construction.
 
-The general lesson is recorded in the repo: **a fuzz target that normalises its inputs cannot find
-bugs in the normalisation.**
+The general lesson is recorded in the repository: **a fuzz target that normalises its inputs
+cannot exercise the normalisation.**
 
 ## Kernel heap
 
 The heap is a segregated-fit allocator with 17 size classes at 3/2 spacing rather than pure powers
-of two. Doubling caps worst-case internal waste at 49% — a 1025-byte request consuming 2048;
-interleaving the 1.5× steps caps it at 33%. The cost is eight more list heads (64 bytes) and one
-extra comparison in class selection, which stays branch-light and division-free.
+of two. Doubling caps worst-case internal waste at 49%, which is a 1025-byte request consuming
+2048. Interleaving the 1.5x steps caps it at 33%. The cost is eight more list heads (64 bytes) and
+one extra comparison in class selection, which stays branch-light and division-free.
 
 Anything larger than the biggest class is rounded to a power-of-two extent and tracked in parallel
 large-block lists. Without that, the bump region never recycles and a 16 MiB non-growing heap is
@@ -126,17 +126,17 @@ contract". That named an obligation the caller could neither discover nor discha
 nothing for the caller to uphold at that call site: the invariants are established by
 `set_backing` and preserved by `dealloc`, both of which remain `unsafe`.
 
-Returning a raw pointer is not unsafe; *dereferencing* it is, and that is the caller's act.
-Marking `alloc` unsafe devalued the marker on the call sitting right next to it that genuinely
-carries a contract.
+Returning a raw pointer is not unsafe. Dereferencing it is, and that is the caller's act. Marking
+`alloc` unsafe devalued the marker on the call sitting right next to it that carries a real
+contract.
 
 ## Per-CPU state and SMP
 
 ### Why `static mut` had to go
 
 M0 kept the GDT, TSS, IDT and double-fault stack in `static mut` singletons. That was sound only
-because exactly one CPU existed. The TSS holds `rsp0` and the interrupt stack table, both per-CPU
-by definition — two cores sharing one means two cores faulting onto the same stack.
+because exactly one CPU existed. The TSS holds `rsp0` and the interrupt stack table, both of which
+are per-CPU by definition. Two cores sharing one means two cores faulting onto the same stack.
 
 They now live in a per-CPU block reached through `GS`. The first five fields sit at fixed offsets
 with compile-time offset assertions, because the `SYSCALL` entry stub reaches them with `gs:[N]`
@@ -157,8 +157,8 @@ Every AP installs its own descriptor tables and reports in. None of them run thr
 
 That is a specific limit, not an omission. The scheduler's `current` is a single field naming one
 running thread. On one CPU that is true; with two CPUs scheduling through it, the first switch has
-one core save its stack pointer into the other core's context — two threads on one stack, which is
-the same class of failure as the allocator handing out one frame twice. The per-CPU block already
+one core save its stack pointer into the other core's context. That puts two threads on one stack,
+which is the same class of failure as the allocator handing out one frame twice. The per-CPU block already
 carries a `current_thread` slot; moving `current` into it is what makes APs schedulable.
 
 Parking is the honest behaviour in the meantime: an AP that took work would corrupt the CPU that
@@ -177,7 +177,7 @@ starved"; a weighted scheme with no workload to tune against would be guesswork.
 Two properties earned their place by being non-obvious:
 
 - **Enqueueing a thread that is already queued is refused.** A double push lets one thread be
-  handed to two CPUs — the scheduler's version of the double-free.
+  handed to two CPUs, which is the scheduler's version of a double free.
 - **"Is there work to steal" excludes the idle band.** The idle thread is always queued, so a
   naive length check would migrate idle threads between cores forever.
 
@@ -188,7 +188,7 @@ the incoming thread scheduled: the lock would be owned by a thread that is no lo
 cannot release it until it is scheduled again.
 
 **Interrupts stay off across the whole of `schedule`, not just while the lock is held.** The lock
-must drop before the switch, and in that window `current` already names the incoming thread — a
+must drop before the switch, and in that window `current` already names the incoming thread. A
 tick landing there would save the outgoing thread's stack pointer into the incoming thread's
 context.
 
@@ -206,13 +206,13 @@ freeing takes the heap lock and holding both would order two locks in a way noth
 ## Address spaces
 
 An address space owns its page tables and returns every frame on drop. The kernel half is shared
-by *reference* — the top-level entries 256–512 are copied, not the tables beneath them — so a
-later kernel mapping appears in every address space without walking them all.
+by reference. The top-level entries 256 to 512 are copied, not the tables beneath them, so a later
+kernel mapping appears in every address space without walking them all.
 
 The cost is that teardown must free only what it allocated, which is why the address space keeps
 an explicit list rather than walking the table at drop. A walk cannot distinguish a frame this
 address space allocated from one it merely mapped, and freeing a shared kernel table would unmap
-the kernel out from under every other address space — including the one doing the freeing.
+the kernel out from under every other address space, including the one doing the freeing.
 
 `activate` is the first code in the project to write CR3, which makes two things newly
 load-bearing. The instruction after `mov cr3` is fetched through the *new* tables, so a root
@@ -229,8 +229,8 @@ report itself through.
 ### Why the native ABI borrows Linux's register convention
 
 `rax` holds the syscall number; arguments arrive in `rdi`, `rsi`, `rdx`, `r10`, `r8`. The numbers
-are qunix's own and deliberately not Linux's — a compatibility personality will translate those —
-but the *register* convention matches so that layer needs no re-plumbing.
+are qunix's own rather than Linux's, since a compatibility personality will translate those. The
+register convention matches so that layer needs no re-plumbing.
 
 `r10` rather than `rcx` for the fourth argument because `SYSCALL` clobbers `rcx` with the return
 address. That is architectural, not a choice.
@@ -255,14 +255,14 @@ to address 0.
 
 A process's text is mapped executable and not writable; its stack is writable and never
 executable. Text is mapped writable just long enough for the kernel to copy the program in, then
-remapped — the alternative, a second temporary mapping of the same frame, costs a page table walk
-and buys nothing, because nothing can reach the address space until it is activated.
+remapped. The alternative, a second temporary mapping of the same frame, costs a page table walk
+and buys nothing, since nothing can reach the address space until it is activated.
 
 ### What syscall argument validation does and does not check
 
 Addresses naming memory are checked: the higher half is refused outright, ranges that wrap are
-refused, and a range that *starts* legal and *ends* kernel-side is refused — checking only the
-start would let a process read across the boundary.
+refused, and a range that starts legal and ends kernel-side is refused. Checking only the start
+would let a process read across the boundary.
 
 What is not checked is whether the pages are mapped. A well-formed but unmapped user address still
 faults, and the kernel has no handler that can recover. That needs a per-thread expected-fault

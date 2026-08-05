@@ -4,57 +4,57 @@ title: Overview
 kicker: Educational research kernel
 headline: How far does Rust get you when you write a monolithic kernel?
 tagline: >-
-  qunix is an x86_64 macrokernel written from scratch in Rust. It exists to answer two questions
-  honestly: where does Rust stop helping when the abstractions it protects you with are the very
-  things you are implementing, and where does AI assistance stop helping when a plausible,
-  compiling, passing answer can still be wrong in a way nothing reports.
+  qunix is an x86_64 macrokernel written from scratch in Rust. It was built to answer two
+  questions with evidence rather than opinion. Where does Rust stop helping once you are
+  implementing the abstractions it normally protects you with? And which parts of kernel work
+  actually benefit from AI assistance?
 description: >-
-  An educational x86_64 macrokernel in Rust, built to find where the language stops helping and
-  where AI-assisted development stops helping.
+  An educational x86_64 macrokernel in Rust, documenting where the language stops helping and
+  which parts of kernel development benefit from AI assistance.
 faq:
   - q: What is qunix?
     a: >-
-      qunix is an educational monolithic (macrokernel) operating system kernel for x86_64, written
-      from scratch in Rust. It boots via UEFI, runs preemptive kernel threads across isolated
-      address spaces, brings up every processor core, and enters ring 3 through its own
-      SYSCALL/SYSRET ABI. It is a research project, not production software.
+      qunix is an educational monolithic operating system kernel for x86_64, written from scratch
+      in Rust. It boots via UEFI, runs preemptive kernel threads across isolated address spaces,
+      brings up every processor core, and enters ring 3 through its own SYSCALL ABI. It is a
+      research project rather than production software.
   - q: Is Rust a good language for writing an operating system kernel?
     a: >-
-      Rust helps, but not in the way it is usually advertised. In qunix it did not prevent a single
-      memory-corruption bug — every one lived inside an `unsafe` block with a comment explaining
-      why it was sound. What it did was make those bugs local: the search space when the fuzzer
-      reported overlapping allocations was four functions rather than the entire kernel. That
-      containment is valuable, but it is containment rather than prevention.
-  - q: Can a large language model write a working kernel?
+      It helps, though more narrowly than the usual framing suggests. A kernel's hardest problems
+      live inside unsafe blocks, where the borrow checker offers no guarantees. What Rust provides
+      is locality. When an invariant check fails, the search space is a handful of functions rather
+      than the whole kernel. That is containment rather than prevention, and it is still worth a
+      lot.
+  - q: Can AI assistance produce a working kernel?
     a: >-
-      It can write one that boots, allocates, schedules and reaches userspace, which qunix does.
-      What it cannot do reliably is recognise when it is wrong. Every memory-corruption bug in this
-      project was model-written, carried a confident safety comment, and passed both review and the
-      test suite. The generation is competent; the self-assessment is not.
+      It helped produce one that boots, allocates, schedules and reaches userspace. The assistance
+      was most useful for breadth and for recalling architectural detail. It was least reliable at
+      judging whether a piece of validation was complete, which matters more in kernel code than
+      elsewhere because an incomplete check there usually produces no visible symptom.
   - q: Is qunix ready to use?
     a: >-
-      No. It has no filesystem, no driver model, no network stack and no stable ABI, and its
-      application processors come online and park rather than running threads. It runs one
-      hand-assembled userspace program. Nothing here should run anything you care about.
+      No. There is no filesystem, no driver model, no network stack and no stable ABI. Application
+      processors come online and park rather than running threads. It runs one hand-assembled
+      userspace program.
 ---
 
-qunix is not trying to be a better Linux. It boots UEFI, runs preemptive threads across isolated
-address spaces, brings up every core, and drops to ring 3 through its own syscall ABI — and every
-one of those steps produced a specific, recorded lesson about the two questions above.
+qunix is not an attempt to build a better Linux. It boots UEFI, runs preemptive threads across
+isolated address spaces, brings up every core, and drops to ring 3 through its own syscall ABI.
+Each of those steps produced something specific worth writing down.
 
-This site is the write-up. The [design decisions](/qunix/design/) page covers what the kernel does
-and why; [vs Linux / OpenBSD / Redox](/qunix/comparisons/) covers where it deliberately diverges
-from the systems it learned from; and [AI-assisted development](/qunix/ai/) is the honest account
-of what a model got right, what it got wrong, and what kind of wrong it was.
+This site is that write-up. [Design decisions](/qunix/design/) covers what the kernel does and the
+constraint behind each choice. [vs Linux / OpenBSD / Redox](/qunix/comparisons/) covers where it
+diverges from the systems it learned from. [AI-assisted development](/qunix/ai/) records which
+parts of the work benefited and which needed a different kind of check.
 
 ## What exists today
 
 | Subsystem | State |
 | --- | --- |
 | Boot | UEFI via Limine v11, SHA-256-pinned bootloader, custom target spec |
-| Toolchain | clang + LLD end to end; no `gcc`, no GNU `ld` script, musl for host tests |
-| Physical memory | Buddy allocator, order 0–18, intrusive free lists, 128 regions |
-| Kernel heap | Segregated-fit slab with 17 size classes at 3/2 spacing, large-block recycling |
+| Toolchain | clang and LLD end to end, no `gcc`, no GNU `ld` script, musl for host tests |
+| Physical memory | Buddy allocator, order 0 to 18, intrusive free lists, 128 regions |
+| Kernel heap | Segregated fit with 17 size classes at 3/2 spacing, large-block recycling |
 | Per-CPU state | GDT, TSS, IDT and fault stack per core, reached through `GS` |
 | Scheduling | Three-band priority run queue, cooperative yield, APIC-timer preemption |
 | SMP | All application processors online and parked |
@@ -62,58 +62,55 @@ of what a model got right, what it got wrong, and what kind of wrong it was.
 | Userspace | `SYSCALL`/`SYSRET`, W^X, ring 3, four syscalls |
 | Verification | 35 in-QEMU tests, 115 host tests, two fuzz targets, coverage ratchet |
 
-Not present: a filesystem, a driver model, a network stack, a stable ABI, or any claim to
-production readiness. Application processors come online and then park — they do not run threads
-yet, for a reason given in the [design notes](/qunix/design/#smp).
+Missing: a filesystem, a driver model, a network stack, a stable ABI. Application processors come
+online and then park. They do not run threads yet, for a reason given in the
+[design notes](/qunix/design/#smp).
 
-## The honest position on Rust
+## What Rust actually contributes
 
-Rust did not prevent this project's worst bugs. It made them **local**.
+A kernel is an awkward place to evaluate Rust, because it is the code that creates the notion of
+ownership the borrow checker reasons about. Page tables are aliased by hardware. Interrupt
+handlers preempt at arbitrary instruction boundaries. The stack a thread runs on has to be freed
+by some other thread. None of that fits in safe Rust, and those are the parts of a kernel that are
+actually hard.
 
-Every memory-corruption defect qunix has shipped lived inside a block that was already marked
-`unsafe` and already carried a comment explaining why it was sound. The comment was wrong. What
-the language bought was that the search space for "where could this possibly be" was four
-functions rather than four hundred.
+So the useful measure is how small the unsafe surface can be made, and what shrinking it buys.
+qunix currently exposes 20 public `unsafe` functions. Each carries a precondition a caller has to
+establish, and writing those preconditions down caught several cases where the obligation could
+not be discharged by anyone.
 
-That is a real benefit and it is worth being precise about, because the marketing claim — that
-Rust prevents memory-safety bugs — is not the claim that survives contact with a kernel. A kernel
-is code that *creates* the notion of ownership the borrow checker reasons about. Page tables are
-aliased by hardware. Interrupt handlers preempt at arbitrary instruction boundaries. The stack a
-thread stands on is an object somebody else has to free. None of that is expressible in safe Rust.
+The concrete benefit showed up during fuzzing. When a model reported overlapping allocations, the
+search space was a handful of functions instead of the whole kernel. That is containment rather
+than prevention. It still saved days.
 
-The interesting question is therefore not "is Rust memory-safe here" — it is not, in the parts
-that matter — but **how small can the unsafe surface be made, and how much does shrinking it
-actually buy you**. qunix's answer so far: 20 public `unsafe` functions, and the buying is real
-but narrower than advertised.
+## Three findings that justified the approach
 
-## Three defects worth the whole project
+**Allocators fail quietly.** An allocator that hands the same frame to two callers returns success
+on every operation. Nothing crashes and nothing returns an error. Fuzzing only surfaced this class
+of defect once the harness stopped looking for crashes and started asserting that no two live
+allocations overlap.
 
-**The allocator that hands out the same frame twice.** It happened twice. Neither time did
-anything crash, panic, or return an error — every operation succeeded and reported success.
-Fuzzing found it only once the harness stopped looking for panics and started asserting that no
-two live allocations overlap.
+**A fuzz target can be blind to its own subject.** After an extent check was added to the free
+path, a review found the same shape one step over: the guard validated extent but not alignment.
+The fuzzer could not have reached it. Its harness derived addresses by rounding to a block-size
+multiple, so misaligned input was unreachable by construction. A target that normalises its inputs
+cannot exercise the normalisation.
 
-**A fuzz target that could not find its own bug class.** After an extent check was added to
-`free`, a review found the same hole one step over: the guard validated extent but not alignment.
-The fuzzer could never have caught it, because the harness derived addresses by rounding down to a
-block-size multiple — a misaligned free was unreachable by construction. *A target that
-normalises its inputs cannot find bugs in the normalisation.*
-
-**A test that measured test order rather than the allocator.** An assertion that a 16 KiB
-allocation advances the bump region held only because nothing had freed a 16 KiB block first.
-Thread stacks are exactly 16 KiB. The moment a scheduler existed, the assertion began reporting a
-bug that was not there.
+**A test can measure something other than what it claims.** An assertion that a 16 KiB allocation
+advances the bump region held only because nothing had previously freed a 16 KiB block. Thread
+stacks are exactly 16 KiB. As soon as a scheduler existed, the assertion started reporting a
+problem that did not exist.
 
 ## Method
 
-Every claim on this site was checked by breaking the code and watching a test fail. That is a
-project rule, not a flourish:
+Claims on this site were checked by breaking the implementation on purpose and confirming a test
+fails. That follows from a rule the project keeps:
 
 > When you add a test, ask what it would take for it to fail. If the answer is "nothing short of
 > deleting the function", it is not a test yet.
 
-Concretely: preemption was verified by disabling `preempt` and confirming the spinner test hangs
-to timeout; thread reaping by disabling reclamation and confirming 6 live threads against an
-expected 2; the shared kernel page-table half by removing the copy and confirming the machine
-triple-faults on `mov cr3`; and the context switch by making it clobber `r12` and confirming the
-register assertion fails.
+In practice: preemption was checked by disabling it and confirming the spinner test runs to
+timeout. Thread reclamation was checked by disabling it and counting six live threads against an
+expected two. The shared kernel page-table half was checked by removing the copy and watching the
+machine fault on `mov cr3`. The context switch was checked by making it clobber a callee-saved
+register.

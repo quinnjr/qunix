@@ -1,8 +1,8 @@
 @import "tailwindcss";
-/* Oxide: tailswatch's Rust-inspired dark theme — rust orange on charcoal.
-   Chosen because it is literally the language's palette, and this project is an
-   argument about that language. Its colour tokens are what we want from it; its
-   typography is overridden below. */
+/* Oxide: tailswatch's Rust-inspired dark theme, rust orange on charcoal.
+   Chosen because it is the language's own palette and this project is an argument
+   about that language. Its colour tokens are what we want from it. Its typography
+   is overridden below. */
 @import "tailswatch/themes/oxide";
 
 /*
@@ -11,12 +11,12 @@
   a privacy leak and a dependency that can break independently of this repo.
 
   The @font-face rules are written out by hand instead of importing the
-  @fontsource-variable entrypoints, because those pull every unicode subset the
-  family ships — latin, latin-ext, vietnamese, cyrillic and greek where they
-  exist. That was 287 KB of woff2 for a site written entirely in English. Naming
-  the latin file directly cuts it to a third, and the `unicode-range` means a
-  browser that meets a character outside the subset falls back rather than
-  rendering tofu.
+  @fontsource-variable entrypoints, because those pull every unicode subset a
+  family ships: latin, latin-ext, vietnamese, cyrillic and greek where they
+  exist. That came to 287 KB of woff2 for a site written entirely in English.
+  Naming the latin file directly cuts it to a third, and the `unicode-range`
+  means a browser that meets a character outside the subset falls back instead
+  of rendering tofu.
 
   Variable fonts, so weights 300-700 cost one file per family rather than five.
 */
@@ -61,10 +61,10 @@
   would silently fall back to the system sans and the site would look like every
   other Tailwind default.
 
-  Space Grotesk for headings: a grotesk with squared terminals and a drawn
-  single-storey `a` — technical without being a costume. IBM Plex Sans for
-  running text, designed for exactly this kind of documentation. JetBrains Mono
-  for code, whose large x-height keeps register dumps readable at small sizes.
+  Space Grotesk for headings, a grotesk with squared terminals and a drawn
+  single-storey `a`. IBM Plex Sans for running text, which was designed for this
+  kind of documentation. JetBrains Mono for code, whose large x-height keeps
+  register dumps readable at small sizes.
 */
 @theme {
   --font-heading: 'Space Grotesk Variable', ui-sans-serif, system-ui, sans-serif;

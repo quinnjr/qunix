@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="qunix — a Rust macrokernel experiment">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="qunix, a Rust macrokernel experiment">
   <rect width="1200" height="630" fill="#1a1410"/>
   <rect x="0" y="0" width="1200" height="6" fill="#e65100"/>
   <text x="80" y="250" font-family="'Space Grotesk',ui-sans-serif,sans-serif" font-size="104" font-weight="700" fill="#ff9800">qunix</text>
   <text x="80" y="330" font-family="'IBM Plex Sans',ui-sans-serif,sans-serif" font-size="40" fill="#f5f0eb">A monolithic kernel written in Rust,</text>
   <text x="80" y="386" font-family="'IBM Plex Sans',ui-sans-serif,sans-serif" font-size="40" fill="#f5f0eb">as an experiment in language limits.</text>
-  <text x="80" y="470" font-family="'JetBrains Mono',ui-monospace,monospace" font-size="26" fill="#a89c90">x86_64 · buddy + slab · SMP · ring 3</text>
+  <text x="80" y="470" font-family="'JetBrains Mono',ui-monospace,monospace" font-size="26" fill="#a89c90">x86_64 / buddy + slab / SMP / ring 3</text>
   <text x="80" y="524" font-family="'JetBrains Mono',ui-monospace,monospace" font-size="26" fill="#7a7068">github.com/quinnjr/qunix</text>
 </svg>

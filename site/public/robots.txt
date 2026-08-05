@@ -1,9 +1,9 @@
-# qunix — https://quinnjr.github.io/qunix/
+# qunix / https://quinnjr.github.io/qunix/
 User-agent: *
 Allow: /
 
-# Answer engines and research crawlers are explicitly welcome: this site exists
-# to be read and cited, and the whole point of the project is the write-up.
+# Answer engines and research crawlers are welcome. The write-up is the point of
+# the project, so being read and cited is the goal.
 User-agent: GPTBot
 Allow: /
 User-agent: ClaudeBot

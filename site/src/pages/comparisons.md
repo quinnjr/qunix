@@ -5,12 +5,12 @@ kicker: Comparison
 headline: How qunix differs from Linux, OpenBSD and Redox
 tagline: >-
   qunix borrows from all three and diverges from each on specific, defensible points. This page
-  states where and why — including the places where the established systems are simply right and
+  states where and why, including the places where the established systems are simply right and
   qunix is making a research trade.
 description: >-
   A detailed comparison of qunix against Linux, OpenBSD and Redox OS: kernel structure, memory
-  allocators, language and safety strategy, scheduling, security posture, and driver models —
-  with the reasoning behind each divergence.
+  allocators, language and safety strategy, scheduling, security posture and driver models, with
+  the reasoning behind each divergence.
 faq:
   - q: How is qunix different from Redox OS?
     a: >-
@@ -28,16 +28,16 @@ faq:
       hardware dependency, and enforces a coverage ratchet and fuzzing model on its allocators.
   - q: How is qunix different from OpenBSD?
     a: >-
-      OpenBSD's defining trait is aggressive, opinionated simplicity in service of auditability —
-      removing features to reduce attack surface. qunix shares the philosophy of proving security
-      properties rather than asserting them, but pursues it through machine-checked means, using
-      fuzzing with independent models, a coverage ratchet, and tests that assert the negative
-      direction, rather than through code review culture alone.
+      OpenBSD's defining trait is opinionated simplicity in service of auditability, removing
+      features to reduce attack surface. qunix shares the instinct that security properties should
+      be demonstrated rather than asserted, but pursues it through machine-checked means: fuzzing
+      against independent models, a coverage ratchet, and tests that assert the negative direction,
+      rather than through review culture alone.
   - q: Is qunix a fork of any existing kernel?
     a: >-
-      No. qunix is written from scratch. It borrows ideas — the buddy allocator lineage from Unix
-      and Linux, W^X and the security-by-proof posture from OpenBSD, the case for Rust in kernel
-      space from Redox — but shares no code with any of them.
+      No. qunix is written from scratch. It borrows ideas, including the buddy allocator lineage
+      from Unix and Linux, W^X and the demonstrate-rather-than-assert posture from OpenBSD, and the
+      case for Rust in kernel space from Redox. It shares no code with any of them.
 ---
 
 qunix learned from all three systems below. Where it diverges, the divergence is deliberate and
@@ -58,33 +58,34 @@ simply right, this page says so.
 | Isolation model | Address space + ring 3 | Address space + namespaces | Address space + `pledge`/`unveil` | Address space + capabilities |
 | Verification | Fuzzing w/ models, coverage ratchet | Extensive; syzkaller | Audit culture, mitigations | Type safety, tests |
 
-## Against Redox — the closest relative, and the sharpest divergence
+## Against Redox, the closest relative
 
 Redox is the obvious comparison: a Rust operating system, actively developed, far more complete
 than qunix. The divergence is structural.
 
 **Redox is a microkernel. qunix is monolithic, on purpose.** Redox moves drivers, filesystems and
 the network stack into userspace processes communicating over a scheme-based IPC layer. For
-building a real operating system, that is the better engineering choice — a driver fault becomes a
-restartable process instead of a panic.
+building a real operating system that is the better engineering choice, since a driver fault
+becomes a restartable process instead of a panic.
 
-For the question qunix is asking, it is the wrong choice, because it **relieves exactly the
-pressure that is interesting**. The genuinely hard parts of writing a kernel in Rust —
-hardware-aliased page tables, interrupt handlers that preempt at arbitrary instruction boundaries,
-a thread stack that must be freed by a different thread, per-CPU state reached through a segment
-base — mostly live in the parts a microkernel relocates to userspace, where ordinary Rust rules
-apply again. A macrokernel keeps them in the kernel, which is the point of the experiment.
+For the question qunix is asking it is the wrong choice, because it relieves the pressure that
+makes the question interesting. The hard parts of writing a kernel in Rust are hardware-aliased
+page tables, interrupt handlers that preempt at arbitrary instruction boundaries, a thread stack
+that has to be freed by a different thread, and per-CPU state reached through a segment base. Most
+of those live in the parts a microkernel relocates to userspace, where ordinary Rust rules apply
+again. A macrokernel keeps them in the kernel.
 
 **What Redox does better, plainly:** it has a filesystem, a userland, a package ecosystem, and it
 self-hosts. qunix runs one hand-assembled program that prints a string and exits. Redox has also
 solved problems qunix has not reached, notably a coherent driver interface.
 
-**Where qunix diverges on method:** qunix treats its allocators as the primary threat and fuzzes
-them against an independent model that asserts no two live allocations overlap. That is a response
-to a specific finding — the allocators do not crash when they are wrong. Type safety does not
-help here, because the bug lives inside the `unsafe` block that implements the abstraction.
+**Where qunix diverges on method:** it treats the allocators as the primary risk and fuzzes them
+against an independent model asserting that no two live allocations overlap. That follows from a
+specific observation, which is that these allocators do not fail loudly when they are wrong. Type
+safety offers little help, because the relevant code sits inside the `unsafe` block implementing
+the abstraction.
 
-## Against Linux — structure in common, strategy apart
+## Against Linux, structure in common and strategy apart
 
 qunix is monolithic like Linux and borrows the buddy allocator lineage directly. The differences
 are in policy, and each is a deliberate reaction to a known Linux pain point.
@@ -93,9 +94,9 @@ are in policy, and each is a deliberate reaction to a known Linux pain point.
 
 Linux uses per-CPU variables extensively but also carries a large amount of global mutable state
 guarded by convention and lock discipline. qunix bans `static mut` outright as of its second
-milestone. Where a static genuinely cannot be allocated — the bootstrap CPU's descriptor tables,
-which must exist before the allocator does — it is an `UnsafeCell` in a `Sync` newtype with a
-comment naming the single writer.
+milestone. Where a static genuinely cannot be allocated, as with the bootstrap CPU's descriptor
+tables which have to exist before the allocator does, it is an `UnsafeCell` in a `Sync` newtype
+with a comment naming the single writer.
 
 This is cheap in a young kernel and would be expensive to retrofit into an old one. It is not a
 criticism of Linux; it is a thing you can only do at the start.
@@ -110,9 +111,9 @@ case where the language earns its place.
 ### Scheduling policy has no hardware dependency
 
 Linux's scheduler is deeply entangled with per-CPU runqueue structures, and testing it means
-booting. qunix's policy is a separate crate with no notion of a CPU, a stack or a context switch —
-threads are opaque IDs. It is host-tested, so a policy bug is a failed assertion in a second
-rather than a machine that stops responding.
+booting. qunix keeps policy in a separate crate with no notion of a CPU, a stack or a context
+switch, where threads are opaque IDs. It is host-tested, so a policy bug is a failed assertion in
+a second rather than a machine that stops responding.
 
 The cost is real and worth stating: the split means the policy cannot make decisions informed by
 cache topology or NUMA distance without that information being passed in explicitly. Linux's
@@ -124,17 +125,17 @@ Linux's per-CPU page allocator caches, its RCU machinery, and its enormous hardw
 not things qunix is improving on. qunix has one global run queue and one lock, which is a
 correctness-first placeholder that will not survive contact with a real workload.
 
-## Against OpenBSD — same instinct, different instrument
+## Against OpenBSD, same instinct and different instrument
 
 OpenBSD's defining trait is aggressive simplicity in service of auditability: remove features,
 reduce attack surface, make the code small enough that humans can actually read all of it. qunix
-shares the underlying instinct — that security properties should be *proved* rather than asserted
-— and pursues it differently.
+shares the underlying instinct, that security properties should be demonstrated rather than
+asserted, and pursues it differently.
 
-### Proof by machine rather than by reading
+### Verification by machine rather than by reading
 
-OpenBSD's principal instrument is a code review culture with unusually high standards. qunix's is
-machine-checked:
+OpenBSD's principal instrument is a code review culture with unusually high standards. qunix leans
+on machine-checked properties instead:
 
 - **Fuzzing against an independent model.** The allocator targets do not look for panics. They
   maintain a separate model of what is live and assert, after every operation, that no two live
@@ -142,11 +143,11 @@ machine-checked:
 - **A coverage ratchet.** Per-crate line coverage cannot fall without a written justification in
   the file itself; the tooling refuses to lower a floor that has no recorded reason.
 - **Tests that assert the negative direction.** Not that coalescing merges, but that it *refuses*
-  a live buddy. Two memory-corruption bugs shipped precisely inside that gap.
+  a live neighbour. Defects have twice occupied precisely that gap.
 
-This is not better than OpenBSD's approach — OpenBSD's has three decades of evidence behind it and
+This is not better than OpenBSD's approach, which has three decades of evidence behind it where
 qunix has none. It is a different bet: that a small project with one contributor gets more safety
-per hour from machine-checked invariants than from review.
+per hour from machine-checked invariants than from review alone.
 
 ### Shared posture: W^X, and no exceptions
 
@@ -157,20 +158,21 @@ retroactive is much harder than making it foundational.
 ### Where OpenBSD is simply right
 
 `pledge` and `unveil` are the best ergonomics-to-security ratio in any production kernel. qunix
-has nothing comparable and no syscall filtering at all. OpenBSD's mitigations — `malloc` guard
-pages, kernel address randomisation, trapsleds — are also production-tested in a way nothing here
+has nothing comparable and no syscall filtering at all. Its mitigations, including `malloc` guard
+pages, kernel address randomisation and trapsleds, are production-tested in a way nothing here
 is.
 
-## The security properties qunix does *not* claim
+## Current limits
 
-Being explicit, because a research kernel that overstates its position is worse than useless:
+Stated plainly, because a research kernel that overstates its position is not useful to anyone:
 
-- **No fault recovery.** A syscall handed a well-formed but unmapped user address faults, and
-  nothing catches it. Validation checks the higher half and wrapping, not mapping.
-- **No syscall filtering, no capabilities, no namespaces.** Four syscalls, all unrestricted.
-- **No ASLR, no stack guard pages.** Limine's stack has no guard page, so stack overflow scribbles
-  through memory rather than faulting — recorded in the repo as a known hazard.
-- **One user process, no multi-tenancy.** Isolation between two processes is demonstrated by a
-  test, not by anything running in anger.
-- **The allocators have shipped memory corruption twice.** Both are fixed and both have regression
-  tests. The relevant fact is that they existed, passed review, and were found by fuzzing.
+- **No fault recovery.** A system call given a well-formed but unmapped user address will fault,
+  and nothing catches it. Validation covers the higher half and wrapping, not mapping.
+- **No syscall filtering, capabilities or namespaces.** Four calls, all unrestricted.
+- **No ASLR, and no stack guard pages.** The bootloader's stack has none, so overflow writes
+  through adjacent memory rather than faulting.
+- **One user process.** Isolation between two address spaces is demonstrated by a test rather than
+  by a running workload.
+- **The allocators are the most-scrutinised part of the kernel for a reason.** Both have carried
+  defects that produced no symptom until a fuzzing model asserted the invariant directly; both are
+  fixed and carry regression tests.
