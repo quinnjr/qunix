@@ -78,8 +78,17 @@ fn bench_args(extra: &[String]) -> Vec<String> {
 /// rather than letting libFuzzer run forever, so this is usable in CI and in a
 /// pre-PR check without needing to be interrupted by hand.
 fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
-    let mut args: Vec<String> =
-        ["fuzz", "run", target].iter().map(|s| (*s).to_string()).collect();
+    let mut args: Vec<String> = ["fuzz", "run", target]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    // Pinned, not defaulted. cargo-fuzz targets the triple *it* was built for,
+    // so a source-built copy picks gnu while the prebuilt binary CI downloads
+    // is musl-static -- and a sanitizer cannot be linked into a static libc
+    // ("sanitizer is incompatible with statically linked libc"). Naming the
+    // triple makes the build identical however cargo-fuzz was installed.
+    args.push("--target".to_string());
+    args.push("x86_64-unknown-linux-gnu".to_string());
     args.push("--".to_string());
     args.push(format!("-max_total_time={seconds}"));
     // libFuzzer's default 2 GiB ceiling counts the sanitizer's shadow memory,
@@ -267,6 +276,12 @@ mod tests {
     fn fuzz_bounds_the_run_and_names_the_target() {
         let args = fuzz_args("buddy", 90, &[]);
         assert_eq!(args[..3], ["fuzz", "run", "buddy"]);
+        // A sanitizer cannot link against a static libc, so the triple must be
+        // pinned rather than inherited from how cargo-fuzz was installed.
+        assert!(
+            args.windows(2).any(|w| w[0] == "--target" && w[1] == "x86_64-unknown-linux-gnu"),
+            "fuzz target triple not pinned: {args:?}"
+        );
         // Unbounded, libFuzzer never returns, which would hang CI.
         assert!(args.iter().any(|a| a == "-max_total_time=90"), "no time bound: {args:?}");
         assert!(args.iter().any(|a| a.starts_with("-rss_limit_mb=")));
