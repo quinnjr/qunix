@@ -258,8 +258,7 @@ mod tests {
 
     #[test]
     fn lock_takes_the_backoff_path_when_genuinely_contended() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
         use std::time::Duration;
 
         // `contended_across_threads_never_loses_increments` only reaches the
@@ -267,21 +266,27 @@ mod tests {
         // is a property of the host's core count rather than of the code. This
         // test forces the overlap: the lock is provably held before the main
         // thread asks for it, so `try_lock` must fail and `lock` must spin.
+        //
+        // A `Barrier` rather than a flag and a busy-wait. The busy-wait was
+        // itself scheduling-dependent -- on a CI runner the flag was already
+        // set at the first check, so its body never executed, and the two lines
+        // showed as a coverage regression on a commit that had not touched this
+        // crate. The barrier orders the two threads without a spin at all.
         let lock = Arc::new(SpinLock::new(0u32));
-        let held = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
 
         let holder_lock = Arc::clone(&lock);
-        let holder_flag = Arc::clone(&held);
+        let holder_ready = Arc::clone(&ready);
         let holder = std::thread::spawn(move || {
             let mut guard = holder_lock.lock();
-            holder_flag.store(true, Ordering::SeqCst);
+            // Released only after the sleep below, so the main thread is
+            // guaranteed to find the lock held when it wakes from the barrier.
+            holder_ready.wait();
             std::thread::sleep(Duration::from_millis(50));
             *guard = 7;
         });
 
-        while !held.load(Ordering::SeqCst) {
-            std::hint::spin_loop();
-        }
+        ready.wait();
         // Blocks until the holder drops its guard, spinning in the backoff loop.
         let guard = lock.lock();
         assert_eq!(*guard, 7, "acquired before the holder finished writing");

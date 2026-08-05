@@ -8,5 +8,5 @@
 # is uncoverable and why.
 qunix-hal-x86_64 = 25.45
 qunix-mm = 95.29
-qunix-sync = 97.84
-xtask = 37.89
+qunix-sync = 97.81
+xtask = 40.23

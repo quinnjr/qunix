@@ -97,15 +97,18 @@ The backoff loop in `SpinLock::lock` is only executed when threads genuinely
 overlap, and how often that happens is a property of the runner's core count
 and scheduling, not of the code — the same reason recorded under Tests.
 
-So a ratchet failure in `qunix-sync` is not automatically a regression. Re-run
-it once before believing it. When it does fail, the error now lists the
-uncovered lines of each regressed crate; compare those against a local run
-rather than assuming the percentage means what it says.
+The cause was not the library. A ratchet failure now lists the uncovered lines
+of each regressed crate, and that named `lib.rs:283-284` — the *test's own*
+busy-wait body. On a runner where the holder thread was scheduled first, the
+flag was already set at the first check and the loop body never executed. The
+test has since been rewritten around a `Barrier`, which orders the threads
+without spinning at all, so the only lines left uncovered are the compile-time
+assertions in `const _: () = {}`, which are uncovered on every machine.
 
-Do not "fix" this by widening `TOLERANCE_PP` — that weakens the ratchet for
-every crate to accommodate one. The lines at `lib.rs:221-222` are compile-time
-assertions inside `const _: () = {}` and are uncovered on every machine; they
-are not the flaky ones.
+The general lesson outlives that fix: when the ratchet fails, read the lines it
+names before believing the percentage, and do not widen `TOLERANCE_PP` to make
+it pass — that weakens the ratchet for every crate to accommodate one. A test
+that synchronises by busy-waiting has coverage that depends on the scheduler.
 
 ## Fuzzing
 
