@@ -38,6 +38,15 @@ static HEAP: LockedHeap = LockedHeap(IrqSpinLock::new(SlabHeap::new()));
 // no window to observe, so a flag is all it needs.
 static INITIALISED: IrqSpinLock<bool, qunix_hal_x86_64::Irq> = IrqSpinLock::new(false);
 
+/// Bytes currently handed out, in the extents the heap actually charged.
+///
+/// Unlike [`bump_remaining`] this is unaffected by whether a block came from
+/// the bump region or from a large-block free list, which is what makes it
+/// usable as an assertion that does not depend on what ran earlier.
+pub fn allocated_bytes() -> usize {
+    HEAP.0.lock().allocated_bytes()
+}
+
 /// Bytes left in the heap's bump region.
 ///
 /// This is the number that predicts heap death: `allocated_bytes` cannot,
@@ -104,7 +113,7 @@ pub fn init() {
         // frame. Both halves of that are checked here, rather than resting on
         // `mapped` happening to stay aligned because the order hint only ever
         // fell -- which stopped being true the moment the hint learned to climb.
-        if order >= HUGE_ORDER && mapped % (1u64 << HUGE_ORDER) == 0 {
+        if order >= HUGE_ORDER && mapped.is_multiple_of(1u64 << HUGE_ORDER) {
             unsafe {
                 space
                     .map_2mib(

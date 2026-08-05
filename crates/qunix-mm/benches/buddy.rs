@@ -12,7 +12,11 @@ use qunix_mm::{FrameBacking, buddy::BuddyAllocator};
 use std::cell::UnsafeCell;
 use std::hint::black_box;
 
-/// Flat buffer standing in for physical memory, mirroring the test double.
+/// Flat buffer standing in for physical memory.
+///
+/// Raw volatile access, deliberately unlike the unit tests' bounds-checked
+/// slicing: the checking dominated the measurement. See the note on the `impl`
+/// below, and `crates/qunix-mm/src/buddy.rs`'s copy. Do not unify them.
 struct VecBacking {
     base: u64,
     mem: UnsafeCell<Vec<u8>>,

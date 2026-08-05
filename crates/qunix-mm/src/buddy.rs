@@ -16,8 +16,9 @@ const TAG_SEED: u64 = 0x5155_4E49_585F_4652;
 
 /// Real UEFI firmware breaks conventional memory into runs separated by
 /// boot-services, ACPI and reserved descriptors; 20-40 usable runs is realistic
-/// on large machines. Overflowing this silently discards the remainder, so the
-/// headroom is deliberately generous — 128 entries costs 2 KiB.
+/// on large machines. Overflowing this discards the remainder — counted in
+/// `refused_regions` and `refused_region_bytes`, not silently — so the headroom
+/// is deliberately generous: 128 entries costs 2 KiB.
 const MAX_REGIONS: usize = 128;
 
 // `nonempty` is a u32 indexed by order.
@@ -45,9 +46,22 @@ pub struct BuddyAllocator<B: FrameBacking> {
     /// Bytes, not a count of events, despite the name.
     foreign_frees: u64,
     /// Coalescing attempts refused because the buddy's `prev`/`next` links did
-    /// not name plausible blocks. Non-zero means either corruption or a caller
-    /// forging a free tag.
+    /// not name blocks that are themselves free at this order. Non-zero means
+    /// either corruption or a caller forging a free tag.
+    ///
+    /// Coalescing only: `pop`'s own link rejection is counted separately, in
+    /// `truncated_lists`. They are deliberately not shared — one says a `free`
+    /// declined to merge and lost nothing, the other says a free list was cut
+    /// short and `free_bytes` is now an over-estimate.
     rejected_unlinks: u64,
+    /// Free lists truncated by `pop` refusing an implausible forward link.
+    ///
+    /// Every block past the rejected link is unreachable: the chain cannot be
+    /// walked, so the bytes cannot be subtracted from `free_bytes`, and their
+    /// count cannot be known. Guessing a correction would be worse than
+    /// reporting the fact, so the counter exists instead and `free_bytes` is
+    /// documented as an upper bound once it is non-zero.
+    truncated_lists: u64,
     /// Regions actually handed to the allocator, in insertion order.
     ///
     /// A scalar min/max span would treat every hole between disjoint regions as
@@ -81,6 +95,7 @@ impl<B: FrameBacking> BuddyAllocator<B> {
             free_bytes: 0,
             foreign_frees: 0,
             rejected_unlinks: 0,
+            truncated_lists: 0,
             regions: [(0, 0); MAX_REGIONS],
             region_count: 0,
             edge_dropped_bytes: 0,
@@ -99,6 +114,13 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         self.backing = backing;
     }
 
+    /// Bytes currently on the free lists.
+    ///
+    /// An **upper bound** once `truncated_lists()` is non-zero: a truncation
+    /// orphans every block past the rejected link, and those bytes stay counted
+    /// here because the chain that held them can no longer be walked to
+    /// subtract them. Every other rejection path keeps this number exact — see
+    /// the `refuse!` macro in `free`.
     pub fn free_bytes(&self) -> u64 {
         self.free_bytes
     }
@@ -141,18 +163,36 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         self.foreign_frees
     }
 
-    /// Coalescing attempts refused for implausible free-list links.
+    /// Coalescing attempts refused because a neighbour link did not name a
+    /// block that is itself free at that order. Coalescing only — `pop`'s
+    /// rejections are in [`Self::truncated_lists`].
     pub fn rejected_unlinks(&self) -> u64 {
         self.rejected_unlinks
     }
 
+    /// Free lists cut short by `pop` refusing an implausible forward link.
+    ///
+    /// Non-zero means memory was leaked deliberately in preference to splicing
+    /// through a corrupt link, and that [`Self::free_bytes`] is now an upper
+    /// bound rather than an exact figure.
+    pub fn truncated_lists(&self) -> u64 {
+        self.truncated_lists
+    }
+
     /// The region containing `block`, if any.
     ///
-    /// Called once per `free`, not once per coalescing level: regions are
-    /// disjoint intervals and a merged block is the union of two adjacent
-    /// sub-intervals, so every ancestor of a block lies in the same region it
-    /// does. Scanning inside the loop would cost `MAX_ORDER * region_count`
-    /// comparisons per free for no additional information.
+    /// Called once per `free` for the block being freed: regions are disjoint
+    /// intervals and a merged block is the union of two adjacent sub-intervals,
+    /// so every ancestor lies in the same region its child does, and re-looking
+    /// it up per level would buy nothing.
+    ///
+    /// It is *also* called from `plausible_link`, on two paths. Coalescing runs
+    /// it up to twice per level, so a full 18-level merge against populated
+    /// free lists scans the region table repeatedly; and `pop` runs it once per
+    /// allocation, on the hot path, to validate the link it is about to make
+    /// the new list head. That cost is the price of validating a link before
+    /// splicing through it; `plausible_link` short circuits on `NIL`, so the
+    /// common case of a short list pays almost none of it.
     fn region_of(&self, block: u64) -> Option<(u64, u64)> {
         self.regions[..self.region_count]
             .iter()
@@ -201,7 +241,33 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         if head == NIL {
             return None;
         }
-        let next = self.word(head, OFF_NEXT);
+        // `next` is read out of a block that was, until it was freed, caller
+        // memory. `unlink` validates exactly this word before splicing through
+        // it; `pop` did not, which made the identical hazard reachable from the
+        // hot allocation path -- `set_word(next, OFF_PREV, NIL)` is an 8-byte
+        // store to an address the previous owner of the block chose, and the
+        // list head is left naming it for every subsequent `pop`.
+        //
+        // An implausible link truncates the list rather than following it. The
+        // blocks beyond it are lost, which is a leak; splicing through it is
+        // memory corruption, and a leak is the better of the two. The bytes
+        // cannot be reclaimed from `free_bytes` because the chain that held
+        // them is exactly what has just been declared unwalkable, so the event
+        // is counted instead and `free_bytes` documents itself as an upper
+        // bound while `truncated_lists` is non-zero.
+        //
+        // The orphaned blocks keep valid free tags and a `prev` naming `head`,
+        // which is about to become a live allocation. `unlink` is what would
+        // then write through that `prev`, and it refuses to, because it
+        // requires a neighbour to be free in its own right and `head`'s tag is
+        // cleared below.
+        let next = match self.word(head, OFF_NEXT) {
+            link if self.plausible_link(link, order) => link,
+            _ => {
+                self.truncated_lists += 1;
+                NIL
+            }
+        };
         self.free_lists[order as usize] = next;
         if next == NIL {
             self.nonempty &= !(1 << order);
@@ -225,6 +291,29 @@ impl<B: FrameBacking> BuddyAllocator<B> {
             || (link.is_multiple_of(Self::block_size(order)) && self.region_of(link).is_some())
     }
 
+    /// A free-list neighbour that is genuinely free at `order`, not merely at an
+    /// address where such a block could live.
+    ///
+    /// Plausibility alone is not enough to authorise a write through a link.
+    /// `pop` can orphan a block whose `prev` names a block it then returned to
+    /// a caller: the orphan's tag is still valid, its `prev` is in-region and
+    /// correctly aligned, and a later coalescing `unlink` of the orphan would
+    /// splice through it — an 8-byte store into live caller memory. Reading the
+    /// neighbour's own tag closes that: `pop` clears a block's tag as it leaves
+    /// the allocator, so a returned block can never pass this.
+    ///
+    /// It refuses nothing legitimate. A block genuinely on the free list of
+    /// `order` has its tag written by `push` and cleared only by `pop` or
+    /// `unlink`, both of which remove it from the list first.
+    ///
+    /// The plausibility test must come first: it is what keeps the tag read
+    /// below off memory this allocator was never given.
+    fn free_neighbour(&self, link: u64, order: u8) -> bool {
+        link == NIL
+            || (self.plausible_link(link, order)
+                && self.word(link, OFF_TAG) == Self::free_tag(link, order))
+    }
+
     /// Removes `pa` from the free list of `order`, if it is on it.
     ///
     /// The tag identifies membership without walking the list, so this is O(1).
@@ -236,13 +325,17 @@ impl<B: FrameBacking> BuddyAllocator<B> {
         let next = self.word(pa, OFF_NEXT);
         // The tag lives in caller-owned memory, so a block that is live and
         // happens to hold a matching word gets us here with `prev`/`next` fully
-        // attacker-chosen. Validating both before any write downgrades the
-        // splice from an arbitrary 8-byte write to a write inside RAM this
-        // allocator already manages. That is a mitigation, not a fix: the real
-        // answer is out-of-band membership state (a per-order bitmap) so that
-        // no word in caller memory can authorise anything. Deferred because it
-        // changes the allocator's storage model, not just this function.
-        if !self.plausible_link(prev, order) || !self.plausible_link(next, order) {
+        // attacker-chosen. Requiring each neighbour to be *free at this order*
+        // — not merely at a plausible address — downgrades the splice from an
+        // arbitrary 8-byte write to a write into a block this allocator
+        // currently owns and has tagged as free. In-region-and-aligned alone
+        // was not enough: `pop`'s truncation can leave an orphan whose `prev`
+        // names a block that has since been handed out, and that address is
+        // both in-region and correctly aligned. It is a mitigation rather than
+        // a removal of the hazard: membership is still authorised by words that
+        // live in memory the caller once owned, and only out-of-band state (a
+        // per-order bitmap) would change that.
+        if !self.free_neighbour(prev, order) || !self.free_neighbour(next, order) {
             self.rejected_unlinks += 1;
             return false;
         }
@@ -262,6 +355,14 @@ impl<B: FrameBacking> BuddyAllocator<B> {
     }
 
     /// Adds a usable physical region to the allocator.
+    ///
+    /// May accept nothing, and says so only through the counters. A range that
+    /// overflows the address space, one with no whole page in it, or one
+    /// arriving after `MAX_REGIONS` is full is dropped and billed to
+    /// `malformed_region_bytes` or `refused_region_bytes`. Check
+    /// `dropped_bytes()` once the memory map has been consumed; a caller that
+    /// assumes acceptance will go on to `free` into a region the allocator
+    /// never took, which trips the pre-init assert.
     ///
     /// # Safety
     /// The region must be genuinely free physical memory that nothing else
@@ -289,7 +390,7 @@ impl<B: FrameBacking> BuddyAllocator<B> {
 
         if self.region_count == MAX_REGIONS {
             // Refusing is the safe failure: a region that is not recorded here
-            // would never satisfy `within_a_region`, so its blocks could never
+            // would never satisfy `region_of`, so its blocks could never
             // coalesce, and `free` would silently stop merging.
             self.refused_region_bytes += end - addr;
             self.refused_regions += 1;
@@ -437,6 +538,14 @@ mod tests {
     use super::*;
 
     /// Host-side backing: a flat byte buffer standing in for physical memory.
+    ///
+    /// Deliberately bounds-checked slicing rather than the raw volatile access
+    /// `FrameBacking` documents as required, so an out-of-region access panics
+    /// with an index instead of quietly corrupting the buffer. That is right
+    /// for a unit test and wrong everywhere else, which is why the two other
+    /// copies differ: `benches/buddy.rs` uses raw volatile because this
+    /// checking dominated the measurement, and `fuzz/fuzz_targets/buddy.rs`
+    /// uses raw volatile plus an arena-bounds assert. Do not unify them.
     struct VecBacking {
         base: u64,
         mem: std::cell::UnsafeCell<Vec<u8>>,
@@ -609,6 +718,229 @@ mod tests {
 
         // The two order-0 buddies must still merge into an order-1 block.
         assert!(a.alloc(1).is_some(), "coalescing broke after a refused free");
+    }
+
+    /// A forged free tag whose links point outside every region must be
+    /// refused, and must not become allocatable.
+    ///
+    /// This is the case `plausible_link` exists for and the one nothing
+    /// covered: the existing forged-tag test supplies tags that fail the
+    /// *first* comparison, so `plausible_link` was never reached and
+    /// `rejected_unlinks` was asserted nowhere. CLAUDE.md names "a forged tag
+    /// is rejected" as one of the negative directions whose absence let two
+    /// memory-corruption bugs ship.
+    #[test]
+    fn unlink_refuses_a_forged_tag_whose_links_are_implausible() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 8 * 4096));
+        unsafe { a.add_region(base, 8 * 4096) };
+
+        // Two order-0 buddies. `live` stays allocated; `other` is freed, which
+        // makes the allocator try to coalesce with `live`.
+        let live = a.alloc(0).unwrap();
+        let other = live ^ PAGE_SIZE;
+        while a.alloc(0).map(|p| p != other).unwrap_or(false) {}
+
+        // Forge the tag the coalescer checks, and point the links at an
+        // address in no region at all.
+        let forged = BuddyAllocator::<VecBacking>::free_tag(live, 0);
+        unsafe {
+            a.backing.write_link(live + OFF_TAG, forged);
+            a.backing.write_link(live + OFF_PREV, 0xdead_0000);
+            a.backing.write_link(live + OFF_NEXT, 0xdead_0000);
+        }
+
+        let before = a.rejected_unlinks();
+        unsafe { a.free(other, 0) };
+
+        assert_eq!(
+            a.rejected_unlinks(),
+            before + 1,
+            "an implausible link was spliced instead of refused"
+        );
+        // The consequence: the live block must never be handed out again.
+        while let Some(pa) = a.alloc(0) {
+            assert_ne!(pa, live, "a live block was handed out via a forged tag");
+        }
+    }
+
+    /// `pop` must validate the link it splices, exactly as `unlink` does.
+    ///
+    /// The same hazard, one step over from the fix that added `plausible_link`:
+    /// the head's `next` word lives in memory a caller owned until it was
+    /// freed, so following it unvalidated turns `set_word(next, OFF_PREV, NIL)`
+    /// into an 8-byte write to an address that block's previous owner chose --
+    /// and leaves the list head naming it for every later `pop`. `unlink`
+    /// checked it; `pop`, on the hot allocation path, did not.
+    /// Builds an order-0 free list with two entries whose buddies stay
+    /// allocated, plus an untouched order-3 block, and returns
+    /// `(allocator, base, head, orphan)`.
+    ///
+    /// The buddies matter: two freed frames that are buddies coalesce into an
+    /// order-1 block and leave the order-0 list with a single entry, whose
+    /// `next` is already `NIL`. A test that forges `next` on a one-entry list
+    /// asserts nothing about truncation, because the list was already
+    /// terminated. Freeing frames whose buddies are still out is what makes the
+    /// list genuinely two long.
+    fn allocator_with_a_two_entry_order_zero_list() -> (BuddyAllocator<VecBacking>, u64, u64, u64) {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 16 * 4096));
+        unsafe { a.add_region(base, 16 * 4096) };
+
+        // The low half as eight single frames; the high half stays as one
+        // order-3 block, so there is still allocatable memory after the
+        // truncation to count.
+        let mut frames = Vec::new();
+        for _ in 0..8 {
+            frames.push(a.alloc(0).expect("the low half must yield eight frames"));
+        }
+        // Free two frames whose buddies are still held, so neither coalesces.
+        assert_eq!(frames[0] ^ PAGE_SIZE, frames[1], "test needs frames 0 and 1 to be buddies");
+        assert_eq!(frames[2] ^ PAGE_SIZE, frames[3], "test needs frames 2 and 3 to be buddies");
+        unsafe { a.free(frames[0], 0) };
+        unsafe { a.free(frames[2], 0) };
+
+        let head = a.free_lists[0];
+        assert_eq!(head, frames[2], "the most recent free must be the list head");
+        (a, base, head, frames[0])
+    }
+
+    /// `pop` must validate the link it splices, exactly as `unlink` does.
+    ///
+    /// The same hazard, one step over from the fix that added `plausible_link`:
+    /// the head's `next` word lives in memory a caller owned until it was
+    /// freed, so following it unvalidated turns `set_word(next, OFF_PREV, NIL)`
+    /// into an 8-byte write to an address that block's previous owner chose --
+    /// and leaves the list head naming it for every later `pop`. `unlink`
+    /// checked it; `pop`, on the hot allocation path, did not.
+    #[test]
+    fn pop_refuses_an_implausible_next_link() {
+        let (mut a, base, head, orphan) = allocator_with_a_two_entry_order_zero_list();
+
+        // The precondition the test rests on: without a real second entry,
+        // truncation is indistinguishable from an already-terminated list.
+        assert_ne!(
+            a.word(head, OFF_NEXT),
+            NIL,
+            "the order-0 list has one entry, so truncating it proves nothing"
+        );
+        unsafe { a.backing.write_link(head + OFF_NEXT, 0xdead_0000) };
+
+        let before = a.truncated_lists();
+        let popped = a.alloc(0).expect("the head itself is still allocatable");
+        assert_eq!(popped, head);
+        assert_eq!(
+            a.truncated_lists(),
+            before + 1,
+            "an implausible link was spliced instead of refused"
+        );
+
+        // The list is truncated, not left pointing at the forged address. Every
+        // remaining frame must come from the untouched order-3 block: exactly
+        // eight, and the orphaned entry is leaked rather than handed out.
+        let mut handed = 0;
+        while let Some(pa) = a.alloc(0) {
+            assert_ne!(pa, 0xdead_0000, "a forged link was handed out as a block");
+            assert_ne!(pa, orphan, "a block beyond the truncation was handed out");
+            assert!(pa >= base && pa < base + 16 * 4096, "alloc returned {pa:#x}, outside the region");
+            handed += 1;
+        }
+        assert_eq!(handed, 8, "truncation lost or invented blocks beyond the orphan");
+    }
+
+    /// A truncation must be reported, because it silently invalidates
+    /// `free_bytes`.
+    ///
+    /// The orphaned blocks stay counted as free forever — the chain that held
+    /// them is exactly what was declared unwalkable, so they cannot be
+    /// subtracted. `free_bytes` is what the kernel consults to decide it is out
+    /// of memory, so the over-report has to be visible somewhere.
+    #[test]
+    fn a_truncated_list_is_counted_and_free_bytes_becomes_an_upper_bound() {
+        let (mut a, _base, head, orphan) = allocator_with_a_two_entry_order_zero_list();
+        assert_eq!(a.truncated_lists(), 0, "nothing has been truncated yet");
+        unsafe { a.backing.write_link(head + OFF_NEXT, 0xdead_0000) };
+
+        let free_before = a.free_bytes();
+        a.alloc(0).unwrap();
+        assert_eq!(a.truncated_lists(), 1, "a truncation went unreported");
+
+        // One frame left the allocator, so exactly one page comes off the
+        // total; the orphan's page is still counted despite being unreachable,
+        // which is the over-report the counter exists to disclose.
+        assert_eq!(a.free_bytes(), free_before - PAGE_SIZE);
+        let reachable: u64 = {
+            let mut n = 0;
+            while a.alloc(0).is_some() {
+                n += 1;
+            }
+            n * PAGE_SIZE
+        };
+        assert_eq!(
+            reachable,
+            free_before - PAGE_SIZE - PAGE_SIZE,
+            "the orphan at {orphan:#x} was either reclaimed or the leak grew"
+        );
+        // The disclosure itself: the allocator is empty, yet still reports a
+        // page free. That gap is what `truncated_lists() != 0` warns about.
+        assert_eq!(
+            a.free_bytes(),
+            PAGE_SIZE,
+            "free_bytes should over-report by exactly the orphaned page"
+        );
+    }
+
+    /// The corruption path `pop`'s truncation opens, and the reason `unlink`
+    /// requires a neighbour to be *free* rather than merely plausible.
+    ///
+    /// After a truncation the second list entry keeps a valid free tag and a
+    /// `prev` naming the block `pop` just returned to a caller. Coalescing that
+    /// orphan away would execute `set_word(prev, OFF_NEXT, ..)` — an 8-byte
+    /// store into live caller memory at an address that is in-region and
+    /// correctly aligned, so the plausibility test alone waves it through.
+    #[test]
+    fn unlink_refuses_a_neighbour_that_is_not_itself_free() {
+        let (mut a, _base, head, orphan) = allocator_with_a_two_entry_order_zero_list();
+        unsafe { a.backing.write_link(head + OFF_NEXT, 0xdead_0000) };
+
+        // `live` is now caller memory, and the orphan's `prev` still names it.
+        let live = a.alloc(0).unwrap();
+        assert_eq!(live, head);
+        assert_eq!(a.word(orphan, OFF_PREV), live, "test needs the orphan to point at the live block");
+        // What a caller writes into the frame it now owns.
+        const SENTINEL: u64 = 0x0102_0304_0506_0708;
+        for off in [OFF_NEXT, OFF_PREV, OFF_TAG] {
+            unsafe { a.backing.write_link(live + off, SENTINEL) };
+        }
+
+        // Freeing the orphan's buddy is what drives `unlink(orphan, 0)`.
+        let buddy = orphan ^ PAGE_SIZE;
+        let before = a.rejected_unlinks();
+        unsafe { a.free(buddy, 0) };
+
+        assert_eq!(
+            a.rejected_unlinks(),
+            before + 1,
+            "a neighbour that is not itself free was spliced through"
+        );
+        for off in [OFF_NEXT, OFF_PREV, OFF_TAG] {
+            assert_eq!(
+                a.word(live + off, 0),
+                SENTINEL,
+                "the coalescer wrote through a stale link into live memory at offset {off}"
+            );
+        }
+    }
+
+    /// `set_backing` after a region exists must panic rather than silently
+    /// leave the free lists pointing through the old backing.
+    #[test]
+    #[should_panic(expected = "backing changed after regions were added")]
+    fn set_backing_refuses_a_swap_after_regions_exist() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 4 * 4096));
+        unsafe { a.add_region(base, 4 * 4096) };
+        a.set_backing(VecBacking::new(base, 4 * 4096));
     }
 
     /// The 129th region must be refused, and its memory must never be handed

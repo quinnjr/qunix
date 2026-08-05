@@ -163,6 +163,7 @@ mod coverage;
 mod image;
 mod licensing;
 mod qemu;
+mod userland;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -243,9 +244,13 @@ fn main() -> Result<()> {
                 "-p",
                 "qunix-hal-x86_64",
                 "-p",
+                "qunix-sched",
+                "-p",
+                "qunix-elf",
+                "-p",
                 "xtask",
                 "--features",
-                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std",
+                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std",
             ]);
             if release {
                 host.arg("--release");

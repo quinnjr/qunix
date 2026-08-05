@@ -59,6 +59,54 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+  # The release profile is what ships, and it differs in ways that matter:
+  # overflow checks are off, so arithmetic the debug build would have panicked on
+  # wraps silently. Nothing else in CI compiled it, which meant a `--release`-only
+  # miscompile or lint failure reached a tag unnoticed.
+  #
+  # Its own job rather than a second step in `test`, and this is the tradeoff:
+  # the work is genuinely duplicated -- a full `-Zbuild-std` compile of
+  # core/alloc/compiler_builtins, the kernel under thin LTO, every host crate,
+  # every in-QEMU test re-run under TCG, plus the licensing and attestation
+  # checks, which are profile-independent and so are pure repetition. As a step
+  # that roughly doubled the `test` job serially. As a job it is the same machine
+  # time but off the critical path, which is what a contributor waits on.
+  # `prefix-key` keeps it from sharing (and evicting) the debug job's cache,
+  # since the two fill it with different artifacts for the same crates.
+  test-release:
+    name: test suite (release profile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-release
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf clang lld
+          # Must be a unified image; see the comment in the `test` job.
+          for candidate in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
+            if [ -f "$candidate" ]; then
+              echo "QUNIX_OVMF=$candidate" >> "$GITHUB_ENV"
+              echo "using $candidate"
+              exit 0
+            fi
+          done
+          echo "::error::no unified OVMF image found" >&2
+          ls -l /usr/share/ovmf /usr/share/OVMF 2>/dev/null >&2
+          exit 1
+
+      - name: Test (release profile)
+        run: cargo xtask test --release
+
   coverage:
     name: coverage ratchet
     runs-on: ubuntu-latest

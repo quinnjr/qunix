@@ -1,0 +1,102 @@
+---
+// Layout for the markdown pages. Everything on this site is content, so the
+// styling lives here once rather than being repeated per page. A markdown file
+// carries only `title`, `description` and an optional `tagline`.
+import Base from './Base.astro';
+
+interface Props {
+  frontmatter: {
+    title: string;
+    description: string;
+    kicker?: string;
+    tagline?: string;
+    headline?: string;
+    /** Rendered as FAQPage structured data *and* as a visible section. */
+    faq?: { q: string; a: string }[];
+    dateModified?: string;
+  };
+}
+
+const { frontmatter } = Astro.props;
+const { title, description, kicker, tagline, headline, faq = [], dateModified } = frontmatter;
+
+// The <title> tag is the single strongest on-page signal, so it carries the
+// page subject first and the brand last -- not the other way round.
+const pageTitle = `${headline ?? title} | qunix`;
+---
+
+<Base title={pageTitle} description={description} faq={faq} dateModified={dateModified}>
+  <header class="mb-12 border-b border-border pb-10">
+    {kicker && <p class="mb-3 text-sm tracking-widest text-primary-600 uppercase">{kicker}</p>}
+    <h1 class="font-heading text-4xl leading-tight font-bold text-text md:text-5xl">
+      {headline ?? title}
+    </h1>
+    {tagline && <p class="mt-5 max-w-3xl text-lg leading-relaxed text-text-muted">{tagline}</p>}
+  </header>
+
+  <!--
+    All markdown typography, in one place. Tailwind v4 has no `prose` plugin
+    here by default, and hand-rolling the handful of elements this site
+    actually uses is smaller than the plugin and easier to reason about than
+    overriding it.
+  -->
+  <article
+    class="space-y-5 leading-relaxed text-text-muted
+
+           [&>h2]:mt-14 [&>h2]:scroll-mt-24 [&>h2]:border-t [&>h2]:border-border [&>h2]:pt-8
+           [&>h2]:font-heading [&>h2]:text-2xl [&>h2]:font-semibold [&>h2]:text-text
+
+           [&>h3]:mt-10 [&>h3]:scroll-mt-24 [&>h3]:font-heading [&>h3]:text-lg
+           [&>h3]:font-semibold [&>h3]:text-primary-400
+
+           [&_a]:text-primary-400 [&_a]:underline [&_a]:decoration-primary-800
+           [&_a]:underline-offset-4 hover:[&_a]:text-primary-300 hover:[&_a]:decoration-primary-500
+
+           [&_strong]:font-semibold [&_strong]:text-text
+           [&_em]:text-text-muted
+
+           [&_:not(pre)>code]:rounded [&_:not(pre)>code]:border [&_:not(pre)>code]:border-border-muted
+           [&_:not(pre)>code]:bg-surface-elevated [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5
+           [&_:not(pre)>code]:text-[0.875em] [&_:not(pre)>code]:text-primary-300
+
+           [&>ul]:space-y-2.5 [&>ol]:space-y-2.5
+           [&_li]:ml-6 [&_li]:leading-relaxed
+           [&>ul_li]:list-disc [&>ol_li]:list-decimal
+           [&_li]:marker:text-primary-700
+
+           [&>pre]:overflow-x-auto [&>pre]:rounded-lg [&>pre]:border [&>pre]:border-border
+           [&>pre]:bg-surface [&>pre]:p-4 [&>pre]:text-sm [&>pre]:leading-relaxed
+
+           [&>blockquote]:rounded-r [&>blockquote]:border-l-2 [&>blockquote]:border-primary-700
+           [&>blockquote]:bg-surface/60 [&>blockquote]:py-3 [&>blockquote]:pr-4 [&>blockquote]:pl-5
+           [&>blockquote]:text-text-muted [&>blockquote_p]:m-0
+
+           [&>table]:my-8 [&>table]:block [&>table]:w-full [&>table]:overflow-x-auto
+           [&_th]:border-b [&_th]:border-border [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left
+           [&_th]:font-heading [&_th]:text-sm [&_th]:font-semibold [&_th]:text-text
+           [&_td]:border-b [&_td]:border-border-muted [&_td]:px-3 [&_td]:py-2.5 [&_td]:align-top
+           [&_td]:text-sm
+
+           [&>hr]:my-12 [&>hr]:border-border"
+  >
+    <slot />
+  </article>
+
+  {
+    faq.length > 0 && (
+      <section aria-labelledby="faq" class="mt-16 border-t border-border pt-10">
+        <h2 id="faq" class="font-heading text-2xl font-semibold text-text">
+          Frequently asked questions
+        </h2>
+        <dl class="mt-6 space-y-6">
+          {faq.map((item) => (
+            <div class="rounded-lg border border-border bg-surface p-5">
+              <dt class="font-heading font-semibold text-text">{item.q}</dt>
+              <dd class="mt-2 leading-relaxed text-text-muted">{item.a}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+    )
+  }
+</Base>

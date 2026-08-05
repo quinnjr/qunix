@@ -1,0 +1,37 @@
+# qunix
+
+> An educational x86_64 macrokernel (monolithic kernel) written from scratch in Rust. It documents
+> two things with evidence: where Rust stops helping once you are implementing the abstractions it
+> normally protects you with, and which parts of kernel development actually benefit from AI
+> assistance.
+
+qunix boots UEFI via Limine, runs preemptive kernel threads across isolated address spaces, brings
+every application processor online, and enters ring 3 through its own SYSCALL/SYSRET ABI. It is a
+research kernel: no filesystem, no driver model, no network stack, no stable ABI.
+
+Key findings, stated plainly:
+
+- Rust contributes locality rather than immunity. A kernel's hard problems live inside `unsafe`
+  blocks, where the borrow checker offers no guarantees. What the language provides is a bounded
+  search space when an invariant check fails.
+- AI assistance was most useful for breadth and for recalling architectural detail, and least
+  reliable at judging whether a piece of validation was complete.
+- Allocators do not fail loudly when they are wrong. Fuzzing surfaced real defects only once the
+  harness stopped looking for crashes and asserted that no two live allocations overlap.
+- A fuzz target that normalises its inputs cannot exercise the normalisation.
+
+## Pages
+
+- [Overview](https://quinnjr.github.io/qunix/): what exists, what Rust contributes, and the three
+  findings that justified the approach.
+- [Design decisions](https://quinnjr.github.io/qunix/design/): every non-obvious architectural
+  choice with the constraint that produced it. Buddy allocator, slab heap, per-CPU state through
+  GS, SMP bring-up, preemption ordering rules, owned address spaces, SYSCALL ABI, W^X.
+- [vs Linux / OpenBSD / Redox](https://quinnjr.github.io/qunix/comparisons/): where qunix diverges
+  from each and why, including where the established systems are simply right.
+- [AI-assisted development](https://quinnjr.github.io/qunix/ai/): what worked, the categories of
+  defect that needed machine-checked verification, and the three practices that caught them.
+
+## Source
+
+- [Repository](https://github.com/quinnjr/qunix)

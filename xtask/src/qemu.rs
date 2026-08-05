@@ -57,24 +57,28 @@ fn kvm_usable() -> bool {
     std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok()
 }
 
-fn find_ovmf() -> Option<String> {
-    if let Ok(path) = std::env::var("QUNIX_OVMF")
-        && Path::new(&path).exists()
-    {
-        return Some(path);
+fn find_ovmf() -> Result<String> {
+    // An explicit override that does not exist is an error, not a reason to
+    // fall back. Returning `None` here was not enough: the caller's message is
+    // "install edk2-ovmf or set QUNIX_OVMF", which tells someone who just set
+    // it to set it, and never names the path that is missing.
+    if let Ok(path) = std::env::var("QUNIX_OVMF") {
+        if !Path::new(&path).exists() {
+            bail!("QUNIX_OVMF is set to `{path}`, which does not exist; unset it to search the usual locations");
+        }
+        return Ok(path);
     }
     OVMF_CANDIDATES
         .iter()
         .find(|p| Path::new(p).exists())
         .map(|p| (*p).to_string())
+        .context("no OVMF firmware found; install edk2-ovmf or set QUNIX_OVMF")
 }
 
 /// Boots the ESP directory under QEMU via OVMF, killing it if it outlives the
 /// timeout. Returns how the process terminated.
 pub fn run_esp(esp: &Path, headless: bool) -> Result<Exit> {
-    let Some(ovmf) = find_ovmf() else {
-        bail!("no OVMF firmware found; install edk2-ovmf or set QUNIX_OVMF");
-    };
+    let ovmf = find_ovmf()?;
 
     let mut cmd = Command::new("qemu-system-x86_64");
     // The `accel=kvm:tcg` fallback list is a `-machine` property; the standalone
@@ -83,6 +87,10 @@ pub fn run_esp(esp: &Path, headless: bool) -> Result<Exit> {
     // safe in CI containers. Under TCG every guest instruction is translated,
     // and the bulk of a test run is OVMF firmware init.
     cmd.args(["-M", "q35,accel=kvm:tcg", "-m", "512M"]);
+    // Four CPUs so SMP bring-up is actually exercised. A single-CPU guest makes
+    // every AP test vacuous -- it would assert that zero processors came
+    // online, which is true of a kernel that cannot start any.
+    cmd.args(["-smp", "4"]);
     // Existence is not usability: /dev/kvm is typically 0660 root:kvm, so a
     // user outside that group (or a container without the device cgroup) gets
     // the silent kvm->tcg fallback. `-cpu host` is rejected outright under TCG

@@ -1,0 +1,16 @@
+# qunix / https://quinnjr.github.io/qunix/
+User-agent: *
+Allow: /
+
+# Answer engines and research crawlers are welcome. The write-up is the point of
+# the project, so being read and cited is the goal.
+User-agent: GPTBot
+Allow: /
+User-agent: ClaudeBot
+Allow: /
+User-agent: PerplexityBot
+Allow: /
+User-agent: Google-Extended
+Allow: /
+
+Sitemap: https://quinnjr.github.io/qunix/sitemap-index.xml

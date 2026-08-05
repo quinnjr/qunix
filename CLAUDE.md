@@ -6,7 +6,7 @@ already cost someone an hour. It is not a style guide.
 ## Commands
 
 ```sh
-cargo xtask test    # 14 in-QEMU + 89 host tests + licensing and attestation checks
+cargo xtask test    # 46 in-QEMU + 165 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 cargo xtask bench   # criterion, host-buildable crates only
@@ -34,8 +34,9 @@ Host crates test against **musl**, not glibc:
 
 - **`no_std`** everywhere except `xtask` and `fuzz/`. Both are host-only tools.
   `fuzz/` is additionally its own workspace, so it is outside `cargo xtask
-  test`, the licensing check and the coverage ratchet — `cargo xtask fuzz` is
-  the only thing that builds it.
+  test` and the coverage ratchet — `cargo xtask fuzz` is the only thing that
+  builds it. The licensing check *does* reach it, because that walks the
+  workspace root rather than the member list.
 - **No floating point in kernel crates.** The target disables SSE and uses
   soft-float; an `f32` is a bug, not a style choice.
 - **Edition 2024 unsafe attributes**: `#[unsafe(no_mangle)]`,
@@ -158,10 +159,35 @@ LeakSanitizer.
 
 ## Gotchas already paid for
 
-- `static mut` access uses `&raw const` / `&raw mut`. Clippy's `deref_addrof`
-  suggestion is **wrong** here — taking a direct reference to a `static mut` is a
-  hard error under `static_mut_refs` in edition 2024. Those 13 warnings are
-  expected; do not "fix" them.
+- **`static mut` is gone as of M1 Task 1**, and is banned from here on. The GDT,
+  TSS, IDT and double-fault stack it held are per-CPU state, and sharing them
+  across CPUs is not a style question — two CPUs faulting onto one IST stack
+  corrupt each other. They live in `percpu::PerCpu` now, reached through `GS`.
+  The 13 `static_mut_refs` warnings M0 documented as expected are zero; if any
+  reappear, something reintroduced a shared mutable static. Use `UnsafeCell` in
+  a `Sync` newtype (see `percpu::BspCell`) when a static genuinely cannot be
+  allocated, and say who the single writer is.
+- **Ring 3 can zero the hidden `GS.base`** with `mov gs, ax`. The syscall stub
+  always reloaded it with `swapgs`; the *exception* path did not, so the first
+  thing a ring-3 fault handler did was read `gs:[0x20]` at linear address 0x20
+  under the faulting process's own tables. Any new entry from ring 3 must
+  restore the base before touching per-CPU state — one of two entry paths is
+  the shape of hole this kernel keeps finding.
+- **CR3 is not a source for the kernel's page-table root.** A user thread
+  activates its own space and never switches back, so once a process is running
+  the "current" root is that process's. `vmspace::record_kernel_root` captures
+  it at boot and every new address space copies from that; reading CR3 instead
+  works only by accident, because the kernel halves happen to be identical.
+- **`TSS.rsp0` is per-thread, not per-CPU-once.** The scheduler reprograms it
+  from the incoming thread's own `kernel_stack_top` before every switch, so a
+  ring-3 trap lands on the stack of the thread that is actually running.
+  Threads that adopted the boot stack report 0 and are skipped — writing 0
+  there would point the next trap at the null page.
+- **Pruning must refuse the shared higher half.** PML4 entries 256..512 are
+  copied by *reference* into every address space, so the tables beneath them
+  belong to no single space and freeing one on teardown frees the kernel's.
+  The guard (`paging::shares_the_kernel_half`) is a single bit test, and one
+  index either way is a kernel-wide double free.
 - The HHDM covers **RAM only**. Device MMIO (the LAPIC at `0xFEE00000`) is not
   mapped and must be mapped explicitly, uncacheable.
 - Limine's stack has **no guard page**. Stack overflow scribbles through memory
@@ -190,5 +216,30 @@ diverging. A plan written before the code is a hypothesis; the deviations are th
 result.
 
 M0 is complete. M1 is SMP, scheduling, address spaces and the first userspace
-process; its plan assumes M0's *planned* interfaces, several of which drifted, so
-reconcile it against the code before executing it.
+process. Its plan assumed M0's *planned* interfaces and five of them had
+drifted; the reconciliation is written up as Execution Deviation D1 in
+`docs/superpowers/plans/2026-08-04-m1-processes.md`. Read that before picking up
+a task — in particular, `gdt` exposes selector *accessors* rather than
+constants, `AddressSpace::from_root` is what the plan calls `new_empty`, and
+`qunix-abi` already exists and is consumed by `xtask`.
+
+**M1 is complete.** Per-CPU state, scheduling policy, context switch, kernel
+threads, timer preemption, SMP bring-up, address spaces, the native syscall
+ABI, an ELF64 loader, ring 3, and a real init program loaded as a Limine
+module. A boot prints `hello from ring 3, qunix` from a process with its own
+address space.
+
+A fault taken *from ring 3* kills the offending process; only a fault from ring
+0 panics. So a userspace bug now shows up as a process that quietly exits, not
+as a stopped machine — assert that the process is gone rather than waiting for
+a panic.
+
+`kernel/user/init.s` is assembled by `xtask` (see `userland.rs`) into a
+standalone ELF placed in the ESP, not linked into the kernel. The kernel finds
+it by module cmdline (`init`), not by index, so adding a second module cannot
+silently change which one runs.
+
+QEMU runs with `-smp 4`. The APs come online and park — they do not schedule,
+because `sched::Scheduler::current` is one field shared by all CPUs and two
+CPUs scheduling through it would put two threads on one stack. Deviation D3 in
+the M1 plan says what moving it involves.

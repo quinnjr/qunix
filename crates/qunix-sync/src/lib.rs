@@ -76,10 +76,13 @@ pub struct SpinLockGuard<'a, T: ?Sized> {
     _not_send: PhantomData<*const ()>,
 }
 
-// Without this, the guard would auto-derive `Sync` from `&SpinLock<T>`, i.e.
-// whenever `T: Send`. Two threads sharing `&guard` could then both `deref()`
-// and hold `&T` concurrently, which is unsound for `Send + !Sync` types such as
-// `Cell`. The bound must be `T: Sync`, matching `std::sync::MutexGuard`.
+// This impl *grants* `Sync`, it does not narrow an auto-derive. The
+// `PhantomData<*const ()>` above makes the guard neither `Send` nor `Sync`, so
+// without this line it would be unconditionally `!Sync` and `&guard` could not
+// be shared at all. The bound is `T: Sync` rather than `T: Send` because two
+// threads holding `&guard` can both `deref()` and hold `&T` concurrently, which
+// is unsound for `Send + !Sync` types such as `Cell`. Same bound as
+// `std::sync::MutexGuard`, for the same reason.
 unsafe impl<T: ?Sized + Sync> Sync for SpinLockGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for SpinLockGuard<'_, T> {
@@ -185,6 +188,8 @@ pub struct IrqSpinLockGuard<'a, T: ?Sized, I: IrqControl> {
     _not_send: PhantomData<*const ()>,
 }
 
+// As `SpinLockGuard`: grants `Sync` that the `PhantomData<*const ()>` above
+// otherwise denies, at the bound that keeps `&T` sharing sound.
 unsafe impl<T: ?Sized + Sync, I: IrqControl> Sync for IrqSpinLockGuard<'_, T, I> {}
 
 impl<T: ?Sized, I: IrqControl> Deref for IrqSpinLockGuard<'_, T, I> {
@@ -211,6 +216,25 @@ impl<T: ?Sized, I: IrqControl> Drop for IrqSpinLockGuard<'_, T, I> {
     }
 }
 
+/// `IrqControl` that masks nothing.
+///
+/// Used by the auto-trait assertions below, and by the host tests: it makes
+/// `IrqSpinLock`'s guard lifecycle testable off the machine, which is
+/// otherwise reachable only from the kernel where a failure is a hang rather
+/// than an assertion. It cannot witness the *restore* half of the contract —
+/// its `restore` is empty — so that is covered by the tests' `CountingIrq`.
+///
+/// Deliberately not `pub`: an `IrqSpinLock<T, NoIrq>` in kernel code is a lock
+/// that does not mask interrupts while reading as though it does, which is the
+/// self-deadlock this whole type exists to prevent.
+pub(crate) struct NoIrq;
+impl IrqControl for NoIrq {
+    fn disable_and_save() -> bool {
+        false
+    }
+    fn restore(_: bool) {}
+}
+
 /// Compile-time assertions on the guards' auto-traits.
 ///
 /// These are the properties that make the locks sound, and they are invisible
@@ -224,6 +248,14 @@ const _: () = {
     // The locks themselves are shareable and sendable for `T: Send`.
     let _ = assert_sync::<SpinLock<u32>>;
     let _ = assert_send::<SpinLock<u32>>;
+    // The same two properties, restated for the IRQ pair: they are separate
+    // types with separate `PhantomData`, so an omission in one is not caught by
+    // the other. The guard's `!Send` -- sharper here, since dropping it on
+    // another CPU would restore a flag captured elsewhere -- is still enforced
+    // only by `PhantomData<*const ()>`, for the reason given below.
+    let _ = assert_sync::<IrqSpinLock<u32, NoIrq>>;
+    let _ = assert_send::<IrqSpinLock<u32, NoIrq>>;
+    let _ = assert_sync::<IrqSpinLockGuard<'static, u32, NoIrq>>;
     // A guard over a `Sync` payload is shareable...
     let _ = assert_sync::<SpinLockGuard<'static, u32>>;
     // ...but no guard is ever `Send`. There is no positive way to assert the
@@ -254,6 +286,69 @@ mod tests {
         let lock = SpinLock::new(0);
         drop(lock.lock());
         assert!(lock.try_lock().is_some());
+    }
+
+    #[test]
+    fn irq_spinlock_guards_the_value_and_releases_on_drop() {
+        let lock: IrqSpinLock<u32, NoIrq> = IrqSpinLock::new(5);
+        {
+            let mut guard = lock.lock();
+            *guard += 1;
+            // Held: a second attempt must fail rather than hand out a second
+            // `&mut` to the same value.
+            assert!(lock.try_lock().is_none(), "try_lock succeeded while the lock was held");
+        }
+        assert_eq!(*lock.lock(), 6, "the write through the guard was lost");
+    }
+
+    // Thread-local, not global: the counters are read as a baseline and then
+    // asserted to have moved by exactly one. Process-wide statics would make
+    // that assertion depend on no *other* test using `CountingIrq`
+    // concurrently, which the default parallel harness does not guarantee.
+    thread_local! {
+        static DISABLES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        static RESTORES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Counts its calls, so the *restore* half of the contract is observable.
+    ///
+    /// `NoIrq` cannot serve here: its `restore` is empty, so deleting the
+    /// `I::restore(was_enabled)` from `try_lock`'s failure arm would leave any
+    /// test built on it green.
+    struct CountingIrq;
+    impl IrqControl for CountingIrq {
+        fn disable_and_save() -> bool {
+            DISABLES.with(|c| c.set(c.get() + 1));
+            true
+        }
+        fn restore(_: bool) {
+            RESTORES.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    #[test]
+    fn irq_spinlock_try_lock_restores_state_when_it_fails() {
+        let lock: IrqSpinLock<u32, CountingIrq> = IrqSpinLock::new(0);
+        let held = lock.lock();
+        let disables = DISABLES.with(|c| c.get());
+        let restores = RESTORES.with(|c| c.get());
+
+        assert!(lock.try_lock().is_none());
+        // The failed attempt saved the flag and must have given it back. A
+        // version that forgot would leave interrupts masked on every miss.
+        assert_eq!(
+            DISABLES.with(|c| c.get()),
+            disables + 1,
+            "try_lock did not save the flag"
+        );
+        assert_eq!(
+            RESTORES.with(|c| c.get()),
+            restores + 1,
+            "the failed try_lock did not restore the flag it saved"
+        );
+
+        drop(held);
+        assert!(lock.try_lock().is_some(), "the lock stayed held after a failed try_lock");
     }
 
     #[test]

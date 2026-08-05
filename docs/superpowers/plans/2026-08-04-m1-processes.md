@@ -10,6 +10,95 @@
 
 **Tech Stack:** Rust (pinned nightly, edition 2024), `limine` 0.6.5 MP request for SMP bring-up, `x86_64` 0.15, naked functions via `#[unsafe(naked)]` + `naked_asm!`.
 
+## Execution Deviations
+
+Recorded as they are found, per CLAUDE.md. The plan was written against M0's
+*planned* interfaces; this section is the reconciliation against what M0
+actually landed, plus anything reality contradicted during execution.
+
+### D1 — Reconciliation before Task 1 (2026-08-05)
+
+Re-read of the M0 source as it shipped. Five assumptions in this plan are wrong:
+
+1. **`gdt::{KERNEL_CODE, USER_DATA}` do not exist as constants.** M0 landed
+   accessor *functions* — `kernel_code_selector()`, `kernel_data_selector()`,
+   `tss_selector()` — because the selectors are computed when the table is
+   built rather than being fixed indices. There are **no user segments at all**;
+   Task 8 must add them, not merely reference them. Tasks 1 and 8 are corrected
+   to call the accessors.
+
+2. **`AddressSpace::new_empty(hhdm_offset, root_pa)` does not exist.** M0 landed
+   `unsafe fn AddressSpace::from_root(hhdm_offset, root_pa)`, which is the same
+   thing under another name and is `unsafe` because it trusts `root_pa`. Task 7
+   uses `from_root`; `new_empty` is not added.
+
+3. **`AddressSpace::activate` does not exist.** Nothing in M0 ever reloads CR3 —
+   the kernel runs on the bootloader's tables. Task 7 must add it, and it is the
+   first code in the project to write CR3, so the TLB and the "are we still
+   mapped afterwards" question are live for the first time.
+
+4. **`qunix-abi` already exists.** Task 8 Step 1 says "create the ABI crate"; M0
+   created it for `ExitCode` and the `HOST_STATUS_*` values that `xtask` matches
+   on. Task 8 **extends** it. Nothing in it may be renamed without updating
+   `xtask/src/qemu.rs`, which is a host-side consumer.
+
+5. **`AddressSpace::translate` takes `&mut self`,** not `&self`, because the
+   `x86_64` crate's `OffsetPageTable` needs a mutable mapper. Any caller the
+   plan shows holding a shared borrow needs adjusting.
+
+Unchanged and confirmed: `frames::alloc(order) -> Option<u64>`,
+`unsafe frames::free(pa, order)`, `boot::hhdm_offset()`, `apic::eoi()`,
+`apic::TIMER_VECTOR`, `qunix_mm::PAGE_SIZE`, and the `SpinLock`/`IrqSpinLock`
+API. The `static mut` GDT/IDT the plan promises to remove are indeed still
+there, in `gdt.rs` and `idt.rs`.
+
+### D2 — The BSP cannot heap-allocate its per-CPU block (Task 1, 2026-08-05)
+
+The plan's `unsafe fn percpu::install(cpu_id)` `Box`es the block. That is
+impossible for the bootstrap processor. `gdt::init` runs at `kmain` line 101,
+*before* `frames::init` and `heap::init`, and it has to: a CPU with no IDT
+triple-faults on the first fault instead of printing a diagnostic, so the
+descriptor tables must exist before the allocators run, not after.
+
+Split into two entry points instead:
+
+- `unsafe fn percpu::install_bsp()` — uses a statically reserved block, so it
+  needs no allocator. Idempotent, because the in-QEMU harness brings the CPU up
+  once per test and `ltr` refuses an already-busy TSS descriptor, so the tables
+  must be rebuilt each time; `installed_count` is not incremented twice.
+- `unsafe fn percpu::install_ap(cpu_id)` — boxes and leaks, for Task 6's APs,
+  which start long after the heap is up.
+
+Linux splits it the same way and for the same reason.
+
+Also changed from the plan: `PerCpu` carries a `self_ptr` at offset 0x20.
+`gs:`-relative addressing can read *through* the base but cannot produce it, so
+recovering `&PerCpu` needs a pointer stored inside the block. The plan's
+`current()` had no way to work as written.
+
+### D3 — APs come online but do not schedule (Task 6, 2026-08-05)
+
+Task 6 brings every application processor up: each installs its own per-CPU
+block — GDT, TSS, IDT, double-fault stack — and reports in. It then parks in
+`hlt`.
+
+APs deliberately do **not** run scheduler threads yet, and the reason is
+specific rather than a matter of effort. `sched::Scheduler::current` is a
+single field naming one running thread. On one CPU that is the truth; with two
+CPUs scheduling it is one "what am I running" slot shared between them, and the
+first switch would have one CPU save its stack pointer into the other CPU's
+context — two threads on one stack, which is the failure this project has
+already shipped twice in the allocator.
+
+`percpu::PerCpu` already carries a `current_thread` slot for exactly this.
+Moving `current` (and then the run queue) into it is what makes APs
+schedulable. Until then, parking is the honest behaviour: an AP that took work
+would corrupt the CPU that queued it.
+
+Also changed: `xtask` now launches QEMU with `-smp 4`. On a single-CPU guest
+every AP assertion is vacuously true — it would assert that zero processors
+came online, which is equally true of a kernel that cannot start any.
+
 ## Global Constraints
 
 - **MSRV:** `rust-version = "1.97"` in every crate manifest.
@@ -2761,7 +2850,79 @@ M1 is complete when all of the following hold:
 - [ ] A user mapping in one address space is not visible in another.
 - [ ] `cargo xtask run` boots and runs a real `init` ELF in ring 3, which issues syscalls and exits cleanly.
 
+### D4 — SYSCALL argument registers do not line up with System V (Task 8, 2026-08-05)
+
+The plan's stub moves `r10` into `rcx` and calls the handler, implying the rest
+of the registers already match. They do not:
+
+    syscall:  nr=rax  a0=rdi  a1=rsi  a2=rdx  a3=r10  a4=r8
+    sysv:     nr=rdi  a0=rsi  a1=rdx  a2=rcx  a3=r8   a4=r9
+
+Every argument shifts by one register, and the syscall number has to move from
+`rax` into `rdi`. The first version of the stub did only the `r10` move, and
+the failure was silent: the kernel dispatched on whatever was in `rdi`, so a
+process calling `exit(7)` had its message *address* interpreted as the syscall
+number, both syscalls returned `BadSyscall`, and execution ran off the end of
+the program into a `ud2`. Nothing faulted at the point of the mistake.
+
+The moves are written right-to-left so each source is read before it is
+overwritten.
+
+### D5 — `TSS.rsp0` is a second, separate kernel stack pointer (Task 8/10, 2026-08-05)
+
+`percpu::kernel_rsp` is read by the `SYSCALL` stub, which switches stacks
+itself because `syscall` does not. `TSS.privilege_stack_table[0]` is read by
+the *CPU* on any interrupt or exception taken from ring 3. They are different
+mechanisms and both must be set; the plan mentions only the first.
+
+Setting only `kernel_rsp` produces a kernel that services syscalls correctly
+and then dies on the first timer tick that lands while a process is running,
+because the CPU pushes the interrupt frame to address 0. `percpu::set_kernel_stack`
+now sets both, which is why it lives there rather than in `syscall`.
+
+### D6 — init is a bootloader module, not an embedded blob (Task 11, 2026-08-05)
+
+Task 10 embedded a flat binary in the kernel via a build script, which was the
+smallest thing that could reach ring 3. Task 11 replaces it: `xtask` assembles
+`kernel/user/init.s` into a standalone ELF, places it in the ESP, and
+`limine.conf` loads it as a module.
+
+Two consequences worth recording. The kernel selects the module by *cmdline*
+rather than by index, because `limine.conf` can gain another module at any time
+and positional lookup would silently start returning a different file instead of
+failing. And the ELF path replaced the flat-binary path entirely rather than
+sitting beside it, since a second loader with no caller is dead code.
+
+The loader maps every segment writable, copies, then re-applies permissions in a
+second pass over all segments. One pass would leave a read-only page in the way
+of a later segment that shares it, which happens whenever two segments land in
+one page.
+
+### D7 — A process's address space is leaked when the process exits (Task 10, 2026-08-05)
+
+`user_thread_entry` calls `core::mem::forget(space)` before `enter_user`. It has
+to: `enter_user` does not return, so no destructor can run at that point, and
+dropping the `VmSpace` would free the page tables the process is about to
+execute on. Nothing else owns the space afterwards, so every frame it holds —
+the PML4, the intermediate tables, and every user page — is leaked for the
+lifetime of the boot.
+
+The plan assumed this was academic because M1 did not implement process exit.
+It no longer is. Exit is routinely reachable two ways: `Sys::Exit`, and the
+ring-3 fault path (`syscall::user_fault`), which kills the faulting process
+rather than the machine. Both switch the CPU back to the kernel root and stop
+the thread, and neither has a handle to the address space to reclaim.
+
+Fixing it needs an owner that outlives `enter_user` — the process table entry
+the scheduler can reach from `exit_current` — which is a process-lifetime change
+belonging to M2's reaping work, not something the ring-3 entry path can do.
+
 ## Known Limitations Carried Into M2
+
+- **Application processors are online but idle.** They install per-CPU state
+  and park. Making them schedule requires moving `sched::Scheduler::current`
+  and the run queue into `percpu::PerCpu`; see Execution Deviation D3.
+
 
 1. **Application processors idle.** `smp::start_all` brings APs online but leaves them halted; they have no run queues. Per-CPU scheduling and work stealing use the `RunQueue::steal` already implemented here.
 2. **No TLB shootdown.** Unmapping still flushes only the local CPU. Now that there is more than one CPU, this is a live correctness bug rather than a theoretical one — it must be fixed before any address space is modified while shared.

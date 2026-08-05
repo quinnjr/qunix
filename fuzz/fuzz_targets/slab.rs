@@ -69,12 +69,10 @@ fuzz_target!(|ops: Vec<Op>| {
     for op in ops {
         match op {
             Op::Alloc { size, align_shift } => {
-                // Bounded well below the arena so exhaustion is reachable but
-                // not immediate; alignment capped at 4 KiB, the largest the
-                // kernel ever asks for.
                 // Up to twice the arena, so exhaustion and the >4 MiB
-                // never-recycled branch are both reachable; a 64 KiB cap made
-                // the large-block leak path unreachable by construction.
+                // never-recycled branch are both reachable; an earlier 64 KiB
+                // cap made the large-block path unreachable by construction.
+                // Alignment is capped at 4 KiB, the largest the kernel asks for.
                 let size = (size as usize % (ARENA_LEN * 2)).max(1);
                 let align = 1usize << (align_shift % 13);
                 let Ok(layout) = Layout::from_size_align(size, align) else { continue };
@@ -88,13 +86,17 @@ fuzz_target!(|ops: Vec<Op>| {
                 let addr = ptr as usize;
 
                 assert_eq!(addr % align, 0, "alloc({size}, {align}) returned {addr:#x}, misaligned");
-                assert!(
-                    addr >= base && addr + size <= base + ARENA_LEN,
-                    "alloc({size}, {align}) returned {addr:#x}..{:#x}, outside the arena",
-                    addr + size
-                );
                 let charged = heap.allocated_bytes() - before;
                 assert!(charged >= size, "charged {charged} for a {size}-byte request");
+                // Bounded on the *reserved* extent, not the requested size, for
+                // the same reason the overlap check below is: a block whose
+                // reserved tail runs past the arena while its requested prefix
+                // fits is exactly how a size-class off-by-one presents.
+                assert!(
+                    addr >= base && addr + charged <= base + ARENA_LEN,
+                    "alloc({size}, {align}) reserved {addr:#x}..{:#x}, outside the arena",
+                    addr + charged
+                );
                 // Overlap is checked over the *reserved* extent, not the
                 // requested size: two blocks whose reserved tails overlap but
                 // whose requested prefixes do not would otherwise pass, and a

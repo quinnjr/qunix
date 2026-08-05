@@ -5,113 +5,109 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-/// The double-fault handler's peak depth is one `println!` -- the 32 backtrace
-/// lines are sequential, not nested -- so a few KiB suffices in principle.
-/// 16 KiB keeps a ~5x margin anyway, because this stack has no guard page and
-/// overflow grows *down* into whatever `.bss` precedes it, silently corrupting
-/// the very structures fault handling depends on. Still 4 KiB cheaper than the
-/// original 20 KiB, and it becomes per-CPU in M1.
-const IST_STACK_SIZE: usize = 4096 * 4;
-/// Written at the low end of the stack and checked on entry, so an overflow is
-/// reported rather than silently scribbling.
-const IST_CANARY: u64 = 0x5153_5441_434B_5F30;
 
-/// The CPU aligns RSP to 16 bytes on an IST stack switch, so an align-1 array
-/// merely wastes the slack. Aligning explicitly also keeps the stack from
-/// sharing a cache line with the statics declared after it.
-#[repr(align(16))]
-struct IstStack([u8; IST_STACK_SIZE]);
-
-static mut DOUBLE_FAULT_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
-static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable::new();
-static mut SELECTORS: Option<Selectors> = None;
-
-struct Selectors {
-    code: SegmentSelector,
-    data: SegmentSelector,
-    tss: SegmentSelector,
+/// Selectors for one CPU's table.
+///
+/// Not constants. The indices depend on the order descriptors are appended, and
+/// `x86_64`'s builder assigns them, so hard-coding them would encode an
+/// assumption the builder is free to break. M1's plan assumed `KERNEL_CODE` and
+/// `USER_DATA` consts; see Execution Deviation D1.
+#[derive(Clone, Copy)]
+pub struct Selectors {
+    pub kernel_code: SegmentSelector,
+    pub kernel_data: SegmentSelector,
+    pub user_code: SegmentSelector,
+    pub user_data: SegmentSelector,
+    pub tss: SegmentSelector,
 }
 
-/// Installs the GDT and TSS on the current CPU. Idempotent per CPU: the `lgdt`,
-/// the segment-register reloads and the `ltr` all run on every call, so every
-/// CPU that calls this ends up actually using the table, not just the first
-/// one. [`crate::idt::init`] depends on that — its double-fault gate names an
-/// IST index, which is only meaningful on a CPU that has the TSS loaded, so a
-/// CPU reaching `idt::init` without this having run there would triple-fault on
-/// the first #DF.
+/// Builds this CPU's GDT into `gdt`, loads it, and loads `tss`.
 ///
-/// Only the shared IST stack's one-time setup is skipped on repeat calls.
+/// Every CPU gets its own table and its own TSS: the TSS holds `rsp0` and the
+/// IST pointers, both of which are per-CPU by definition, so a shared one would
+/// have two CPUs faulting onto the same stack.
 ///
-/// Uses `static mut` because this runs before any allocator exists.
-pub fn init() {
+/// # Safety
+/// `gdt` and `tss` must live for as long as this CPU runs — the CPU keeps
+/// reading them via GDTR and TR long after this returns. They must not be moved
+/// or dropped, which is why the caller stores them in the per-CPU block rather
+/// than on a stack.
+///
+/// `ist_top` must be the top (highest address) of a stack reserved for this
+/// CPU's double-fault handler.
+pub unsafe fn build_and_load(
+    gdt: &mut GlobalDescriptorTable,
+    tss: &TaskStateSegment,
+    ist_top: u64,
+) -> Selectors {
+    // The TSS is filled in through a raw pointer rather than `&mut` because the
+    // descriptor below borrows it immutably for `'static`, and the two borrows
+    // would otherwise overlap. Sound: this is the only writer, and it runs
+    // before the descriptor is built.
+    let tss_ptr = (tss as *const TaskStateSegment).cast_mut();
     unsafe {
-        // The IST stack is shared and is set up once. Rewriting the canary on a
-        // later call would erase the evidence of an overflow an earlier caller
-        // could still report; M1's per-CPU storage gives each CPU its own stack
-        // and TSS, at which point this moves with them.
-        if (*(&raw const SELECTORS)).is_none() {
-            let stack_start = VirtAddr::from_ptr(&raw const DOUBLE_FAULT_STACK.0);
-            let tss = &mut *(&raw mut TSS);
-            // The canary sits at the lowest address, which is where a
-            // descending overflow reaches first.
-            (&raw mut DOUBLE_FAULT_STACK.0).cast::<u64>().write(IST_CANARY);
-            tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-                stack_start + IST_STACK_SIZE as u64;
-        }
+        (*tss_ptr).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            VirtAddr::new(ist_top);
+    }
 
-        // The descriptors are rebuilt rather than reused because `ltr` sets the
-        // busy bit in the TSS descriptor, and `ltr` against an already-busy
-        // descriptor raises #GP -- so every call must present a fresh,
-        // available one. The code and data entries are rewritten with the
-        // byte-identical values they already held, and the TSS entry is not
-        // consulted by anything but `ltr` (the CPU stack-switches from the
-        // cached TR, not from the table), so the table the CPU is reading is
-        // never observably inconsistent and this needs no interrupt masking.
-        let gdt = &mut *(&raw mut GDT);
-        *gdt = GlobalDescriptorTable::new();
-        let code = gdt.append(Descriptor::kernel_code_segment());
-        let data = gdt.append(Descriptor::kernel_data_segment());
-        let tss_sel = gdt.append(Descriptor::tss_segment(&*(&raw const TSS)));
+    // Rebuilt rather than reused because `ltr` sets the busy bit in the TSS
+    // descriptor, and `ltr` against an already-busy descriptor raises #GP, so
+    // every call must present a fresh, available one.
+    *gdt = GlobalDescriptorTable::new();
+    let kernel_code = gdt.append(Descriptor::kernel_code_segment());
+    let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+    // Order is dictated by `SYSRET`, not by taste. It loads CS from
+    // `IA32_STAR[63:48] + 16` and SS from `+ 8`, so the user *data* descriptor
+    // must sit immediately before the user *code* one. Appending them the other
+    // way round compiles, boots, and then returns to ring 3 with a data
+    // selector in CS -- a #GP on the first user instruction.
+    let user_data = gdt.append(Descriptor::user_data_segment());
+    let user_code = gdt.append(Descriptor::user_code_segment());
+    // SAFETY: the caller guarantees `tss` outlives this CPU, which is what the
+    // `'static` bound on `tss_segment` is really asking for.
+    let tss_static: &'static TaskStateSegment = unsafe { &*(tss as *const TaskStateSegment) };
+    let tss_sel = gdt.append(Descriptor::tss_segment(tss_static));
 
-        (*(&raw const GDT)).load();
-        CS::set_reg(code);
-        DS::set_reg(data);
-        ES::set_reg(data);
-        SS::set_reg(data);
+    // SAFETY: same lifetime argument -- the table lives in the per-CPU block.
+    let gdt_static: &'static GlobalDescriptorTable =
+        unsafe { &*(gdt as *const GlobalDescriptorTable) };
+    gdt_static.load();
+    unsafe {
+        CS::set_reg(kernel_code);
+        DS::set_reg(kernel_data);
+        ES::set_reg(kernel_data);
+        SS::set_reg(kernel_data);
         load_tss(tss_sel);
-
-        SELECTORS = Some(Selectors { code, data, tss: tss_sel });
     }
+
+    Selectors { kernel_code, kernel_data, user_code, user_data, tss: tss_sel }
 }
 
-fn selectors() -> &'static Selectors {
-    unsafe { (*(&raw const SELECTORS)).as_ref().expect("gdt not initialised") }
-}
-
-/// Whether the double-fault stack's low-end canary survives: `Some(false)`
-/// means it overflowed.
-///
-/// `None` before [`init`] has run, because the canary is written by `init` and
-/// the stack is zeroed until then — a bare `false` there would report a fault
-/// taken during early boot as a stack overflow it cannot have been.
+/// Whether this CPU's double-fault stack canary survives: `Some(false)` means
+/// it overflowed, `None` that this CPU has no per-CPU block yet.
 pub fn ist_canary_intact() -> Option<bool> {
-    unsafe {
-        if (*(&raw const SELECTORS)).is_none() {
-            return None;
-        }
-        Some((&raw const DOUBLE_FAULT_STACK.0).cast::<u64>().read() == IST_CANARY)
+    if !crate::percpu::is_installed() {
+        return None;
     }
+    crate::percpu::current().ist_canary_intact()
 }
 
 pub fn kernel_code_selector() -> SegmentSelector {
-    selectors().code
+    crate::percpu::current().selectors().kernel_code
 }
 
 pub fn kernel_data_selector() -> SegmentSelector {
-    selectors().data
+    crate::percpu::current().selectors().kernel_data
 }
 
 pub fn tss_selector() -> SegmentSelector {
-    selectors().tss
+    crate::percpu::current().selectors().tss
+}
+
+pub fn user_code_selector() -> SegmentSelector {
+    crate::percpu::current().selectors().user_code
+}
+
+pub fn user_data_selector() -> SegmentSelector {
+    crate::percpu::current().selectors().user_data
 }

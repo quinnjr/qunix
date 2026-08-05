@@ -16,6 +16,8 @@ test = true
 [dependencies]
 limine.workspace = true
 qunix-abi.workspace = true
+qunix-elf.workspace = true
+qunix-sched.workspace = true
 qunix-hal-x86_64.workspace = true
 qunix-sync.workspace = true
 x86_64.workspace = true

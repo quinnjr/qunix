@@ -378,10 +378,15 @@ name = "qunix-abi"
 version = "0.1.0"
 
 [[package]]
+name = "qunix-elf"
+version = "0.1.0"
+
+[[package]]
 name = "qunix-hal-x86_64"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "qunix-abi",
  "qunix-sync",
  "x86_64",
 ]
@@ -392,8 +397,10 @@ version = "0.1.0"
 dependencies = [
  "limine",
  "qunix-abi",
+ "qunix-elf",
  "qunix-hal-x86_64",
  "qunix-mm",
+ "qunix-sched",
  "qunix-sync",
  "x86_64",
 ]
@@ -404,6 +411,10 @@ version = "0.1.0"
 dependencies = [
  "criterion",
 ]
+
+[[package]]
+name = "qunix-sched"
+version = "0.1.0"
 
 [[package]]
 name = "qunix-sync"
