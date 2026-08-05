@@ -141,6 +141,21 @@ impl SlabHeap {
     fn bump(&mut self, size: usize, align: usize) -> *mut u8 {
         // `GlobalAlloc::alloc` must never panic, so the rounding-up step is as
         // guarded as the size step below it.
+        //
+        // The rounding guard cannot be falsified by a test, and that is a
+        // property of the arithmetic rather than a gap in the suite. Any
+        // overflow of `bump_next + align - 1` leaves a value below `align`,
+        // which the mask then rounds down to 0 -- and `0 as *mut u8` is exactly
+        // the null this returns. Replacing `checked_add` with `wrapping_add`
+        // produces identical observable behaviour for every alignment the
+        // allocator accepts, so a mutation of this line is invisible.
+        //
+        // It stays because it is correct and free, and because the identity
+        // holds only while `MAX_CLASS_ALIGN` is a power of two no larger than
+        // the classes: raise it and the wrap could mask to a non-zero address,
+        // at which point this is the only thing standing between a caller and a
+        // pointer to low memory. The size guard below IS falsifiable and is
+        // covered by `a_heap_at_the_top_of_the_address_space_refuses_rather_than_wrapping`.
         let Some(start) = self.bump_next.checked_add(align - 1).map(|v| v & !(align - 1)) else {
             return core::ptr::null_mut();
         };
@@ -375,6 +390,52 @@ mod tests {
     /// `allocated_bytes` is what the kernel reads to decide how much heap it is
     /// using; charging a failed allocation inflates it permanently, and nothing
     /// ever subtracts it because there is no pointer to `dealloc`.
+    /// The bump allocator's two overflow guards, which nothing reached.
+    ///
+    /// `bump` rounds the cursor up to the requested alignment and then adds the
+    /// size, and both steps are `checked_` because `GlobalAlloc::alloc` must
+    /// never panic. A heap placed against the top of the address space is the
+    /// only way to reach either: every other test allocates from a backing far
+    /// from the boundary, so the wrap could not occur and the guards were
+    /// unprotected -- removing either left all 64 tests green.
+    ///
+    /// The failure they prevent is not a panic in release, where overflow
+    /// checks are off. It is a wrap to a *low* address, which `end > bump_end`
+    /// then accepts, so the allocator returns a pointer nowhere near its
+    /// backing and the caller writes through it.
+    #[test]
+    fn a_heap_at_the_top_of_the_address_space_refuses_rather_than_wrapping() {
+        // No real backing: nothing is dereferenced, because every allocation
+        // here must fail before it returns a pointer.
+        //
+        // Two heaps, at two distances from the top, because the guards
+        // short-circuit each other. Whichever overflows first returns, so a
+        // single placement can only ever reach one of them -- which is how the
+        // alignment guard stayed unprotected through three attempts at this
+        // test.
+
+        // One byte below the top: rounding the cursor up to the class alignment
+        // overflows before any size is considered.
+        let mut heap = SlabHeap::new();
+        unsafe { heap.set_backing(usize::MAX - 1, 1) };
+        assert!(
+            heap.alloc(Layout::from_size_align(8, MAX_CLASS_ALIGN).unwrap()).is_null(),
+            "aligning the cursor wrapped past the top of the address space"
+        );
+        assert_eq!(heap.allocated_bytes(), 0, "a refused allocation was charged");
+
+        // `MAX_CLASS_ALIGN` bytes below the top: the rounding now fits exactly,
+        // so the cursor lands on the last aligned address and it is the size
+        // that overflows.
+        let mut heap = SlabHeap::new();
+        unsafe { heap.set_backing(usize::MAX - MAX_CLASS_ALIGN, MAX_CLASS_ALIGN) };
+        assert!(
+            heap.alloc(Layout::from_size_align(64, 8).unwrap()).is_null(),
+            "adding the size wrapped past the top of the address space"
+        );
+        assert_eq!(heap.allocated_bytes(), 0, "a refused allocation was charged");
+    }
+
     #[test]
     fn a_failed_large_allocation_is_not_charged_and_leaves_the_heap_usable() {
         let (mut heap, _backing) = heap_with(64 * 1024);
