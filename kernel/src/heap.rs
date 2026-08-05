@@ -21,7 +21,7 @@ struct LockedHeap(IrqSpinLock<SlabHeap, qunix_hal_x86_64::Irq>);
 
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { self.0.lock().alloc(layout) }
+        self.0.lock().alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { self.0.lock().dealloc(ptr, layout) };

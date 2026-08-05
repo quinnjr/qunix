@@ -372,6 +372,16 @@ impl AddressSpace {
 
     /// Physical address of the next-level table, or `None` when the entry is
     /// absent or maps a huge page (which owns no child table).
+    ///
+    /// # Safety
+    /// `table` must point at a live page table reachable through the HHDM, and
+    /// no other reference to it may be alive for the duration of the call.
+    ///
+    /// These three helpers take a raw pointer rather than `&PageTable` on
+    /// purpose. The caller walks several levels at once, and holding long-lived
+    /// references to them would be undefined behaviour the moment two levels
+    /// aliased -- which a self-referencing entry in a table this kernel did not
+    /// build would produce. A raw pointer tolerates that; `&mut` does not.
     unsafe fn child_of(&self, table: *mut PageTable, index: PageTableIndex) -> Option<u64> {
         let table: &PageTable = unsafe { &*table };
         let entry = &table[index];
@@ -381,11 +391,16 @@ impl AddressSpace {
         Some(entry.addr().as_u64())
     }
 
+    /// # Safety
+    /// As [`child_of`](Self::child_of).
     unsafe fn is_empty(table: *mut PageTable) -> bool {
         let table: &PageTable = unsafe { &*table };
         table.iter().all(|e| e.is_unused())
     }
 
+    /// # Safety
+    /// As [`child_of`](Self::child_of), and the entry must not be one the
+    /// caller still intends to walk through.
     unsafe fn clear_entry(table: *mut PageTable, index: PageTableIndex) {
         let table: &mut PageTable = unsafe { &mut *table };
         table[index].set_unused();

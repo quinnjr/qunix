@@ -59,7 +59,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 let align = 1usize << (align_shift % 13);
                 let Ok(layout) = Layout::from_size_align(size, align) else { continue };
 
-                let ptr = unsafe { heap.alloc(layout) };
+                let ptr = heap.alloc(layout);
                 if ptr.is_null() {
                     // Exhaustion is a legitimate answer, not a failure.
                     continue;

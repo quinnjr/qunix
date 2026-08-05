@@ -151,9 +151,20 @@ impl SlabHeap {
         start as *mut u8
     }
 
-    /// # Safety
-    /// Standard `GlobalAlloc::alloc` contract.
-    pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+    /// Allocates a block, or returns null when the heap cannot satisfy it.
+    ///
+    /// Safe, deliberately. There is nothing for the caller to uphold: the
+    /// free-list reads below are justified by this heap's own invariants —
+    /// blocks are only on a list because `dealloc` put them there — and by
+    /// [`set_backing`](Self::set_backing), whose contract is where the real
+    /// obligation lives. Before `set_backing`, `bump_end` is zero and every
+    /// path returns null rather than touching memory.
+    ///
+    /// Returning a raw pointer is not itself unsafe; *dereferencing* it is, and
+    /// that is the caller's act. Marking this `unsafe` implied an obligation
+    /// the caller could neither discover nor discharge, which devalues the
+    /// marker on the calls that genuinely carry one — `dealloc` below.
+    pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
         match Self::class_for(layout) {
             Some(class) => {
                 let size = CLASSES[class];
@@ -249,7 +260,7 @@ mod tests {
     fn small_allocation_honours_an_alignment_stricter_than_its_size() {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(8, 16).unwrap();
-        let ptr = unsafe { heap.alloc(layout) };
+        let ptr = heap.alloc(layout);
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % 16, 0);
     }
@@ -260,12 +271,12 @@ mod tests {
         // 32 bytes fits a size class, but align 64 exceeds MAX_CLASS_ALIGN, so
         // this takes the large-block path in both directions.
         let layout = Layout::from_size_align(32, 64).unwrap();
-        let first = unsafe { heap.alloc(layout) };
+        let first = heap.alloc(layout);
         assert!(!first.is_null());
         assert_eq!(first as usize % 64, 0);
         unsafe { heap.dealloc(first, layout) };
         assert_eq!(heap.allocated_bytes(), 0);
-        let second = unsafe { heap.alloc(layout) };
+        let second = heap.alloc(layout);
         assert_eq!(first, second, "over-aligned block was not recycled");
     }
 
@@ -273,10 +284,10 @@ mod tests {
     fn large_allocation_is_recycled() {
         let (mut heap, _backing) = heap_with(256 * 1024);
         let layout = Layout::from_size_align(9000, 16).unwrap();
-        let first = unsafe { heap.alloc(layout) };
+        let first = heap.alloc(layout);
         assert!(!first.is_null());
         unsafe { heap.dealloc(first, layout) };
-        let second = unsafe { heap.alloc(layout) };
+        let second = heap.alloc(layout);
         assert_eq!(first, second, "large block was not recycled");
     }
 
@@ -287,7 +298,7 @@ mod tests {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         for _ in 0..10_000 {
-            let p = unsafe { heap.alloc(layout) };
+            let p = heap.alloc(layout);
             assert!(!p.is_null(), "heap exhausted despite every block being freed");
             unsafe { heap.dealloc(p, layout) };
         }
@@ -331,12 +342,12 @@ mod tests {
         // `LARGE_LISTS` has to come with a deliberate change here.
         let (mut heap, _backing) = heap_with(32 * 1024 * 1024);
         let layout = Layout::from_size_align(8 * 1024 * 1024, 8).unwrap();
-        let first = unsafe { heap.alloc(layout) };
+        let first = heap.alloc(layout);
         assert!(!first.is_null());
         let remaining = heap.bump_remaining();
         unsafe { heap.dealloc(first, layout) };
         assert_eq!(heap.bump_remaining(), remaining, "bump region cannot reclaim");
-        let second = unsafe { heap.alloc(layout) };
+        let second = heap.alloc(layout);
         assert!(!second.is_null());
         assert_ne!(first, second, "an extent beyond the largest list was recycled");
     }
@@ -351,7 +362,7 @@ mod tests {
     fn small_allocation_is_correctly_aligned_and_writable() {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(24, 8).unwrap();
-        let ptr = unsafe { heap.alloc(layout) };
+        let ptr = heap.alloc(layout);
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % 8, 0);
         unsafe { core::ptr::write_bytes(ptr, 0xAB, 24) };
@@ -362,8 +373,8 @@ mod tests {
     fn allocations_of_the_same_class_do_not_overlap() {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(32, 8).unwrap();
-        let a = unsafe { heap.alloc(layout) };
-        let b = unsafe { heap.alloc(layout) };
+        let a = heap.alloc(layout);
+        let b = heap.alloc(layout);
         assert!(!a.is_null() && !b.is_null());
         assert_ne!(a, b);
         assert!((a as isize - b as isize).unsigned_abs() >= 32);
@@ -373,9 +384,9 @@ mod tests {
     fn freed_block_is_reused_by_the_next_same_sized_allocation() {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let first = unsafe { heap.alloc(layout) };
+        let first = heap.alloc(layout);
         unsafe { heap.dealloc(first, layout) };
-        let second = unsafe { heap.alloc(layout) };
+        let second = heap.alloc(layout);
         assert_eq!(first, second, "freed block was not reused");
     }
 
@@ -383,7 +394,7 @@ mod tests {
     fn large_allocation_falls_back_and_still_succeeds() {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(9000, 16).unwrap();
-        let ptr = unsafe { heap.alloc(layout) };
+        let ptr = heap.alloc(layout);
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % 16, 0);
     }
@@ -394,7 +405,7 @@ mod tests {
         let layout = Layout::from_size_align(2048, 8).unwrap();
         let mut succeeded = 0;
         for _ in 0..64 {
-            if !unsafe { heap.alloc(layout) }.is_null() {
+            if !heap.alloc(layout).is_null() {
                 succeeded += 1;
             }
         }
@@ -407,7 +418,7 @@ mod tests {
         let (mut heap, _backing) = heap_with(64 * 1024);
         let layout = Layout::from_size_align(64, 8).unwrap();
         assert_eq!(heap.allocated_bytes(), 0);
-        let ptr = unsafe { heap.alloc(layout) };
+        let ptr = heap.alloc(layout);
         assert_eq!(heap.allocated_bytes(), 64);
         unsafe { heap.dealloc(ptr, layout) };
         assert_eq!(heap.allocated_bytes(), 0);
