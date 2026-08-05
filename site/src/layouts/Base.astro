@@ -1,0 +1,231 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description: string;
+  /** Page-specific structured data, merged into the graph below. */
+  schema?: Record<string, unknown>[];
+  /** Question/answer pairs rendered as FAQPage structured data. */
+  faq?: { q: string; a: string }[];
+  datePublished?: string;
+  dateModified?: string;
+}
+
+const {
+  title,
+  description,
+  schema = [],
+  faq = [],
+  datePublished = '2026-08-04',
+  dateModified = '2026-08-05',
+} = Astro.props;
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+const ogImage = new URL(`${base}/og.svg`, Astro.site).href;
+
+const nav = [
+  { href: `${base}/design/`, label: 'Design decisions' },
+  { href: `${base}/comparisons/`, label: 'vs Linux / OpenBSD / Redox' },
+  { href: `${base}/ai/`, label: 'AI-assisted development' },
+];
+
+const path = Astro.url.pathname.replace(/\/$/, '');
+
+// Breadcrumbs help answer engines place a page inside the site rather than
+// treating every URL as a root document.
+const crumbs = [{ name: 'qunix', href: `${base}/` }];
+const current = nav.find((n) => n.href.replace(/\/$/, '') === path);
+if (current) crumbs.push({ name: current.label, href: current.href });
+
+const person = {
+  '@type': 'Person',
+  '@id': 'https://github.com/quinnjr',
+  name: 'Joseph R. Quinn',
+  url: 'https://github.com/quinnjr',
+};
+
+// One @graph rather than several disconnected script tags: nodes can then
+// reference each other by @id, which is what lets a crawler understand that
+// the article, the software project and the author are the same subject.
+const graph: Record<string, unknown>[] = [
+  {
+    '@type': 'WebSite',
+    '@id': `${Astro.site}#website`,
+    url: `${Astro.site}`,
+    name: 'qunix',
+    description:
+      'An educational x86_64 macrokernel written in Rust, documenting the limits of Rust for kernel development and of AI-assisted systems programming.',
+    inLanguage: 'en',
+    publisher: { '@id': 'https://github.com/quinnjr' },
+  },
+  person,
+  {
+    '@type': 'SoftwareSourceCode',
+    '@id': `${Astro.site}#software`,
+    name: 'qunix',
+    description:
+      'A monolithic (macrokernel) operating system kernel for x86_64 written from scratch in Rust, with a buddy physical allocator, slab kernel heap, per-CPU state, SMP bring-up, preemptive scheduling, isolated address spaces and a native SYSCALL ABI.',
+    codeRepository: 'https://github.com/quinnjr/qunix',
+    programmingLanguage: [
+      { '@type': 'ComputerLanguage', name: 'Rust' },
+      { '@type': 'ComputerLanguage', name: 'Assembly' },
+    ],
+    runtimePlatform: 'x86_64',
+    license: 'https://spdx.org/licenses/MIT.html',
+    author: { '@id': 'https://github.com/quinnjr' },
+    keywords: [
+      'operating system kernel',
+      'Rust kernel',
+      'macrokernel',
+      'monolithic kernel',
+      'x86_64',
+      'osdev',
+      'buddy allocator',
+      'slab allocator',
+      'SMP',
+      'preemptive scheduling',
+      'ring 3',
+      'SYSCALL',
+      'AI-assisted development',
+    ],
+  },
+  {
+    '@type': 'TechArticle',
+    '@id': `${canonical}#article`,
+    headline: title,
+    description,
+    url: canonical,
+    inLanguage: 'en',
+    datePublished,
+    dateModified,
+    author: { '@id': 'https://github.com/quinnjr' },
+    isPartOf: { '@id': `${Astro.site}#website` },
+    about: { '@id': `${Astro.site}#software` },
+    proficiencyLevel: 'Expert',
+  },
+  {
+    '@type': 'BreadcrumbList',
+    '@id': `${canonical}#breadcrumbs`,
+    itemListElement: crumbs.map((c, i) => ({
+      '@type': 'ListItem',
+      position: i + 1,
+      name: c.name,
+      item: new URL(c.href, Astro.site).href,
+    })),
+  },
+  ...schema,
+];
+
+if (faq.length) {
+  graph.push({
+    '@type': 'FAQPage',
+    '@id': `${canonical}#faq`,
+    mainEntity: faq.map((f) => ({
+      '@type': 'Question',
+      name: f.q,
+      acceptedAnswer: { '@type': 'Answer', text: f.a },
+    })),
+  });
+}
+
+const jsonLd = { '@context': 'https://schema.org', '@graph': graph };
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1" />
+    <meta name="author" content="Joseph R. Quinn" />
+
+    <meta property="og:type" content="article" />
+    <meta property="og:site_name" content="qunix" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <meta name="theme-color" content="#1a1410" />
+    <meta name="color-scheme" content="dark" />
+
+    <link rel="sitemap" href={`${base}/sitemap-index.xml`} />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚙️</text></svg>"
+    />
+
+    <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} is:inline />
+  </head>
+
+  <body class="min-h-screen bg-background text-text antialiased">
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:absolute focus:top-3 focus:left-3 focus:z-50 focus:rounded focus:bg-primary-700 focus:px-3 focus:py-2 focus:text-text-inverse"
+      >Skip to content</a
+    >
+
+    <header class="sticky top-0 z-40 border-b border-border bg-background/85 backdrop-blur">
+      <nav aria-label="Primary" class="mx-auto flex max-w-5xl flex-wrap items-center gap-x-6 gap-y-2 px-5 py-3">
+        <a href={`${base}/`} class="group flex items-baseline gap-2 font-heading text-lg font-bold">
+          <span class="text-primary-500 transition-colors group-hover:text-primary-400">qunix</span>
+          <span class="text-xs font-normal tracking-wide text-text-subtle">a Rust kernel experiment</span>
+        </a>
+        <ul class="ml-auto flex flex-wrap items-center gap-x-5 gap-y-1 text-sm">
+          {
+            nav.map((item) => {
+              const active = path === item.href.replace(/\/$/, '');
+              return (
+                <li>
+                  <a
+                    href={item.href}
+                    aria-current={active ? 'page' : undefined}
+                    class:list={[
+                      'transition-colors hover:text-primary-400',
+                      active ? 'text-primary-500' : 'text-text-muted',
+                    ]}
+                  >
+                    {item.label}
+                  </a>
+                </li>
+              );
+            })
+          }
+          <li>
+            <a
+              href="https://github.com/quinnjr/qunix"
+              rel="me noopener"
+              class="rounded border border-border px-2.5 py-1 text-text-muted transition-colors hover:border-primary-700 hover:text-primary-400"
+              >GitHub</a
+            >
+          </li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="main" class="mx-auto max-w-5xl px-5 py-12 md:py-16">
+      <slot />
+    </main>
+
+    <footer class="border-t border-border">
+      <div
+        class="mx-auto flex max-w-5xl flex-col gap-3 px-5 py-8 text-sm text-text-subtle md:flex-row md:items-center md:justify-between"
+      >
+        <p>qunix is a research kernel. It is not production software and makes no claim to be.</p>
+        <p>Permissive (MIT OR Apache-2.0); the Linux-compatibility layer is GPL-2.0.</p>
+      </div>
+    </footer>
+  </body>
+</html>

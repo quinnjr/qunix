@@ -1,0 +1,104 @@
+@import "tailwindcss";
+/* Oxide: tailswatch's Rust-inspired dark theme — rust orange on charcoal.
+   Chosen because it is literally the language's palette, and this project is an
+   argument about that language. Its colour tokens are what we want from it; its
+   typography is overridden below. */
+@import "tailswatch/themes/oxide";
+
+/*
+  Fonts are self-hosted rather than fetched from a CDN: the site is a static
+  artefact on GitHub Pages, and a third-party request on every page load is both
+  a privacy leak and a dependency that can break independently of this repo.
+
+  The @font-face rules are written out by hand instead of importing the
+  @fontsource-variable entrypoints, because those pull every unicode subset the
+  family ships — latin, latin-ext, vietnamese, cyrillic and greek where they
+  exist. That was 287 KB of woff2 for a site written entirely in English. Naming
+  the latin file directly cuts it to a third, and the `unicode-range` means a
+  browser that meets a character outside the subset falls back rather than
+  rendering tofu.
+
+  Variable fonts, so weights 300-700 cost one file per family rather than five.
+*/
+@font-face {
+  font-family: 'Space Grotesk Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 700;
+  src: url('@fontsource-variable/space-grotesk/files/space-grotesk-latin-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212,
+    U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'IBM Plex Sans Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 700;
+  src: url('@fontsource-variable/ibm-plex-sans/files/ibm-plex-sans-latin-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212,
+    U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212,
+    U+2215, U+FEFF, U+FFFD;
+}
+
+/*
+  The oxide theme ships Fira as its stack. Fira is not bundled, so leaving it
+  would silently fall back to the system sans and the site would look like every
+  other Tailwind default.
+
+  Space Grotesk for headings: a grotesk with squared terminals and a drawn
+  single-storey `a` — technical without being a costume. IBM Plex Sans for
+  running text, designed for exactly this kind of documentation. JetBrains Mono
+  for code, whose large x-height keeps register dumps readable at small sizes.
+*/
+@theme {
+  --font-heading: 'Space Grotesk Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    font-family: var(--font-sans);
+    text-wrap: pretty;
+  }
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-heading);
+    text-wrap: balance;
+    letter-spacing: -0.015em;
+  }
+  code,
+  pre,
+  kbd {
+    font-family: var(--font-mono);
+    font-feature-settings: 'liga' 1, 'calt' 1;
+  }
+  /* Respect a stated preference for less motion; the only motion here is the
+     smooth scroll, which is exactly the kind that triggers vestibular issues. */
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+}

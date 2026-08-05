@@ -1,0 +1,16 @@
+---
+interface Props { title: string; href?: string; kicker?: string }
+const { title, href, kicker } = Astro.props;
+const Tag = href ? 'a' : 'div';
+---
+<Tag
+  href={href}
+  class:list={[
+    'block rounded-lg border border-border bg-surface p-5 transition-colors',
+    href && 'hover:border-primary-700 hover:bg-surface-elevated',
+  ]}
+>
+  {kicker && <p class="mb-1 text-xs tracking-wide text-primary-600 uppercase">{kicker}</p>}
+  <h3 class="font-heading text-base font-semibold text-text">{title}</h3>
+  <div class="mt-2 text-sm leading-relaxed text-text-muted"><slot /></div>
+</Tag>

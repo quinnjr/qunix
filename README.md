@@ -1,5 +1,8 @@
 # qunix
 
+**[Read the write-up →](https://quinnjr.github.io/qunix/)** — design decisions, comparisons
+with Linux/OpenBSD/Redox, and an evidence-based account of AI-assisted kernel development.
+
 A monolithic operating system kernel written in Rust, targeting x86_64.
 
 Core services — memory management, scheduling, VFS, networking — live in kernel

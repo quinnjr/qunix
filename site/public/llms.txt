@@ -1,0 +1,38 @@
+# qunix
+
+> An educational x86_64 macrokernel (monolithic kernel) written from scratch in Rust. It exists to
+> document two things with evidence: where Rust stops helping when you are implementing the very
+> abstractions it protects you with, and where AI-assisted development stops helping when a
+> plausible, compiling, passing answer can still be wrong in a way nothing reports.
+
+qunix boots UEFI via Limine, runs preemptive kernel threads across isolated address spaces, brings
+every application processor online, and enters ring 3 through its own SYSCALL/SYSRET ABI. It is a
+research kernel: no filesystem, no driver model, no network stack, no stable ABI.
+
+Key findings, stated plainly:
+
+- Rust did not prevent this project's memory-corruption bugs. Every one lived inside an `unsafe`
+  block carrying a comment that explained why it was sound. What Rust bought was locality: the
+  search space was a handful of functions rather than the whole kernel.
+- The failure mode of AI-assisted systems programming is plausibility, not incompetence. Code that
+  compiles, matches idiom, carries a confident safety comment, and passes tests it also wrote.
+- Allocators do not crash when they are wrong. Fuzzing found real corruption only once the harness
+  stopped looking for panics and asserted that no two live allocations overlap.
+- A fuzz target that normalises its inputs cannot find bugs in the normalisation.
+
+## Pages
+
+- [Overview](https://quinnjr.github.io/qunix/): what exists, the honest position on Rust, and the
+  three defects that justified the project.
+- [Design decisions](https://quinnjr.github.io/qunix/design/): every non-obvious architectural
+  choice with the constraint that produced it — buddy allocator, slab heap, per-CPU state through
+  GS, SMP bring-up, preemption ordering rules, owned address spaces, SYSCALL ABI, W^X.
+- [vs Linux / OpenBSD / Redox](https://quinnjr.github.io/qunix/comparisons/): where qunix diverges
+  from each and why, including where the established systems are simply right.
+- [AI-assisted development](https://quinnjr.github.io/qunix/ai/): the evidence-based account — what
+  worked, the specific bugs produced, why review missed them, and the three practices that caught
+  them.
+
+## Source
+
+- [Repository](https://github.com/quinnjr/qunix)
