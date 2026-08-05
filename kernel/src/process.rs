@@ -228,15 +228,16 @@ extern "C" fn user_thread_entry(raw: u64) -> ! {
     // SAFETY: the address space carries the kernel half, so this code and this
     // stack stay mapped across the CR3 write.
     unsafe { space.activate() };
-    // Leaked deliberately. `enter_user` does not return, so no destructor can
-    // run here, and dropping the `VmSpace` would free the page tables the
-    // process is about to execute on. Nothing else owns the space afterwards,
-    // so every frame it holds is leaked for the rest of the boot -- and process
-    // exit is now routinely reached, both through `Sys::Exit` and through the
-    // ring-3 fault path. Recorded as Execution Deviation D7 in
-    // `docs/superpowers/plans/2026-08-04-m1-processes.md`, which says what
-    // reclaiming it requires.
-    core::mem::forget(space);
+    // Handed to the scheduler's table, not forgotten. `enter_user` does not
+    // return, so this frame cannot own the space to its end, and dropping it
+    // here would free the page tables the process is about to execute on. The
+    // `Thread` is the one owner that outlives the switch to ring 3: it is
+    // already reaped by a *different* thread, after the exiting thread has
+    // switched the CPU back to the kernel root. Forgetting it instead leaked
+    // the PML4, every intermediate table and every user page for the rest of
+    // the boot, once per process death — Execution Deviation D7 in
+    // `docs/superpowers/plans/2026-08-04-m1-processes.md`.
+    crate::sched::adopt_address_space(space);
 
     // SAFETY: entry and stack are mapped user-accessible in the space just
     // activated, and this CPU's kernel_rsp is set.

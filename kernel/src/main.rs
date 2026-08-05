@@ -786,6 +786,88 @@ mod tests {
         );
     }
 
+    /// Yields until `id` has left the thread table, or the budget runs out.
+    ///
+    /// Returns whether it did. Bounded rather than unbounded because a process
+    /// that never exits must fail the calling test rather than hang the suite,
+    /// and because reaping happens on whichever thread runs *next* — so the
+    /// loop has to keep giving the CPU away after the process is gone.
+    fn wait_until_reaped(id: qunix_sched::ThreadId) -> bool {
+        for _ in 0..2000 {
+            if crate::sched::thread_id_is_live(id) {
+                crate::sched::yield_now();
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test_case]
+    fn a_process_that_exits_cleanly_gives_back_its_address_space() {
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+
+        // The real init image, so this covers the exit path a process actually
+        // takes: `Sys::Exit`, which switches the CPU back to the kernel root
+        // and stops the thread.
+        let image = crate::boot::module("init").expect("no init module");
+
+        let before = crate::frames::free_bytes();
+        let id = crate::process::spawn_elf(image).expect("init failed to load");
+        assert!(
+            crate::frames::free_bytes() < before,
+            "loading a process consumed no frames; the measurement below proves nothing"
+        );
+        assert!(wait_until_reaped(id), "{id:?} never exited and was never reaped");
+
+        // The negative direction, and the whole of Deviation D7: an address
+        // space nobody owns is never dropped, and the kernel goes on working
+        // perfectly while losing a PML4, three page tables and every user page
+        // per process. Nothing else in the kernel observes that.
+        let after = crate::frames::free_bytes();
+        assert_eq!(
+            after, before,
+            "a cleanly-exited process leaked {} bytes of address space",
+            before - after
+        );
+    }
+
+    #[test_case]
+    fn a_process_killed_by_a_ring_three_fault_gives_back_its_address_space() {
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+
+        // The other exit path, and the one no `exit` syscall runs through:
+        // `syscall::user_fault` kills the process from inside an exception
+        // handler. It has to reclaim the same frames as a clean exit, and it
+        // reaches `exit_current` by a different route, so a fix applied to only
+        // one of the two is exactly the shape of hole this kernel keeps
+        // finding.
+        //
+        // Same construction as the fault test above: executable, read-only, and
+        // the entry lands in zero fill, which decodes as `add [rax], al` with
+        // rax cleared by `enter_user` — a deterministic #PF on the null page.
+        let image = elf_with_segment(crate::process::USER_TEXT, 1 | 4, 4096);
+
+        let before = crate::frames::free_bytes();
+        let id = crate::process::spawn_elf(&image).expect("the faulting image failed to load");
+        assert!(
+            crate::frames::free_bytes() < before,
+            "loading a process consumed no frames; the measurement below proves nothing"
+        );
+        assert!(wait_until_reaped(id), "{id:?} survived its fault, or was never reaped");
+
+        let after = crate::frames::free_bytes();
+        assert_eq!(
+            after, before,
+            "a process killed by a ring-3 fault leaked {} bytes of address space",
+            before - after
+        );
+    }
+
     #[test_case]
     fn a_refused_kernel_half_segment_writes_nothing() {
         use crate::process::Process;

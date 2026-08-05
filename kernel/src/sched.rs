@@ -38,10 +38,12 @@ struct Scheduler {
     threads: BTreeMap<ThreadId, Thread>,
     current: ThreadId,
     next_id: u64,
-    /// Threads that have exited and whose stacks are waiting to be freed.
+    /// Threads that have exited and whose stacks and address spaces are waiting
+    /// to be freed.
     ///
-    /// A thread cannot free its own stack: it is standing on it. So `exit`
-    /// records the id here and the next thread to run does the freeing.
+    /// A thread can free neither: it is standing on the stack, and the CPU may
+    /// still hold the address space in CR3. So `exit` records the id here and
+    /// the next thread to run does the freeing.
     reapable: alloc::vec::Vec<ThreadId>,
 }
 
@@ -157,9 +159,46 @@ pub fn current_id() -> ThreadId {
     SCHED.lock().current
 }
 
+/// Gives the running thread ownership of the address space it has activated.
+///
+/// Called by `process::user_thread_entry` immediately before it enters ring 3
+/// and stops being able to own anything: `enter_user` never returns, so the
+/// only owner that can outlive it is the thread table entry, which `reap`
+/// already reclaims from a different thread.
+///
+/// The space is *not* dropped here under any circumstance — that is the whole
+/// point. Dropping it would free the page tables the caller is about to
+/// execute on.
+pub fn adopt_address_space(space: crate::vmspace::VmSpace) {
+    let mut sched = SCHED.lock();
+    let current = sched.current;
+    let thread =
+        sched.threads.get_mut(&current).expect("the running thread is not in the table");
+    // Asserted rather than replaced. A `replace` would drop the previous space
+    // right here — with the scheduler lock held, so the frame allocator would
+    // be entered underneath it, and on a CPU that may still be running on the
+    // tables being freed. A thread enters ring 3 exactly once, so a second call
+    // is a bug rather than a case to handle.
+    assert!(
+        thread.address_space.is_none(),
+        "{current:?} adopted a second address space; the first would be leaked"
+    );
+    thread.address_space = Some(space);
+}
+
 /// Live threads, including the running one and any awaiting reaping.
 pub fn thread_count() -> usize {
     SCHED.lock().threads.len()
+}
+
+/// Whether `id` is still in the thread table.
+///
+/// A count is not enough for a caller waiting on one specific thread: the
+/// harness shares one scheduler across every test, so an unrelated thread
+/// starting or finishing moves the count without saying anything about the
+/// thread the caller cares about.
+pub fn thread_id_is_live(id: ThreadId) -> bool {
+    SCHED.lock().threads.contains_key(&id)
 }
 
 pub fn runnable_count() -> usize {
@@ -294,29 +333,36 @@ fn schedule(outgoing_state: ThreadState) {
     reap();
 }
 
-/// Frees the stacks of threads that have exited.
+/// Frees the stacks and address spaces of threads that have exited.
 ///
 /// Runs on a thread other than the one being freed, which is the entire reason
-/// it is deferred rather than done in `exit_current`.
+/// it is deferred rather than done in `exit_current`. That rule is what makes
+/// dropping the address space safe as well as the stack: by the time another
+/// thread reaps it, the exiting thread has already run
+/// `vmspace::activate_kernel_root` — both exit paths, `Sys::Exit` and the
+/// ring-3 fault handler, do so before they stop — so no CPU holds the dying
+/// tables in CR3.
 fn reap() {
-    // The stacks are dropped *after* the lock is released: freeing runs the
-    // heap allocator, which takes its own lock, and holding the scheduler lock
-    // across that orders two locks in a way nothing else does.
-    let mut corpses = alloc::vec::Vec::new();
+    // The whole `Thread` is dropped *after* the lock is released: freeing the
+    // stack runs the heap allocator and freeing the address space runs the
+    // frame allocator, each of which takes its own lock. Holding the scheduler
+    // lock across either orders two locks in a way nothing else does.
+    let mut corpses: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
     {
         let mut sched = SCHED.lock();
         let current = sched.current;
         let ids = core::mem::take(&mut sched.reapable);
         for id in ids {
             if id == current {
-                // Cannot free the stack we are standing on. Put it back for
-                // whoever runs next.
+                // Cannot free the stack we are standing on, and cannot free an
+                // address space this CPU may still be running on. Put it back
+                // for whoever runs next.
                 sched.reapable.push(id);
                 continue;
             }
-            if let Some(mut thread) = sched.threads.remove(&id) {
+            if let Some(thread) = sched.threads.remove(&id) {
                 sched.queue.remove(id);
-                corpses.push(thread.stack.take());
+                corpses.push(thread);
             }
         }
     }
