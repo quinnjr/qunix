@@ -30,7 +30,7 @@ fn bench_alloc_dealloc(c: &mut Criterion) {
             let (mut heap, _backing) = heap_with(8 << 20);
             let layout = Layout::from_size_align(size, 8).unwrap();
             b.iter(|| {
-                let p = unsafe { heap.alloc(black_box(layout)) };
+                let p = heap.alloc(black_box(layout));
                 unsafe { heap.dealloc(p, layout) };
             })
         });
@@ -49,7 +49,7 @@ fn bench_bump_carve(c: &mut Criterion) {
             |(heap, _backing)| {
                 let layout = Layout::from_size_align(64, 8).unwrap();
                 for _ in 0..512 {
-                    black_box(unsafe { heap.alloc(layout) });
+                    black_box(heap.alloc(layout));
                 }
             },
             criterion::BatchSize::LargeInput,
@@ -67,7 +67,7 @@ fn bench_large_path(c: &mut Criterion) {
         let (mut heap, _backing) = heap_with(32 << 20);
         let layout = Layout::from_size_align(9000, 16).unwrap();
         b.iter(|| {
-            let p = unsafe { heap.alloc(black_box(layout)) };
+            let p = heap.alloc(black_box(layout));
             unsafe { heap.dealloc(p, layout) };
         })
     });
@@ -78,7 +78,7 @@ fn bench_large_path(c: &mut Criterion) {
         let (mut heap, _backing) = heap_with(32 << 20);
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         b.iter(|| {
-            let p = unsafe { heap.alloc(black_box(layout)) };
+            let p = heap.alloc(black_box(layout));
             unsafe { heap.dealloc(p, layout) };
         })
     });
@@ -96,7 +96,7 @@ fn bench_class_ladder(c: &mut Criterion) {
         b.iter(|| {
             for size in 1..=2048usize {
                 let layout = Layout::from_size_align(size, 8).unwrap();
-                let p = unsafe { heap.alloc(black_box(layout)) };
+                let p = heap.alloc(black_box(layout));
                 unsafe { heap.dealloc(p, layout) };
             }
         })

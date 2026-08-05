@@ -6,11 +6,36 @@
 # at all -- xtask command dispatch that only spawns cargo is the usual
 # case. The second kind of update belongs in a PR that says which code
 # is uncoverable and why.
+
+# Per-crate line coverage floor. A change may raise these or hold them,
+# never drop them by more than the tolerance in xtask/src/coverage.rs.
+#
+# Regenerate with `cargo xtask coverage --update` when coverage
+# genuinely improves, or when a crate gains code that cannot be covered
+# at all -- xtask command dispatch that only spawns cargo is the usual
+# case. The second kind of update belongs in a PR that says which code
+# is uncoverable and why.
+# Low because most of this crate cannot execute on the host: `port.rs` is raw
+# in/out instructions, and GDT/IDT/APIC touch hardware. What is measured here is
+# the pure-logic remainder.
 qunix-hal-x86_64 = 25.45
-qunix-mm = 94.65
-qunix-sync = 97.84
-# xtask fell from 32.72 when `cargo xtask bench` was added: the command arm
-# only builds an argument list and spawns cargo, and the spawn cannot be
-# covered. The argument construction was extracted into `bench_args` and is
-# tested; the dispatch around it is not coverable.
-xtask = 31.43
+
+qunix-mm = 96.30
+
+# Three lines are uncovered, all of them deliberately unreachable on a passing
+# run: 221-222 are the compile-time auto-trait assertions inside
+# `const _: () = {}`, and 304 is the panic arm of the contention test's
+# elapsed-time assertion, which only executes when `lock()` failed to block.
+# A test whose failure branch is covered is a failing test, so this is the floor
+# a green run produces -- on every machine, which is the point.
+qunix-sync = 97.33
+
+# xtask's floor is low because each command arm only builds an argument list and
+# spawns cargo, and the spawn is not coverable. The argument construction is
+# extracted (`bench_args`, `fuzz_args`, `fuzz_selection`) and tested, which is
+# what this number actually tracks.
+#
+# It was lowered to 31.43 once on the claim that `bench_args` was tested. That
+# claim was false -- main.rs had no `#[cfg(test)]` module, so those tests never
+# compiled. They exist now, which is most of the rise since.
+xtask = 50.05

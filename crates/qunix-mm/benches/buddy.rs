@@ -8,7 +8,7 @@
 //! and instruction count, not absolute kernel cost.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use qunix_mm::{FrameBacking, PAGE_SIZE, buddy::BuddyAllocator};
+use qunix_mm::{FrameBacking, buddy::BuddyAllocator};
 use std::cell::UnsafeCell;
 use std::hint::black_box;
 

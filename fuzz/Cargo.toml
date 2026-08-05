@@ -1,0 +1,37 @@
+[package]
+name = "qunix-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# cargo-fuzz refuses a manifest without this marker.
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace on purpose. cargo-fuzz builds with sanitizer rustflags that
+# must not reach the kernel build, and the root workspace's `[build] target`
+# points at the bare-metal JSON spec, which libFuzzer cannot link against.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.qunix-mm]
+path = "../crates/qunix-mm"
+features = ["std"]
+
+[[bin]]
+name = "buddy"
+path = "fuzz_targets/buddy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slab"
+path = "fuzz_targets/slab.rs"
+test = false
+doc = false
+bench = false

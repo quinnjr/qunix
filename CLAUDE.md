@@ -6,10 +6,11 @@ already cost someone an hour. It is not a style guide.
 ## Commands
 
 ```sh
-cargo xtask test    # 14 in-QEMU + 64 host tests + licensing and attestation checks
+cargo xtask test    # 14 in-QEMU + 89 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 cargo xtask bench   # criterion, host-buildable crates only
+cargo xtask fuzz    # libFuzzer, 60s per target by default
 ```
 
 Always go through `xtask`. A bare `cargo build` fails: the kernel needs
@@ -31,7 +32,10 @@ Host crates test against **musl**, not glibc:
 
 ## Hard rules
 
-- **`no_std`** everywhere except `xtask`.
+- **`no_std`** everywhere except `xtask` and `fuzz/`. Both are host-only tools.
+  `fuzz/` is additionally its own workspace, so it is outside `cargo xtask
+  test`, the licensing check and the coverage ratchet — `cargo xtask fuzz` is
+  the only thing that builds it.
 - **No floating point in kernel crates.** The target disables SSE and uses
   soft-float; an `f32` is a bug, not a style choice.
 - **Edition 2024 unsafe attributes**: `#[unsafe(no_mangle)]`,
@@ -79,14 +83,78 @@ real page tables) are out of reach too.
 
 Two traps, both already hit here:
 
-- **The test double can dominate the measurement.** The buddy benches were
-  reporting ~35% harness overhead until `VecBacking` was changed from
+- **The test double can dominate the measurement.** The *benchmark's*
+  `VecBacking` was reporting ~35% harness overhead until it was changed from
   bounds-checked slicing to the raw volatile access the kernel actually uses.
   If a benchmark's backing is not shaped like the real one, it measures itself.
+  There are three `VecBacking`s — unit tests, benches, fuzz — and they differ
+  deliberately; each says so at its definition. Do not unify them.
 - **A plausible optimisation can be a regression.** Batching `push`'s three
   adjacent link writes into one `[u64; 3]` store — an obvious win on paper —
   measured 9-17% *slower* and was reverted. Criterion's change detection is the
   reason that was noticed rather than shipped.
+
+## When the ratchet fails, read the lines it names
+
+`qunix-sync` once measured 97.84% here and 96.76% on a CI runner for the *same
+commit*, failed the ratchet, then passed on a re-run with no code change. The
+tempting conclusions — "the ratchet is flaky", "widen `TOLERANCE_PP`" — were
+both wrong.
+
+The cause was the *test*, not the library. `cargo xtask coverage` now lists the
+uncovered lines of each regressed crate, and that named `lib.rs:283-284`: the
+busy-wait body of the contention test itself. On a runner where the holder
+thread was scheduled first, the flag was already set at the first check and the
+loop never ran. It is now ordered by a `Barrier` and asserts elapsed time, so a
+skipped backoff fails the test instead of silently moving a percentage.
+
+Two things generalise. A test that synchronises by busy-waiting has coverage
+that depends on the scheduler, so make the skipped path *fail* rather than
+merely go uncovered. And never widen `TOLERANCE_PP` to make a red build pass —
+that weakens the ratchet for every crate to accommodate one.
+
+## Fuzzing
+
+`cargo xtask fuzz` runs cargo-fuzz over the buddy allocator and the slab heap.
+`cargo xtask fuzz buddy --seconds=300` for one target and a longer budget.
+Requires `cargo install cargo-fuzz`.
+
+These allocators will not crash when they are wrong. They are arithmetic over
+an array, and the failure this codebase has actually shipped — twice — is
+handing the same memory to two callers while every operation returns
+successfully. So the targets do not look for panics. They maintain an
+independent model of what is live and assert, after every operation, that **no
+two live allocations overlap** and that every allocation lies inside a region
+that was really added. That is the assertion, not the absence of a crash.
+
+Writing the model is where the work is, and getting it wrong looks exactly like
+finding a bug. Three of the first four "crashes" were harness defects:
+
+- `free` deliberately asserts before any region is added, so the harness must
+  not call it then.
+- `add_region` **silently drops** a range too small to hold a whole page, so a
+  model that assumes acceptance will then call `free` and trip that assert.
+- `foreign_frees` accumulates *bytes*, not a count of events, despite the name,
+  and counts three different rejections. Its docs say so; the name still does
+  not.
+
+The fourth was real: `free` validated the buddy's extent against the region but
+never the freed block's own, so a block starting inside a region and ending past
+it was accepted onto a free list.
+
+A review then found the same hole one step over: the guard checked extent but
+not *alignment*, so `free(base + 4096, 1)` was accepted and the next `alloc(1)`
+returned an overlapping block. The harness could not have found it — it derived
+addresses by rounding down to a multiple of the block size, so a misaligned free
+was unreachable by construction. **A fuzz target that normalises its inputs
+cannot find bugs in the normalisation.** Both are covered by
+`free_refuses_a_block_that_overruns_its_region` and
+`free_refuses_a_block_not_aligned_to_its_order`.
+
+The arena in the slab target is a process-lifetime `static`, not a per-run
+allocation. The heap hands out interior pointers, so it must outlive every
+allocation; `Vec::leak` per run both grows without bound and is reported by
+LeakSanitizer.
 
 ## Gotchas already paid for
 
