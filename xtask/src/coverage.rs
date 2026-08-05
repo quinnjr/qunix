@@ -54,6 +54,32 @@ impl Lines {
 /// lcov is used rather than the human summary because its record format is
 /// line-oriented and stable across cargo-llvm-cov versions, where the table
 /// layout is not.
+/// Uncovered line numbers per crate, as `file:line` strings.
+///
+/// The ratchet used to report only that a percentage fell, which is not enough
+/// to act on -- when a drop appears in CI but not locally, the next question is
+/// always *which lines*, and answering it meant guessing or adding a temporary
+/// debug step. Now the failure says so directly.
+pub fn uncovered_lines(lcov: &str, root: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut per_crate: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut file = String::new();
+
+    for line in lcov.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            current = crate_of(path, root);
+            file = path.rsplit('/').next().unwrap_or(path).to_string();
+        } else if let Some(value) = line.strip_prefix("DA:")
+            && let Some((number, hits)) = value.split_once(',')
+            && hits == "0"
+            && let Some(name) = &current
+        {
+            per_crate.entry(name.clone()).or_default().push(format!("{file}:{number}"));
+        }
+    }
+    per_crate
+}
+
 pub fn parse_lcov(lcov: &str, root: &Path) -> BTreeMap<String, Lines> {
     let mut per_crate: BTreeMap<String, Lines> = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -89,7 +115,7 @@ fn crate_of(path: &str, root: &Path) -> Option<String> {
         .map(|(measured, _)| (*measured).to_string())
 }
 
-fn measure(root: &Path) -> Result<BTreeMap<String, Lines>> {
+fn measure(root: &Path) -> Result<(BTreeMap<String, Lines>, String)> {
     let out_path = root.join("target/coverage.lcov");
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -126,7 +152,7 @@ fn measure(root: &Path) -> Result<BTreeMap<String, Lines>> {
             out_path.display()
         );
     }
-    Ok(measured)
+    Ok((measured, lcov))
 }
 
 pub fn parse_baseline(text: &str) -> BTreeMap<String, f64> {
@@ -160,7 +186,7 @@ fn render_baseline(measured: &BTreeMap<String, Lines>) -> String {
 
 /// Measures coverage and compares it against the committed floor.
 pub fn check(root: &Path, update: bool) -> Result<()> {
-    let measured = measure(root)?;
+    let (measured, lcov) = measure(root)?;
     let baseline_path = root.join(BASELINE);
 
     if update {
@@ -178,6 +204,7 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
     let baseline = parse_baseline(&baseline_text);
 
     let mut regressions = Vec::new();
+    let mut regressed_names: Vec<String> = Vec::new();
     let mut improvements = Vec::new();
 
     for (name, lines) in &measured {
@@ -193,6 +220,7 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
                 "  {name:<20} {now:>6.2}%  floor {floor:.2}%  ({:+.2} pp)",
                 now - floor
             ));
+            regressed_names.push(name.clone());
         } else if now > floor + TOLERANCE_PP {
             improvements.push(format!(
                 "  {name:<20} {now:>6.2}%  floor {floor:.2}%  ({:+.2} pp)",
@@ -207,6 +235,18 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
     }
 
     if !regressions.is_empty() {
+        // Name the lines, not just the number. Without this a drop that only
+        // reproduces on CI hardware cannot be diagnosed from the log.
+        let uncovered = uncovered_lines(&lcov, root);
+        let mut detail = String::new();
+        for name in &regressed_names {
+            if let Some(lines) = uncovered.get(name) {
+                detail.push_str(&format!("\n  {name} uncovered ({}):\n", lines.len()));
+                for chunk in lines.chunks(8) {
+                    detail.push_str(&format!("    {}\n", chunk.join(" ")));
+                }
+            }
+        }
         bail!(
             "coverage dropped in {n} crate(s):\n{list}\n\n\
              Add tests for the new code. If it genuinely cannot be covered — \
@@ -215,7 +255,7 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
              is uncoverable and why. Lowering the floor is a decision to be \
              argued for, not a way to make a red build green quietly.",
             n = regressions.len(),
-            list = regressions.join("\n")
+            list = format!("{}\n{detail}", regressions.join("\n"))
         );
     }
 
@@ -293,6 +333,25 @@ end_of_record
         assert_eq!(baseline["qunix-mm"], 95.08);
         assert_eq!(baseline["xtask"], 30.5);
         assert_eq!(baseline.len(), 2);
+    }
+
+    #[test]
+    fn uncovered_lines_reports_only_zero_hit_lines_with_their_file() {
+        let lcov = "\
+SF:/w/crates/qunix-sync/src/lib.rs
+DA:10,5
+DA:11,0
+DA:12,0
+end_of_record
+SF:/home/user/.cargo/registry/src/x/lib.rs
+DA:99,0
+end_of_record
+";
+        let uncovered = uncovered_lines(lcov, &root());
+        // Covered lines must not appear, or the report is noise.
+        assert_eq!(uncovered["qunix-sync"], vec!["lib.rs:11", "lib.rs:12"]);
+        // Dependencies are not the contributor's problem.
+        assert_eq!(uncovered.len(), 1);
     }
 
     #[test]
