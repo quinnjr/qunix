@@ -118,7 +118,7 @@ pub fn check(root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{COPYLEFT, PERMISSIVE, verdict};
+    use super::*;
 
     /// A manifest with the two keys the checker reads.
     fn manifest(name: &str, license_line: &str) -> String {
@@ -127,62 +127,69 @@ mod tests {
 
     #[test]
     fn a_linux_compat_crate_inheriting_the_workspace_licence_is_rejected() {
-        // The whole reason the check exists, and until now nothing asserted it.
-        // `license.workspace = true` resolves to the permissive licence, so a
-        // Linux-compat crate that simply says nothing would ship permissive --
-        // silently, because every existing test was in the accepting direction
-        // and deleting the comparison in `check` passed all of them.
-        let m = manifest("qunix-linux-ext4", "license.workspace = true");
-        let err = verdict("qunix-linux-ext4", &m).unwrap_err().to_string();
-        assert!(err.contains("qunix-linux-ext4"), "{err}");
+        // The whole reason the check exists, and nothing asserted it. Silence
+        // is the dangerous input: `license.workspace = true` resolves to the
+        // permissive licence, so a compat crate that declares nothing ships
+        // permissive. Every existing test was in the accepting direction, so
+        // deleting the comparison in `verdict` passed all of them.
+        let err = verdict("qunix-linux-compat", &manifest("qunix-linux-compat", "license.workspace = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("qunix-linux-compat"), "{err}");
         assert!(err.contains(COPYLEFT), "the error does not name the required licence: {err}");
     }
 
     #[test]
-    fn a_linux_compat_crate_declaring_permissive_is_rejected() {
-        // Explicitly wrong rather than merely unset. Both must fail, or the
+    fn a_linux_compat_crate_declaring_permissive_outright_is_rejected() {
+        // Explicitly wrong, not merely unset. Both routes must fail or the
         // guard covers one of two ways to get it wrong.
-        let m = manifest("qunix-linux-drm", &format!("license = \"{PERMISSIVE}\""));
-        assert!(verdict("qunix-linux-drm", &m).is_err());
+        let m = manifest("qunix-linux-shim", &format!("license = \"{PERMISSIVE}\""));
+        assert!(verdict("qunix-linux-shim", &m).is_err());
     }
 
     #[test]
     fn a_permissive_crate_declaring_copyleft_is_rejected() {
-        // The opposite direction is also a violation: qunix's own code must not
-        // silently become GPL, which would relicense the project by accident.
+        // The opposite direction is also a violation: qunix's own code silently
+        // becoming GPL would relicense the project by accident.
         let m = manifest("qunix-mm", &format!("license = \"{COPYLEFT}\""));
         assert!(verdict("qunix-mm", &m).is_err());
     }
 
     #[test]
     fn a_crate_declaring_no_licence_at_all_is_rejected() {
-        let m = "[package]\nname = \"qunix-mm\"\nedition = \"2024\"\n";
-        let err = verdict("qunix-mm", m).unwrap_err().to_string();
+        let err = verdict("qunix-mm", "[package]\nname = \"qunix-mm\"\n").unwrap_err().to_string();
         assert!(err.contains("declares no license"), "{err}");
     }
 
     #[test]
-    fn the_deliberate_exemption_is_exactly_one_crate() {
+    fn the_exemption_is_exact_and_does_not_shelter_a_marked_crate() {
         // `qunix-linux-abi` is exempt because matching UAPI struct layouts is
-        // not reimplementing the in-kernel driver API (see LICENSING.md). The
-        // risk is that the exemption widens by prefix match, taking every
-        // future `qunix-linux-*` crate with it.
-        assert!(verdict("qunix-linux-abi", &manifest("qunix-linux-abi", "license.workspace = true")).is_ok());
+        // not reimplementing the in-kernel driver API (see LICENSING.md).
+        //
+        // The asymmetry worth pinning: markers match as substrings, the
+        // exemption matches exactly. A crate whose name carries a marker must
+        // stay copyleft even though it also starts with the exempt name, or the
+        // exemption becomes a prefix anyone can hide behind.
         assert!(
-            verdict("qunix-linux-abi-helpers", &manifest("qunix-linux-abi-helpers", "license.workspace = true")).is_err(),
-            "the exemption widened to a crate that merely starts with the exempt name"
+            verdict("qunix-linux-abi", &manifest("qunix-linux-abi", "license.workspace = true")).is_ok(),
+            "the deliberate exemption stopped working"
+        );
+        assert!(
+            verdict(
+                "qunix-linux-abi-linux-compat",
+                &manifest("qunix-linux-abi-linux-compat", "license.workspace = true")
+            )
+            .is_err(),
+            "a crate carrying a copyleft marker was sheltered by the exemption prefix"
         );
     }
 
     #[test]
-    fn crates_in_each_zone_are_accepted_when_correct() {
+    fn each_zone_is_accepted_when_the_declaration_is_correct() {
         assert!(verdict("qunix-mm", &manifest("qunix-mm", "license.workspace = true")).is_ok());
-        assert!(
-            verdict("qunix-linux-ext4", &manifest("qunix-linux-ext4", &format!("license = \"{COPYLEFT}\""))).is_ok()
-        );
+        let compat = manifest("qunix-linux-compat", &format!("license = \"{COPYLEFT}\""));
+        assert!(verdict("qunix-linux-compat", &compat).is_ok());
     }
-
-    use super::*;
 
     #[test]
     fn linux_compat_crates_land_in_the_copyleft_zone() {
