@@ -209,8 +209,8 @@ written than after.
 
 ## Enforcement
 
-`cargo xtask attest` checks that every commit on your branch but not on
-`develop` carries an `Assisted-by:` trailer, and that no work landed directly on
+`cargo xtask attest` checks that every non-merge commit on your branch but not
+on `develop` carries an `Assisted-by:` trailer, and that no work landed directly on
 `main` or `develop`. It runs as part of `cargo xtask test`.
 
 To check a different range explicitly:
