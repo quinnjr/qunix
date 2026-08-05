@@ -201,4 +201,11 @@ a task — in particular, `gdt` exposes selector *accessors* rather than
 constants, `AddressSpace::from_root` is what the plan calls `new_empty`, and
 `qunix-abi` already exists and is consumed by `xtask`.
 
-M1 Task 1 (per-CPU state) is done. Tasks 2-11 are not started.
+M1 Tasks 1-6 are done: per-CPU state, scheduling policy, context switch,
+kernel threads, timer preemption, and SMP bring-up. Tasks 7-11 (address
+spaces, syscall ABI, ELF loader, ring 3, init) are not started.
+
+QEMU runs with `-smp 4`. The APs come online and park — they do not schedule,
+because `sched::Scheduler::current` is one field shared by all CPUs and two
+CPUs scheduling through it would put two threads on one stack. Deviation D3 in
+the M1 plan says what moving it involves.

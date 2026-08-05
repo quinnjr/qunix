@@ -76,6 +76,29 @@ Also changed from the plan: `PerCpu` carries a `self_ptr` at offset 0x20.
 recovering `&PerCpu` needs a pointer stored inside the block. The plan's
 `current()` had no way to work as written.
 
+### D3 — APs come online but do not schedule (Task 6, 2026-08-05)
+
+Task 6 brings every application processor up: each installs its own per-CPU
+block — GDT, TSS, IDT, double-fault stack — and reports in. It then parks in
+`hlt`.
+
+APs deliberately do **not** run scheduler threads yet, and the reason is
+specific rather than a matter of effort. `sched::Scheduler::current` is a
+single field naming one running thread. On one CPU that is the truth; with two
+CPUs scheduling it is one "what am I running" slot shared between them, and the
+first switch would have one CPU save its stack pointer into the other CPU's
+context — two threads on one stack, which is the failure this project has
+already shipped twice in the allocator.
+
+`percpu::PerCpu` already carries a `current_thread` slot for exactly this.
+Moving `current` (and then the run queue) into it is what makes APs
+schedulable. Until then, parking is the honest behaviour: an AP that took work
+would corrupt the CPU that queued it.
+
+Also changed: `xtask` now launches QEMU with `-smp 4`. On a single-CPU guest
+every AP assertion is vacuously true — it would assert that zero processors
+came online, which is equally true of a kernel that cannot start any.
+
 ## Global Constraints
 
 - **MSRV:** `rust-version = "1.97"` in every crate manifest.
@@ -2828,6 +2851,11 @@ M1 is complete when all of the following hold:
 - [ ] `cargo xtask run` boots and runs a real `init` ELF in ring 3, which issues syscalls and exits cleanly.
 
 ## Known Limitations Carried Into M2
+
+- **Application processors are online but idle.** They install per-CPU state
+  and park. Making them schedule requires moving `sched::Scheduler::current`
+  and the run queue into `percpu::PerCpu`; see Execution Deviation D3.
+
 
 1. **Application processors idle.** `smp::start_all` brings APs online but leaves them halted; they have no run queues. Per-CPU scheduling and work stealing use the `RunQueue::steal` already implemented here.
 2. **No TLB shootdown.** Unmapping still flushes only the local CPU. Now that there is more than one CPU, this is a live correctness bug rather than a theoretical one — it must be fixed before any address space is modified while shared.

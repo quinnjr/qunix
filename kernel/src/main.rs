@@ -12,6 +12,7 @@ mod frames;
 mod heap;
 mod panic;
 mod sched;
+mod smp;
 mod thread;
 mod testing;
 
@@ -159,6 +160,18 @@ pub extern "C" fn kmain() -> ! {
     // exists there is nothing to drive it anyway.
     sched::set_preemption(true);
     println!("qunix: apic timer running, preemption enabled");
+
+    let started = smp::start_all();
+    // Bounded: a firmware that lists a CPU it cannot start would otherwise hang
+    // the boot, which is worse than running with fewer cores.
+    let all = smp::wait_for_all(200_000_000);
+    println!(
+        "qunix: smp {}/{} application processors online (of {} cpus){}",
+        smp::online_count(),
+        started,
+        smp::cpu_count(),
+        if all { "" } else { " -- TIMED OUT" }
+    );
 
     #[cfg(test)]
     test_main();
@@ -476,6 +489,54 @@ mod tests {
         assert!(!crate::sched::set_preemption(true), "set_preemption returned the new value");
         assert!(crate::sched::preemption_enabled(), "enabling did not take effect");
         assert!(crate::sched::set_preemption(previous), "the previous setting was not reported");
+    }
+
+    #[test_case]
+    fn all_application_processors_come_online() {
+        crate::frames::init();
+        crate::heap::init();
+
+        let total = crate::smp::cpu_count();
+        // A vacuous pass is the failure mode here: on a single-CPU guest every
+        // assertion below holds for a kernel that cannot start any AP at all.
+        assert!(
+            total >= 2,
+            "qemu must be launched with -smp; only {total} cpu(s) reported"
+        );
+
+        let started = crate::smp::start_all();
+        assert_eq!(
+            started,
+            total - 1,
+            "start_all skipped a processor; the BSP should be the only one not started"
+        );
+
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "only {}/{} application processors came online",
+            crate::smp::online_count(),
+            started
+        );
+    }
+
+    #[test_case]
+    fn each_processor_has_its_own_percpu_block() {
+        use qunix_hal_x86_64::percpu;
+        crate::frames::init();
+        crate::heap::init();
+        crate::smp::start_all();
+        crate::smp::wait_for_all(200_000_000);
+
+        // The whole point of Task 1: one block per CPU, not one shared. If the
+        // APs had reused the BSP's block this count would still be 1, and two
+        // CPUs would be faulting onto a single IST stack.
+        assert_eq!(
+            percpu::installed_count(),
+            crate::smp::cpu_count(),
+            "installed per-CPU blocks do not match the processor count"
+        );
+        // The BSP must still be reading its own block, not an AP's.
+        assert_eq!(percpu::cpu_id(), 0, "the BSP's GS was repointed by AP bring-up");
     }
 
     #[test_case]

@@ -83,6 +83,10 @@ pub fn run_esp(esp: &Path, headless: bool) -> Result<Exit> {
     // safe in CI containers. Under TCG every guest instruction is translated,
     // and the bulk of a test run is OVMF firmware init.
     cmd.args(["-M", "q35,accel=kvm:tcg", "-m", "512M"]);
+    // Four CPUs so SMP bring-up is actually exercised. A single-CPU guest makes
+    // every AP test vacuous -- it would assert that zero processors came
+    // online, which is true of a kernel that cannot start any.
+    cmd.args(["-smp", "4"]);
     // Existence is not usability: /dev/kvm is typically 0660 root:kvm, so a
     // user outside that group (or a container without the device cgroup) gets
     // the silent kvm->tcg fallback. `-cpu host` is rejected outright under TCG
