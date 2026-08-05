@@ -9,6 +9,7 @@ already cost someone an hour. It is not a style guide.
 cargo xtask test    # 14 in-QEMU + 64 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
+cargo xtask bench   # criterion, host-buildable crates only
 ```
 
 Always go through `xtask`. A bare `cargo build` fails: the kernel needs
@@ -68,6 +69,24 @@ machine and uncovered on a 4-core CI runner, because with fewer cores
 `try_lock` simply succeeded first. If a path only runs under contention, force
 the contention — hold the lock in another thread and wait until it is provably
 held — rather than relying on the scheduler to produce it.
+
+## Benchmarks
+
+`cargo xtask bench` covers `qunix-mm`, `qunix-sync` and the pure-logic part of
+`qunix-hal-x86_64`. The kernel cannot be benchmarked: criterion needs `std` and
+the kernel is `no_std` running in QEMU. Hardware paths (port I/O, GDT/IDT/APIC,
+real page tables) are out of reach too.
+
+Two traps, both already hit here:
+
+- **The test double can dominate the measurement.** The buddy benches were
+  reporting ~35% harness overhead until `VecBacking` was changed from
+  bounds-checked slicing to the raw volatile access the kernel actually uses.
+  If a benchmark's backing is not shaped like the real one, it measures itself.
+- **A plausible optimisation can be a regression.** Batching `push`'s three
+  adjacent link writes into one `[u64; 3]` store — an obvious win on paper —
+  measured 9-17% *slower* and was reverted. Criterion's change detection is the
+  reason that was noticed rather than shipped.
 
 ## Gotchas already paid for
 

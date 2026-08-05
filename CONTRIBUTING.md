@@ -137,9 +137,11 @@ sufficient one.
 `cargo xtask coverage` measures line coverage per crate and fails if any crate
 falls below the floor in `coverage-baseline.toml`. It runs on every pull request.
 
-If your change lowers coverage, the fix is a test, not a lower floor. Raising a
-floor to make a red build green defeats the point; the file records what was
-true, not what is convenient. When coverage genuinely improves, raise it:
+If your change lowers coverage, the fix is normally a test. There is one honest
+exception: code that cannot be covered at all — `xtask` command dispatch that
+only spawns cargo is the recurring case — legitimately moves a floor down. That
+is a decision to argue for in the PR, naming which code is uncoverable and why,
+not a quiet edit to make a red build green. Update the floor with:
 
 ```sh
 cargo xtask coverage --update
