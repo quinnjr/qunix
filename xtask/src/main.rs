@@ -46,6 +46,7 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
 }
 
 mod attest;
+mod coverage;
 mod image;
 mod licensing;
 mod qemu;
@@ -147,6 +148,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("attest") => attest::check(&root, args.get(1).map(String::as_str)),
+        Some("coverage") => coverage::check(&root, args.iter().any(|a| a == "--update")),
         other => bail!("unknown xtask command: {other:?}"),
     }
 }

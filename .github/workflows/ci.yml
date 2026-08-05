@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test suite
+    runs-on: ubuntu-latest
+    steps:
+      # attest compares against origin/develop, so it needs more than the
+      # single commit a shallow checkout provides.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # rust-toolchain.toml pins the nightly and its components; this just
+      # honours it rather than choosing a version here.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The kernel boots UEFI-only. GitHub runners have no /dev/kvm, so QEMU
+      # falls back to TCG -- slower, and the reason the APIC timer test is
+      # bounded generously rather than tightly.
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+          echo "QUNIX_OVMF=/usr/share/OVMF/OVMF_CODE.fd" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo xtask test
+
+  coverage:
+    name: coverage ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Fails when any crate's line coverage falls below the floor recorded in
+      # coverage-baseline.toml. Needs no QEMU: only host-testable crates are
+      # measured, which is also the limit of what this number means.
+      - name: Coverage must not regress
+        run: cargo xtask coverage

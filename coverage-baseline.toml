@@ -1,0 +1,9 @@
+# Per-crate line coverage floor. A change may raise these or hold them,
+# never drop them by more than the tolerance in xtask/src/coverage.rs.
+#
+# Regenerate with `cargo xtask coverage --update` after genuinely
+# improving coverage; never to make a red build go green.
+qunix-hal-x86_64 = 25.45
+qunix-mm = 94.65
+qunix-sync = 97.58
+xtask = 32.72

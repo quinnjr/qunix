@@ -132,6 +132,35 @@ including two memory-corruption bugs that survived a seven-agent review because
 every test asserted the happy path. Green is a necessary condition, never a
 sufficient one.
 
+### Coverage must not regress
+
+`cargo xtask coverage` measures line coverage per crate and fails if any crate
+falls below the floor in `coverage-baseline.toml`. It runs on every pull request.
+
+If your change lowers coverage, the fix is a test, not a lower floor. Raising a
+floor to make a red build green defeats the point; the file records what was
+true, not what is convenient. When coverage genuinely improves, raise it:
+
+```sh
+cargo xtask coverage --update
+```
+
+Two limits worth knowing before you trust the number:
+
+- **The kernel is not measured.** Its 14 tests run inside QEMU, where host
+  instrumentation cannot reach. Coverage says nothing about `qunix-kernel`, so a
+  change there can be entirely untested and the ratchet will not notice.
+- **The floors differ enormously by crate, on purpose.** `qunix-mm` sits above
+  94% because it is pure logic; `port.rs` is 0% because it is `in`/`out`
+  instructions that cannot execute on the host, and `xtask` is low because it
+  mostly shells out to cargo and QEMU. Ratcheting one aggregate figure would let
+  untestable orchestration growth fail a well-tested allocator change, which
+  teaches people to game the number instead of testing their code.
+
+Coverage is a floor against carelessness, not evidence of correctness. Both
+memory-corruption bugs this project has shipped were in code that was covered —
+the tests executed the lines and asserted the wrong thing.
+
 ### What a PR must state
 
 - What changes, and what was wrong with the previous state.
@@ -150,7 +179,7 @@ cargo xtask test
 ```
 
 That must be green: 14 in-QEMU tests, 56 host tests, the licensing check, and the
-attestation check.
+attestation check. CI runs the same suite plus the coverage ratchet on every PR.
 
 ### Tests
 
