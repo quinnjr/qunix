@@ -7,10 +7,6 @@
 # case. The second kind of update belongs in a PR that says which code
 # is uncoverable and why.
 qunix-hal-x86_64 = 25.45
-qunix-mm = 94.65
+qunix-mm = 95.29
 qunix-sync = 97.84
-# xtask fell from 32.72 when `cargo xtask bench` was added: the command arm
-# only builds an argument list and spawns cargo, and the spawn cannot be
-# covered. The argument construction was extracted into `bench_args` and is
-# tested; the dispatch around it is not coverable.
-xtask = 31.43
+xtask = 37.89

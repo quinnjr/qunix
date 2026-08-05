@@ -78,3 +78,28 @@ jobs:
       # measured, which is also the limit of what this number means.
       - name: Coverage must not regress
         run: cargo xtask coverage
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Install clang and LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      # Deliberately short, and honest about what that buys: it proves the
+      # harnesses still build and that 60s of fuzzing from an empty corpus
+      # finds nothing. It is not a search for new bugs. No corpus is committed,
+      # so each run starts cold and re-treads shallow ground; finding anything
+      # new needs hours and belongs in a scheduled job, not a PR gate.
+      - name: Fuzz both targets briefly
+        run: cargo xtask fuzz --seconds=60

@@ -355,6 +355,18 @@ impl<B: FrameBacking> BuddyAllocator<B> {
             self.foreign_frees += Self::block_size(order);
             return;
         };
+        // `region_of` locates `pa` only, so a block whose start is inside the
+        // region but whose extent runs past its end has so far been accepted.
+        // Pushing it puts memory the allocator was never given on a free list,
+        // and the next `alloc` of that order hands it out. The merge loop below
+        // already applies exactly this test to the *buddy*
+        // (`region_end - buddy < size`); this is the same test for the block
+        // being freed, which it was missing.
+        if region_end - pa < Self::block_size(order) {
+            self.free_bytes -= Self::block_size(order);
+            self.foreign_frees += Self::block_size(order);
+            return;
+        }
         // One read `push` is about to do anyway. Without it a second `free` of
         // the same block re-pushes it, `push` writes `next(pa) = pa` when `pa`
         // is already the head, and two later `alloc`s return the same frame.
@@ -427,6 +439,38 @@ mod tests {
     fn empty_allocator_has_no_free_memory() {
         let a = BuddyAllocator::new(VecBacking::new(0, 0));
         assert_eq!(a.free_bytes(), 0);
+    }
+
+    /// A block whose *start* is inside a region but whose *extent* runs past
+    /// the end of it must be refused.
+    ///
+    /// `region_of` only locates `pa`, and the coalescing loop below it checks
+    /// the buddy's extent (`region_end - buddy < size`) but never the incoming
+    /// block's own. Accepting one pushes a free block that reaches beyond the
+    /// memory the allocator was given, and the next `alloc` of that order hands
+    /// that memory out. Found by the fuzz target, not by review.
+    ///
+    /// No in-tree caller frees above order 0 today, so this is a latent hole in
+    /// a check that exists to be defensive rather than a live corruption.
+    #[test]
+    fn free_refuses_a_block_that_overruns_its_region() {
+        let base = 0x100000;
+        let mut a = BuddyAllocator::new(VecBacking::new(base, 3 * 4096));
+        unsafe { a.add_region(base, 3 * 4096) };
+        let free_before = a.free_bytes();
+        let foreign_before = a.foreign_frees();
+
+        // 4 pages starting at a 3-page region: the last page lies outside.
+        unsafe { a.free(base, 2) };
+
+        assert_eq!(a.free_bytes(), free_before, "an overrunning free added memory to the heap");
+        assert_eq!(
+            a.foreign_frees(),
+            foreign_before + (PAGE_SIZE << 2),
+            "an overrunning free was not counted as rejected"
+        );
+        // The consequence that matters: it must not become allocatable.
+        assert_eq!(a.alloc(2), None, "an overrunning block was handed out by alloc");
     }
 
     #[test]

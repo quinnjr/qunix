@@ -71,6 +71,27 @@ fn bench_args(extra: &[String]) -> Vec<String> {
     args
 }
 
+/// Cargo arguments for `xtask fuzz`, given a target name and a time budget.
+///
+/// Split from the spawn for the same reason as [`bench_args`]: the selection is
+/// worth pinning, the `Command` is not testable. `-max_total_time` is passed
+/// rather than letting libFuzzer run forever, so this is usable in CI and in a
+/// pre-PR check without needing to be interrupted by hand.
+fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
+    let mut args: Vec<String> =
+        ["fuzz", "run", target].iter().map(|s| (*s).to_string()).collect();
+    args.push("--".to_string());
+    args.push(format!("-max_total_time={seconds}"));
+    // libFuzzer's default 2 GiB ceiling counts the sanitizer's shadow memory,
+    // which the buddy target's 16 MiB arena plus ASan redzones can approach.
+    args.push("-rss_limit_mb=4096".to_string());
+    args.extend(extra.iter().cloned());
+    args
+}
+
+/// Fuzz targets run by a bare `xtask fuzz`.
+const FUZZ_TARGETS: &[&str] = &["buddy", "slab"];
+
 mod attest;
 mod coverage;
 mod image;
@@ -182,8 +203,88 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some("fuzz") => {
+            // A short default: long enough to re-cover the known corpus, short
+            // enough that running it before a PR is not a decision.
+            let seconds: u32 = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--seconds=").and_then(|v| v.parse().ok()))
+                .unwrap_or(60);
+            let selected: Vec<&str> = match args.get(1).map(String::as_str) {
+                Some(t) if !t.starts_with("--") => vec![t],
+                _ => FUZZ_TARGETS.to_vec(),
+            };
+            for target in selected {
+                println!("fuzz: {target} for {seconds}s");
+                let mut cmd = Command::new(env!("CARGO"));
+                cmd.current_dir(&root);
+                cmd.args(fuzz_args(target, seconds, &[]));
+                if !cmd.status().context(
+                    "failed to run cargo fuzz; install it with `cargo install cargo-fuzz`",
+                )?.success() {
+                    bail!("fuzz target `{target}` failed");
+                }
+            }
+            Ok(())
+        }
         Some("attest") => attest::check(&root, args.get(1).map(String::as_str)),
         Some("coverage") => coverage::check(&root, args.iter().any(|a| a == "--update")),
         other => bail!("unknown xtask command: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FUZZ_TARGETS, bench_args, fuzz_args, workspace_root};
+
+    #[test]
+    fn bench_selects_only_host_buildable_crates() {
+        let args = bench_args(&[]);
+        for name in ["qunix-sync", "qunix-mm", "qunix-hal-x86_64"] {
+            assert!(args.iter().any(|a| a == name), "missing {name}: {args:?}");
+        }
+        // criterion needs std; the kernel is no_std running in QEMU.
+        assert!(!args.iter().any(|a| a == "qunix-kernel"));
+    }
+
+    #[test]
+    fn bench_enables_the_std_feature_of_every_selected_crate() {
+        let args = bench_args(&[]);
+        let features = args.iter().find(|a| a.contains("/std")).expect("no --features value");
+        for name in ["qunix-sync", "qunix-mm", "qunix-hal-x86_64"] {
+            assert!(features.contains(&format!("{name}/std")), "missing {name}/std in {features}");
+        }
+    }
+
+    #[test]
+    fn bench_forwards_extra_arguments() {
+        let extra = ["--".to_string(), "alloc_free".to_string()];
+        let args = bench_args(&extra);
+        assert_eq!(&args[args.len() - 2..], &extra[..]);
+    }
+
+    #[test]
+    fn fuzz_bounds_the_run_and_names_the_target() {
+        let args = fuzz_args("buddy", 90, &[]);
+        assert_eq!(args[..3], ["fuzz", "run", "buddy"]);
+        // Unbounded, libFuzzer never returns, which would hang CI.
+        assert!(args.iter().any(|a| a == "-max_total_time=90"), "no time bound: {args:?}");
+        assert!(args.iter().any(|a| a.starts_with("-rss_limit_mb=")));
+    }
+
+    #[test]
+    fn fuzz_passes_libfuzzer_flags_after_the_separator() {
+        let args = fuzz_args("slab", 10, &["-runs=1".to_string()]);
+        let sep = args.iter().position(|a| a == "--").expect("no -- separator");
+        // Anything before `--` is consumed by cargo-fuzz, never by libFuzzer.
+        assert!(args[sep + 1..].iter().any(|a| a == "-runs=1"));
+    }
+
+    #[test]
+    fn every_listed_fuzz_target_has_a_source_file() {
+        for target in FUZZ_TARGETS {
+            let path = workspace_root().join("fuzz/fuzz_targets").join(format!("{target}.rs"));
+            assert!(path.exists(), "{target} is listed but {} is missing", path.display());
+        }
     }
 }

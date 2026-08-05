@@ -198,6 +198,28 @@ Note the in-QEMU harness reports its verdict through a single port write, so
 anything that degrades output without halting still passes green. A green run is
 not evidence that output was correct.
 
+### Fuzzing
+
+`cargo xtask fuzz` runs libFuzzer over the buddy allocator and the slab heap
+(`cargo install cargo-fuzz` first). CI runs 60 seconds per target on every PR,
+which proves the harnesses build and nothing shallow regressed — not that the
+allocators are correct.
+
+If you change `qunix-mm`, run it longer than CI does before opening the PR:
+
+```sh
+cargo xtask fuzz buddy --seconds=600
+```
+
+The targets assert that **no two live allocations overlap**, because that is the
+failure these allocators actually produce — they do not crash when they are
+wrong. If you add a target, assert a property an independent model can check,
+not merely that nothing panicked.
+
+Be aware that a wrong model looks exactly like a bug. Three of the first four
+crashes found here were harness defects, not allocator defects; see the Fuzzing
+section of [`CLAUDE.md`](CLAUDE.md) for which, and why each was tempting.
+
 ## Licensing
 
 Contributions to qunix's own crates are `MIT OR Apache-2.0`. Contributions to the

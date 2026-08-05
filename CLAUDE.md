@@ -10,6 +10,7 @@ cargo xtask test    # 14 in-QEMU + 64 host tests + licensing and attestation che
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 cargo xtask bench   # criterion, host-buildable crates only
+cargo xtask fuzz    # libFuzzer, 60s per target by default
 ```
 
 Always go through `xtask`. A bare `cargo build` fails: the kernel needs
@@ -87,6 +88,39 @@ Two traps, both already hit here:
   adjacent link writes into one `[u64; 3]` store — an obvious win on paper —
   measured 9-17% *slower* and was reverted. Criterion's change detection is the
   reason that was noticed rather than shipped.
+
+## Fuzzing
+
+`cargo xtask fuzz` runs cargo-fuzz over the buddy allocator and the slab heap.
+`cargo xtask fuzz buddy --seconds=300` for one target and a longer budget.
+Requires `cargo install cargo-fuzz`.
+
+These allocators will not crash when they are wrong. They are arithmetic over
+an array, and the failure this codebase has actually shipped — twice — is
+handing the same memory to two callers while every operation returns
+successfully. So the targets do not look for panics. They maintain an
+independent model of what is live and assert, after every operation, that **no
+two live allocations overlap** and that every allocation lies inside a region
+that was really added. That is the assertion, not the absence of a crash.
+
+Writing the model is where the work is, and getting it wrong looks exactly like
+finding a bug. Three of the first four "crashes" were harness defects:
+
+- `free` deliberately asserts before any region is added, so the harness must
+  not call it then.
+- `add_region` **silently drops** a range too small to hold a whole page, so a
+  model that assumes acceptance will then call `free` and trip that assert.
+- `foreign_frees` accumulates *bytes*, not a count of events, despite the name.
+
+The fourth was real: `free` validated the buddy's extent against the region but
+never the freed block's own, so a block starting inside a region and ending past
+it was accepted onto a free list. See
+`free_refuses_a_block_that_overruns_its_region`.
+
+The arena in the slab target is a process-lifetime `static`, not a per-run
+allocation. The heap hands out interior pointers, so it must outlive every
+allocation; `Vec::leak` per run both grows without bound and is reported by
+LeakSanitizer.
 
 ## Gotchas already paid for
 
