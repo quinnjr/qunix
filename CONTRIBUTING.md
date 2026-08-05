@@ -178,7 +178,7 @@ show the test failing before the fix.
 cargo xtask test
 ```
 
-That must be green: 14 in-QEMU tests, 56 host tests, the licensing check, and the
+That must be green: 14 in-QEMU tests, 64 host tests, the licensing check, and the
 attestation check. CI runs the same suite plus the coverage ratchet on every PR.
 
 ### Tests

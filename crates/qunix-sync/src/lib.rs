@@ -257,6 +257,39 @@ mod tests {
     }
 
     #[test]
+    fn lock_takes_the_backoff_path_when_genuinely_contended() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        // `contended_across_threads_never_loses_increments` only reaches the
+        // backoff loop when the scheduler happens to overlap two threads, which
+        // is a property of the host's core count rather than of the code. This
+        // test forces the overlap: the lock is provably held before the main
+        // thread asks for it, so `try_lock` must fail and `lock` must spin.
+        let lock = Arc::new(SpinLock::new(0u32));
+        let held = Arc::new(AtomicBool::new(false));
+
+        let holder_lock = Arc::clone(&lock);
+        let holder_flag = Arc::clone(&held);
+        let holder = std::thread::spawn(move || {
+            let mut guard = holder_lock.lock();
+            holder_flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            *guard = 7;
+        });
+
+        while !held.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        // Blocks until the holder drops its guard, spinning in the backoff loop.
+        let guard = lock.lock();
+        assert_eq!(*guard, 7, "acquired before the holder finished writing");
+        drop(guard);
+        holder.join().unwrap();
+    }
+
+    #[test]
     fn contended_across_threads_never_loses_increments() {
         use std::sync::Arc;
         let lock = Arc::new(SpinLock::new(0usize));
