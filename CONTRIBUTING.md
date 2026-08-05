@@ -1,8 +1,15 @@
 # Contributing to qunix
 
-Two things are non-negotiable here: **every commit attests what assisted in
-writing it**, and **branching follows git-flow**. Both are checked, not merely
-requested — see [Enforcement](#enforcement).
+Three things are non-negotiable here:
+
+- **Every commit attests what assisted in writing it.**
+- **Branching follows git-flow.**
+- **You are responsible for the pull request you open, and nothing is accepted
+  unverified.**
+
+The first two are checked by `cargo xtask test` — see
+[Enforcement](#enforcement). The third cannot be, which is exactly why it is
+stated first among equals rather than left implied.
 
 Everything else is in [`CLAUDE.md`](CLAUDE.md), which records the conventions and
 the traps this codebase has already paid for. Read it before your first change.
@@ -90,17 +97,89 @@ Explain **why** in the body. The subject says what changed; the body says what
 was wrong with the previous state. A commit that says only what it did is a
 diff with extra steps.
 
+## Responsibility
+
+**A pull request is the responsibility of the person who opens it.** Not the
+tool that helped write it, not the reviewer who approves it, and not the
+maintainer who merges it. If you open it, you own it: its correctness, its
+tests, and its consequences.
+
+That holds whatever produced the code. A model wrote most of M0 — the standard
+is unchanged by that fact. Opening a PR is a claim that you have read every line
+in it and can defend it. If you cannot explain why a hunk is there, it is not
+ready to submit; delete it or go and understand it.
+
+The obligation does not transfer on merge. If a change of yours turns out to be
+wrong, the expectation is that you are the one who fixes it.
+
+## Verification before acceptance
+
+**No PR is accepted without being verified.** Verification means someone ran it
+and checked the claims — not that it looked reasonable, and not that CI was
+green, which only proves the assertions that exist actually pass.
+
+Two independent obligations:
+
+- **You verify before opening.** `cargo xtask test` green, the change exercised,
+  and every claim in the PR description something you checked rather than
+  expected.
+- **A reviewer verifies before merging.** Independently, not by re-reading your
+  description. A review that only reads the diff has not verified anything.
+
+That distinction is load-bearing here. This codebase has shipped changes where
+the full suite passed, the reasoning was sound, and the code was wrong —
+including two memory-corruption bugs that survived a seven-agent review because
+every test asserted the happy path. Green is a necessary condition, never a
+sufficient one.
+
+### Coverage must not regress
+
+`cargo xtask coverage` measures line coverage per crate and fails if any crate
+falls below the floor in `coverage-baseline.toml`. It runs on every pull request.
+
+If your change lowers coverage, the fix is a test, not a lower floor. Raising a
+floor to make a red build green defeats the point; the file records what was
+true, not what is convenient. When coverage genuinely improves, raise it:
+
+```sh
+cargo xtask coverage --update
+```
+
+Two limits worth knowing before you trust the number:
+
+- **The kernel is not measured.** Its 14 tests run inside QEMU, where host
+  instrumentation cannot reach. Coverage says nothing about `qunix-kernel`, so a
+  change there can be entirely untested and the ratchet will not notice.
+- **The floors differ enormously by crate, on purpose.** `qunix-mm` sits above
+  94% because it is pure logic; `port.rs` is 0% because it is `in`/`out`
+  instructions that cannot execute on the host, and `xtask` is low because it
+  mostly shells out to cargo and QEMU. Ratcheting one aggregate figure would let
+  untestable orchestration growth fail a well-tested allocator change, which
+  teaches people to game the number instead of testing their code.
+
+Coverage is a floor against carelessness, not evidence of correctness. Both
+memory-corruption bugs this project has shipped were in code that was covered —
+the tests executed the lines and asserted the wrong thing.
+
+### What a PR must state
+
+- What changes, and what was wrong with the previous state.
+- **What you verified, and how.** Name the commands and what you observed.
+- **What you did not verify.** An honest gap is reviewable; a silent one is a
+  trap for whoever hits it later.
+
+"Tests pass" is not verification of anything except that the tests pass. If a
+change adds a guard, show the guard failing when it should. If it fixes a bug,
+show the test failing before the fix.
+
 ## Before you open a PR
 
 ```sh
 cargo xtask test
 ```
 
-That must be green: 14 in-QEMU tests, 51 host tests, and the licensing check.
-
-A PR is expected to state what it changes, why, and **what you verified rather
-than assumed**. If you could not test something, say so — an honest gap is
-reviewable, a silent one is not.
+That must be green: 14 in-QEMU tests, 64 host tests, the licensing check, and the
+attestation check. CI runs the same suite plus the coverage ratchet on every PR.
 
 ### Tests
 
@@ -130,8 +209,8 @@ written than after.
 
 ## Enforcement
 
-`cargo xtask attest` checks that every commit on your branch but not on
-`develop` carries an `Assisted-by:` trailer, and that no work landed directly on
+`cargo xtask attest` checks that every non-merge commit on your branch but not
+on `develop` carries an `Assisted-by:` trailer, and that no work landed directly on
 `main` or `develop`. It runs as part of `cargo xtask test`.
 
 To check a different range explicitly:

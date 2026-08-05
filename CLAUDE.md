@@ -6,7 +6,7 @@ already cost someone an hour. It is not a style guide.
 ## Commands
 
 ```sh
-cargo xtask test    # 14 in-QEMU + 51 host tests + the licensing check
+cargo xtask test    # 14 in-QEMU + 64 host tests + licensing and attestation checks
 cargo xtask run     # interactive boot; a non-test kernel halts and never exits
 cargo xtask build
 ```
@@ -61,6 +61,13 @@ two memory-corruption bugs survived a full review inside that gap.
 
 When you add a test, ask what it would take for it to fail. If the answer is
 "nothing short of deleting the function", it is not a test yet.
+
+Coverage of contention-dependent code is a property of the host's core count,
+not of the code. `SpinLock::lock`'s backoff loop was covered on a 32-core
+machine and uncovered on a 4-core CI runner, because with fewer cores
+`try_lock` simply succeeded first. If a path only runs under contention, force
+the contention — hold the lock in another thread and wait until it is provably
+held — rather than relying on the scheduler to produce it.
 
 ## Gotchas already paid for
 

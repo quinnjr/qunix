@@ -54,7 +54,12 @@ pub fn check(root: &Path, range: Option<&str>) -> Result<()> {
 
     // `%H %(trailers:key=Assisted-by,valueonly)` collapses multi-line trailers,
     // so read the raw body per commit instead.
-    let hashes = git(root, &["rev-list", &range])?;
+    // `--no-merges`: attestation is about authored content, and a merge
+    // introduces none. It also matters mechanically -- actions/checkout builds
+    // a synthetic `refs/pull/N/merge` commit for pull requests, which GitHub
+    // authors and which can carry no trailer, so without this every PR fails
+    // on a commit nobody wrote.
+    let hashes = git(root, &["rev-list", "--no-merges", &range])?;
     let hashes: Vec<&str> = hashes.lines().filter(|l| !l.is_empty()).collect();
 
     if hashes.is_empty() {
