@@ -2880,6 +2880,24 @@ and then dies on the first timer tick that lands while a process is running,
 because the CPU pushes the interrupt frame to address 0. `percpu::set_kernel_stack`
 now sets both, which is why it lives there rather than in `syscall`.
 
+### D6 — init is a bootloader module, not an embedded blob (Task 11, 2026-08-05)
+
+Task 10 embedded a flat binary in the kernel via a build script, which was the
+smallest thing that could reach ring 3. Task 11 replaces it: `xtask` assembles
+`kernel/user/init.s` into a standalone ELF, places it in the ESP, and
+`limine.conf` loads it as a module.
+
+Two consequences worth recording. The kernel selects the module by *cmdline*
+rather than by index, because `limine.conf` can gain another module at any time
+and positional lookup would silently start returning a different file instead of
+failing. And the ELF path replaced the flat-binary path entirely rather than
+sitting beside it, since a second loader with no caller is dead code.
+
+The loader maps every segment writable, copies, then re-applies permissions in a
+second pass over all segments. One pass would leave a read-only page in the way
+of a later segment that shares it, which happens whenever two segments land in
+one page.
+
 ## Known Limitations Carried Into M2
 
 - **Application processors are online but idle.** They install per-CPU state

@@ -150,6 +150,10 @@ pub fn build_esp(root: &Path, target_dir: &Path, kernel: &Path) -> Result<PathBu
     copy_if_changed(&limine.join("BOOTX64.EFI"), &esp.join("EFI/BOOT/BOOTX64.EFI"), &stamps)?;
     copy_if_changed(&root.join("limine.conf"), &esp.join("boot/limine/limine.conf"), &stamps)?;
     copy_if_changed(kernel, &esp.join("boot/qunix-kernel"), &stamps)?;
+    // The init program is a separate ELF the bootloader hands the kernel as a
+    // module, not something linked into the kernel image.
+    let init = crate::userland::build_init(root, target_dir)?;
+    copy_if_changed(&init, &esp.join("boot/init.elf"), &stamps)?;
 
     prune_unexpected(&esp)?;
     Ok(esp)
@@ -166,6 +170,7 @@ fn prune_unexpected(esp: &Path) -> Result<()> {
         "boot/limine",
         "boot/limine/limine.conf",
         "boot/qunix-kernel",
+        "boot/init.elf",
         // Written by OVMF itself. Deleting it makes the firmware redo its
         // variable-store init on every boot.
         "NvVars",

@@ -164,9 +164,14 @@ pub extern "C" fn kmain() -> ! {
     sched::set_preemption(true);
     println!("qunix: apic timer running, preemption enabled");
 
-    match process::spawn_user(process::INIT_BINARY) {
-        Some(id) => println!("qunix: spawned init as {id:?}"),
-        None => println!("qunix: could not create the init address space"),
+    match boot::module("init") {
+        Some(image) => match process::spawn_elf(image) {
+            Ok(id) => println!("qunix: loaded init ({} bytes) as {id:?}", image.len()),
+            Err(e) => println!("qunix: init failed to load: {e:?}"),
+        },
+        // Not fatal: the kernel is usable without userspace, and a missing
+        // module is a boot configuration problem rather than a kernel fault.
+        None => println!("qunix: no init module; continuing without userspace"),
     }
     // Hand the CPU over so init actually runs before the boot thread parks.
     sched::yield_now();
@@ -636,6 +641,54 @@ mod tests {
             "dropping a VmSpace leaked {} bytes",
             before - crate::frames::free_bytes()
         );
+    }
+
+    #[test_case]
+    fn the_init_module_is_a_loadable_elf() {
+        // The bootloader supplies this, so the test also covers `limine.conf`
+        // and the ESP layout: a module that is missing, misnamed, or built as
+        // a flat binary fails here rather than at boot.
+        let image = crate::boot::module("init").expect("no init module was loaded");
+        assert!(image.len() > 64, "init module is too short to be an ELF");
+
+        let elf = qunix_elf::Elf64::parse(image).expect("init module is not a valid ELF64");
+        assert_eq!(elf.entry(), crate::process::USER_TEXT, "init is linked at the wrong address");
+
+        let segments: alloc::vec::Vec<_> = elf.segments().collect();
+        assert!(!segments.is_empty(), "init has no loadable segments");
+        // The direction that matters: nothing the loader will map may be both
+        // writable and executable.
+        for segment in &segments {
+            assert!(
+                !(segment.writable && segment.executable),
+                "init segment at {:#x} is both writable and executable",
+                segment.vaddr
+            );
+        }
+    }
+
+    #[test_case]
+    fn loading_an_elf_produces_a_private_address_space() {
+        crate::frames::init();
+        crate::heap::init();
+
+        let image = crate::boot::module("init").expect("no init module");
+        let a = crate::process::Process::from_elf(image).expect("first load failed");
+        let b = crate::process::Process::from_elf(image).expect("second load failed");
+        // Two loads of one image must not share page tables, or two processes
+        // would see each other's memory.
+        assert_ne!(a.root_frame(), b.root_frame(), "two processes share a PML4");
+    }
+
+    #[test_case]
+    fn a_non_elf_module_is_refused_rather_than_executed() {
+        crate::frames::init();
+        crate::heap::init();
+        // The negative direction: garbage must fail to load, not produce a
+        // process that jumps into whatever the bytes happen to encode.
+        let garbage = [0xffu8; 128];
+        assert!(crate::process::Process::from_elf(&garbage).is_err());
+        assert!(crate::process::Process::from_elf(&[]).is_err());
     }
 
     #[test_case]

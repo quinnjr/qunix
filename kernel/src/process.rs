@@ -5,6 +5,7 @@
 //! with code and a stack mapped user-accessible, and a kernel thread that
 //! switches CR3 and executes `iretq` into ring 3.
 
+use qunix_elf::{Elf64, ElfError};
 use qunix_hal_x86_64::syscall;
 use qunix_sched::{Priority, ThreadId};
 
@@ -27,54 +28,70 @@ pub struct Process {
 }
 
 impl Process {
-    /// Maps `code` at [`USER_TEXT`] and a stack below [`USER_STACK_TOP`].
+    /// Loads a static ELF64 executable into a fresh address space.
     ///
-    /// `code` is raw machine code, not an ELF. The ELF loader parses and then
-    /// calls the same mapping primitives; keeping the two apart means the
-    /// ring-3 transition can be tested without also testing a parser.
-    pub fn from_flat_binary(code: &[u8]) -> Option<Self> {
-        let mut space = VmSpace::new()?;
+    /// Every segment is mapped writable first so the kernel can copy the file
+    /// image and zero the `.bss` tail, then remapped to the permissions the
+    /// program header asked for. Nothing can reach the address space in
+    /// between, because it is not activated until the thread enters it.
+    pub fn from_elf(bytes: &[u8]) -> Result<Self, LoadError> {
+        let elf = Elf64::parse(bytes).map_err(LoadError::Elf)?;
+        let mut space = VmSpace::new().ok_or(LoadError::OutOfMemory)?;
         let hhdm = crate::boot::hhdm_offset();
-        let pages = (code.len() as u64).div_ceil(4096).max(1);
 
-        for page in 0..pages {
-            let va = USER_TEXT + page * 4096;
-            // Mapped writable only long enough to copy the bytes in. The
-            // alternative -- a second temporary mapping of the same frame --
-            // costs a page table walk and buys nothing, because nothing else
-            // can reach this address space until it is activated.
-            let pa = space.map_new_page(va, true, true).ok()?;
+        for segment in elf.segments() {
+            // A segment need not start on a page boundary; the page it lands
+            // in does. Mapping from the rounded-down address is what keeps two
+            // segments sharing a page from unmapping each other.
+            let start = segment.vaddr & !0xfff;
+            let end = segment
+                .vaddr
+                .checked_add(segment.mem_size)
+                .ok_or(LoadError::BadAddress)?;
+            let pages = (end.next_multiple_of(4096) - start) / 4096;
 
-            let start = (page * 4096) as usize;
-            let end = (start + 4096).min(code.len());
-            if start < code.len() {
-                // Written through the HHDM, not through the user mapping: the
-                // user mapping is only reachable once CR3 points here, and it
-                // must not, yet.
-                // SAFETY: `pa` is a frame this address space owns, mapped in
-                // the HHDM like all RAM, and the slice fits in a page.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        code[start..end].as_ptr(),
-                        (hhdm + pa) as *mut u8,
-                        end - start,
-                    )
-                };
+            for page in 0..pages {
+                let va = start + page * 4096;
+                // Skip a page an earlier segment already mapped, which happens
+                // whenever two segments share one page. Mapping it twice would
+                // leak the first frame and discard what was already copied.
+                if space.is_mapped(va) {
+                    continue;
+                }
+                space.map_new_page(va, true, true).map_err(LoadError::Map)?;
             }
-            // Text is executable and *not* writable from ring 3. A process that
-            // can rewrite its own text makes W^X meaningless from the very
-            // first program this kernel runs.
-            space.set_writable(va, false).ok()?;
+
+            // Copied through the HHDM: the user mapping is only reachable once
+            // CR3 points at this address space, and it must not, yet. The
+            // frames were zeroed on allocation, so `.bss` needs no extra work.
+            for (i, byte) in segment.data.iter().enumerate() {
+                let va = segment.vaddr + i as u64;
+                let pa = space.translate(va).ok_or(LoadError::BadAddress)?;
+                // SAFETY: `pa` is a frame this address space owns, reachable
+                // through the HHDM like all RAM.
+                unsafe { ((hhdm + pa) as *mut u8).write(*byte) };
+            }
+        }
+
+        // Permissions applied only after every byte is in place. Doing it per
+        // segment as they are copied would leave a read-only page in the way
+        // of a later segment that shares it.
+        for segment in elf.segments() {
+            let start = segment.vaddr & !0xfff;
+            let end = segment.vaddr + segment.mem_size;
+            for va in (start..end.next_multiple_of(4096)).step_by(4096) {
+                space
+                    .set_permissions(va, segment.writable, segment.executable)
+                    .map_err(LoadError::Map)?;
+            }
         }
 
         for page in 0..USER_STACK_PAGES {
             let va = USER_STACK_TOP - (page + 1) * 4096;
-            // Writable, never executable: an executable stack is the oldest
-            // exploit primitive there is.
-            space.map_new_page(va, true, false).ok()?;
+            space.map_new_page(va, true, false).map_err(LoadError::Map)?;
         }
 
-        Some(Self { space, entry: USER_TEXT, stack_top: USER_STACK_TOP })
+        Ok(Self { space, entry: elf.entry(), stack_top: USER_STACK_TOP })
     }
 
     pub fn root_frame(&self) -> u64 {
@@ -82,11 +99,25 @@ impl Process {
     }
 }
 
-/// Spawns a kernel thread that enters `code` in ring 3.
-pub fn spawn_user(code: &'static [u8]) -> Option<ThreadId> {
-    let process = Process::from_flat_binary(code)?;
+/// Why a program could not be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadError {
+    Elf(ElfError),
+    /// No frame available for the address space or a segment.
+    OutOfMemory,
+    /// A segment names a virtual range that overflows.
+    BadAddress,
+    Map(qunix_hal_x86_64::paging::MapError),
+}
+
+/// Loads an ELF64 executable and spawns a thread that enters it.
+pub fn spawn_elf(bytes: &[u8]) -> Result<ThreadId, LoadError> {
+    Ok(spawn(Process::from_elf(bytes)?))
+}
+
+fn spawn(process: Process) -> ThreadId {
     let boxed = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(process));
-    Some(crate::sched::spawn_kernel(user_thread_entry, boxed as u64, Priority::Normal))
+    crate::sched::spawn_kernel(user_thread_entry, boxed as u64, Priority::Normal)
 }
 
 /// Kernel side of a user thread: arms the syscall path, then leaves ring 0.
@@ -125,8 +156,3 @@ extern "C" fn user_thread_entry(raw: u64) -> ! {
     unsafe { syscall::enter_user(entry, stack_top) }
 }
 
-/// The flat binary assembled from `kernel/user/init.s` at build time.
-///
-/// Not a committed blob: `build.rs` assembles it, so the `.s` is the only
-/// source of truth and the two cannot drift apart.
-pub static INIT_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.bin"));

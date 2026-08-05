@@ -201,9 +201,16 @@ a task — in particular, `gdt` exposes selector *accessors* rather than
 constants, `AddressSpace::from_root` is what the plan calls `new_empty`, and
 `qunix-abi` already exists and is consumed by `xtask`.
 
-M1 Tasks 1-6 are done: per-CPU state, scheduling policy, context switch,
-kernel threads, timer preemption, and SMP bring-up. Tasks 7-11 (address
-spaces, syscall ABI, ELF loader, ring 3, init) are not started.
+**M1 is complete.** Per-CPU state, scheduling policy, context switch, kernel
+threads, timer preemption, SMP bring-up, address spaces, the native syscall
+ABI, an ELF64 loader, ring 3, and a real init program loaded as a Limine
+module. A boot prints `hello from ring 3, qunix` from a process with its own
+address space.
+
+`kernel/user/init.s` is assembled by `xtask` (see `userland.rs`) into a
+standalone ELF placed in the ESP, not linked into the kernel. The kernel finds
+it by module cmdline (`init`), not by index, so adding a second module cannot
+silently change which one runs.
 
 QEMU runs with `-smp 4`. The APs come online and park — they do not schedule,
 because `sched::Scheduler::current` is one field shared by all CPUs and two

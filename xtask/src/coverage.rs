@@ -25,6 +25,7 @@ const MEASURED: &[(&str, Option<&str>)] = &[
     ("qunix-mm", Some("qunix-mm/std")),
     ("qunix-hal-x86_64", Some("qunix-hal-x86_64/std")),
     ("qunix-sched", Some("qunix-sched/std")),
+    ("qunix-elf", Some("qunix-elf/std")),
     ("xtask", None),
 ];
 

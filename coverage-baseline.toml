@@ -7,6 +7,8 @@
 # case. The second kind of update belongs in a PR that says which code
 # is uncoverable and why.
 
+qunix-elf = 100.00
+
 # Per-crate line coverage floor. A change may raise these or hold them,
 # never drop them by more than the tolerance in xtask/src/coverage.rs.
 #
@@ -26,7 +28,7 @@
 # is covered by three new in-QEMU tests, which this number cannot see: the
 # kernel's 17 tests run under QEMU where host instrumentation does not reach.
 # The denominator grew; the tested fraction did not shrink.
-qunix-hal-x86_64 = 21.69
+qunix-hal-x86_64 = 25.00
 
 qunix-mm = 96.30
 
@@ -48,4 +50,8 @@ qunix-sync = 97.33
 # It was lowered to 31.43 once on the claim that `bench_args` was tested. That
 # claim was false -- main.rs had no `#[cfg(test)]` module, so those tests never
 # compiled. They exist now, which is most of the rise since.
-xtask = 49.90
+#
+# M1 Task 11 added `userland.rs`, which assembles the init binary by spawning
+# clang and ld.lld. Like every other command arm it is a `Command` builder plus
+# a spawn, and the spawn is what cannot be covered on the host.
+xtask = 48.06

@@ -117,19 +117,37 @@ impl VmSpace {
         Ok(pa)
     }
 
-    /// Changes the writability of an already-mapped user page.
+    /// Whether `va` already has a mapping in this address space.
     ///
-    /// Exists for one reason: a program's text must be writable while the
-    /// kernel copies it in and read-only once the process can run. Remapping
-    /// is cheaper than a second temporary mapping of the same frame, and
-    /// nothing else can reach the address space in between.
-    pub fn set_writable(&mut self, va: u64, writable: bool) -> Result<(), MapError> {
+    /// The ELF loader needs this because two segments can share a page. Mapping
+    /// such a page twice leaks the first frame and discards whatever was
+    /// already copied into it.
+    pub fn is_mapped(&mut self, va: u64) -> bool {
+        self.space.translate(va).is_some()
+    }
+
+    /// Physical frame backing `va`, if any.
+    pub fn translate(&mut self, va: u64) -> Option<u64> {
+        self.space.translate(va)
+    }
+
+    /// Re-applies permissions to an already-mapped user page.
+    ///
+    /// A program's text has to be writable while the kernel copies it in and
+    /// read-only once the process can run. Remapping is cheaper than a second
+    /// temporary mapping of the same frame, and nothing else can reach the
+    /// address space in between.
+    pub fn set_permissions(
+        &mut self,
+        va: u64,
+        writable: bool,
+        executable: bool,
+    ) -> Result<(), MapError> {
         // SAFETY: `va` was mapped by this address space, so unmapping returns
-        // the frame this owns rather than one shared with the kernel half.
+        // a frame this owns rather than one shared with the kernel half.
         let pa = unsafe { self.space.unmap(va)? };
-        // The frame is still in `owned` -- it was never given back to the frame
-        // allocator, only detached from this virtual address.
-        let executable = !writable;
+        // The frame stays in `owned`: it was detached from a virtual address,
+        // not returned to the frame allocator.
         self.map_user(va, pa, writable, executable)
     }
 

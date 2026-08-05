@@ -43,7 +43,7 @@ static HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// GDT must carry user segments laid out as `SYSRET` requires — see
 /// [`crate::gdt::build_and_load`].
 pub unsafe fn init(handler: SyscallHandler) {
-    HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
+    HANDLER.store(handler as *const () as usize, core::sync::atomic::Ordering::Release);
 
     let sel = crate::percpu::current().selectors();
     // STAR[47:32] is the kernel CS for SYSCALL; STAR[63:48] is the *base* from
@@ -58,7 +58,7 @@ pub unsafe fn init(handler: SyscallHandler) {
         let efer = read_msr(IA32_EFER);
         write_msr(IA32_EFER, efer | 1);
         write_msr(IA32_STAR, star);
-        write_msr(IA32_LSTAR, syscall_entry as usize as u64);
+        write_msr(IA32_LSTAR, (syscall_entry as *const ()) as u64);
         // Cleared on entry. IF above all: the stub runs on a kernel stack it has
         // not yet finished switching to, and an interrupt landing between the
         // `swapgs` and the stack switch would push a frame onto the *user*

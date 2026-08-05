@@ -31,6 +31,26 @@ pub struct MemoryRegion {
 }
 
 /// Offset of the higher-half direct map installed by Limine.
+/// Modules the bootloader loaded alongside the kernel.
+///
+/// In the same `.requests` section as the other requests.
+#[unsafe(link_section = ".requests")]
+static MODULES: limine::request::ModulesRequest = limine::request::ModulesRequest::new();
+
+/// The module whose cmdline is `name`, if the bootloader loaded one.
+///
+/// Selected by cmdline rather than by index: `limine.conf` may gain another
+/// module at any time, and positional lookup would silently start returning a
+/// different file rather than failing.
+pub fn module(name: &str) -> Option<&'static [u8]> {
+    let response = MODULES.response()?;
+    response
+        .modules()
+        .iter()
+        .find(|file| file.cmdline() == name)
+        .map(|file| file.data())
+}
+
 pub fn hhdm_offset() -> u64 {
     HHDM.response().expect("limine provided no HHDM response").offset
 }

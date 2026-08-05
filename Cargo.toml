@@ -13,6 +13,7 @@ publish = false
 limine = "=0.6.5"
 x86_64 = "0.15"
 qunix-abi = { path = "crates/qunix-abi" }
+qunix-elf = { path = "crates/qunix-elf" }
 qunix-sched = { path = "crates/qunix-sched" }
 qunix-sync = { path = "crates/qunix-sync" }
 qunix-mm = { path = "crates/qunix-mm" }

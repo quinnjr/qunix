@@ -50,7 +50,7 @@ impl core::ops::BitOr for PageFlags {
 /// Non-exhaustive: paging gains failure modes as the MMU layer grows (huge-page
 /// teardown, shootdown failures), and adding a variant must not silently widen
 /// what an existing exhaustive `match` in a downstream crate claims to handle.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MapError {
     OutOfFrames,
