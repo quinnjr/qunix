@@ -149,6 +149,110 @@ fn halt_forever() -> ! {
 
 #[cfg(test)]
 mod tests {
+    /// Rendezvous for the context-switch test: where the main thread's context
+    /// is parked so the child can switch back to it.
+    ///
+    /// A static rather than a captured local because the child entry point is
+    /// an `extern "C" fn` -- it takes one `u64` and closes over nothing.
+    static SWITCH_MAIN_CTX: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static SWITCH_CHILD_RAN: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    extern "C" fn switch_child(arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        SWITCH_CHILD_RAN.store(arg, Ordering::SeqCst);
+        // Switch back to whoever started us.
+        //
+        // The static holds the *address of the slot*, not the context: `switch`
+        // writes the outgoing context through `from`, so the slot is only
+        // filled in once control has left the main thread -- which is after
+        // this static was set. Dereferencing it here is what reads the value
+        // that switch just stored. Treating the slot address as the context
+        // itself jumps into the main thread's stack and executes it.
+        let slot = SWITCH_MAIN_CTX.load(Ordering::SeqCst)
+            as *mut *mut qunix_hal_x86_64::context::Context;
+        let main_ctx = unsafe { *slot };
+        let mut scratch: *mut qunix_hal_x86_64::context::Context = core::ptr::null_mut();
+        unsafe { qunix_hal_x86_64::context::switch(&raw mut scratch, main_ctx) };
+        unreachable!("the child was resumed after handing control back");
+    }
+
+    #[test_case]
+    fn context_switch_runs_a_new_thread_and_comes_back() {
+        use alloc::boxed::Box;
+        use core::sync::atomic::Ordering;
+        use qunix_hal_x86_64::context;
+
+        crate::frames::init();
+        crate::heap::init();
+        SWITCH_CHILD_RAN.store(0, Ordering::SeqCst);
+
+        // Leaked: the child's saved context lives on this stack, and the child
+        // is never resumed to unwind it, so freeing it here would hand a live
+        // stack back to the allocator.
+        let stack = Box::leak(alloc::vec![0u8; context::MIN_STACK].into_boxed_slice());
+        let raw_top = stack.as_ptr() as u64 + context::MIN_STACK as u64;
+        let stack_top = raw_top & !0xf;
+
+        let child = unsafe { context::init_kernel_stack(stack_top, switch_child, 0xC0FFEE) };
+        let mut here: *mut context::Context = core::ptr::null_mut();
+        SWITCH_MAIN_CTX.store((&raw mut here) as u64, Ordering::SeqCst);
+
+        // Control leaves here and comes back only when the child switches back.
+        unsafe { context::switch(&raw mut here, child) };
+
+        assert_eq!(
+            SWITCH_CHILD_RAN.load(Ordering::SeqCst),
+            0xC0FFEE,
+            "the child never ran, or did not receive its argument"
+        );
+        assert!(!here.is_null(), "switch did not record this thread's context");
+    }
+
+    #[test_case]
+    fn context_switch_preserves_callee_saved_registers() {
+        use alloc::boxed::Box;
+        use core::sync::atomic::Ordering;
+        use qunix_hal_x86_64::context;
+
+        crate::frames::init();
+        crate::heap::init();
+        SWITCH_CHILD_RAN.store(0, Ordering::SeqCst);
+
+        let stack = Box::leak(alloc::vec![0u8; context::MIN_STACK].into_boxed_slice());
+        let stack_top = (stack.as_ptr() as u64 + context::MIN_STACK as u64) & !0xf;
+        let child = unsafe { context::init_kernel_stack(stack_top, switch_child, 1) };
+        let mut here: *mut context::Context = core::ptr::null_mut();
+        SWITCH_MAIN_CTX.store((&raw mut here) as u64, Ordering::SeqCst);
+
+        // The point of saving rbx/r12-r15 is that they survive. The child
+        // deliberately runs arbitrary code in between; if `switch` dropped a
+        // register the ABI makes it responsible for, these would come back
+        // changed and the corruption would surface in an unrelated caller.
+        // `clobber_abi("C")` requires explicit output registers, so the two
+        // values come back in rax/rdx rather than compiler-chosen ones.
+        let (a, b): (u64, u64);
+        unsafe {
+            core::arch::asm!(
+                "mov r12, 0x1111",
+                "mov r13, 0x2222",
+                "call {switch}",
+                "mov rax, r12",
+                "mov rdx, r13",
+                switch = sym context::switch,
+                out("rax") a,
+                out("rdx") b,
+                in("rdi") &raw mut here,
+                in("rsi") child,
+                clobber_abi("C"),
+            );
+        }
+        assert_eq!(SWITCH_CHILD_RAN.load(Ordering::SeqCst), 1, "the child never ran");
+        assert_eq!(a, 0x1111, "r12 was not preserved across the switch");
+        assert_eq!(b, 0x2222, "r13 was not preserved across the switch");
+    }
+
     #[test_case]
     fn percpu_block_is_reachable_and_reports_its_id() {
         unsafe { qunix_hal_x86_64::percpu::install_bsp() };
