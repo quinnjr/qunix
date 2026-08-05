@@ -8,6 +8,10 @@ publish.workspace = true
 
 [dependencies]
 qunix-abi.workspace = true
+# The per-CPU block carries this CPU's run queue, so the arch layer needs the
+# policy type. The dependency runs one way only: `qunix-sched` is pure logic
+# and knows nothing about CPUs.
+qunix-sched.workspace = true
 qunix-sync.workspace = true
 x86_64.workspace = true
 

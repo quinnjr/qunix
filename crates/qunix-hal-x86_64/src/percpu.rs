@@ -30,7 +30,9 @@
 //! silently, so it is a compile error instead.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use qunix_sched::RunQueue;
+use qunix_sync::IrqSpinLock;
 use x86_64::structures::gdt::GlobalDescriptorTable;
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::tss::TaskStateSegment;
@@ -70,8 +72,17 @@ pub struct PerCpu {
     /// offset 0x10 — this CPU's index, as assigned at bring-up.
     pub cpu_id: u32,
     _pad: u32,
-    /// offset 0x18 — opaque pointer to the running thread, filled in by Task 4.
-    pub current_thread: *mut (),
+    /// offset 0x18 — id of the thread this CPU is running, or [`NO_THREAD`].
+    ///
+    /// One slot per CPU, which is the whole reason application processors can
+    /// schedule. A single shared "what am I running" field would have the first
+    /// switch save one CPU's stack pointer into the other CPU's context, and
+    /// two threads would then be running on one stack.
+    ///
+    /// Not behind a lock: only the owning CPU ever writes it, and it is written
+    /// with interrupts masked as part of a scheduling decision. Other CPUs read
+    /// it for diagnostics only.
+    current_thread: AtomicU64,
     /// offset 0x20 — address of this block.
     ///
     /// `gs:` addressing can read *through* the base but cannot produce it, so
@@ -79,6 +90,18 @@ pub struct PerCpu {
     self_ptr: *const PerCpu,
 
     // Nothing below here has a fixed offset; assembly must not reach it.
+    /// This CPU's queue of runnable threads.
+    ///
+    /// Per-CPU rather than one global queue, which is what removes the single
+    /// lock every scheduling decision on every CPU used to serialise on.
+    ///
+    /// It still has a lock of its own, and that is not the lock being removed:
+    /// work stealing means another CPU reaches into this queue, so the queue
+    /// needs mutual exclusion with exactly one other party at a time. It is a
+    /// *leaf* — nothing is ever acquired while it is held, and in particular
+    /// not the scheduler's thread table — so two CPUs stealing from each other
+    /// cannot deadlock.
+    run_queue: IrqSpinLock<RunQueue, crate::Irq>,
     gdt: GlobalDescriptorTable,
     tss: TaskStateSegment,
     pub(crate) idt: InterruptDescriptorTable,
@@ -109,8 +132,9 @@ impl PerCpu {
             user_rsp: 0,
             cpu_id,
             _pad: 0,
-            current_thread: core::ptr::null_mut(),
+            current_thread: AtomicU64::new(NO_THREAD),
             self_ptr: core::ptr::null(),
+            run_queue: IrqSpinLock::new(RunQueue::new()),
             gdt: GlobalDescriptorTable::new(),
             tss: TaskStateSegment::new(),
             idt: InterruptDescriptorTable::new(),
@@ -169,6 +193,75 @@ pub const MAX_CPUS: u32 = 64;
 /// every TLB shootdown initiator wait forever for an acknowledgement it is
 /// unable to send, so the mask means "can acknowledge", not "exists".
 static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Sentinel for "this CPU is running no thread the scheduler knows about".
+///
+/// A real id, not zero: thread 0 is the bootstrap processor's own idle thread,
+/// so zero would make an uninitialised CPU claim to be running it.
+pub const NO_THREAD: u64 = u64::MAX;
+
+/// Every installed block, indexed by `cpu_id`.
+///
+/// Needed because per-CPU state stops being private the moment work stealing
+/// exists: a CPU with an empty run queue has to reach another CPU's. `GS` can
+/// only ever produce the block of the CPU doing the asking, so the blocks are
+/// registered here as they are installed.
+static BLOCKS: [AtomicPtr<PerCpu>; MAX_CPUS as usize] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS as usize];
+
+fn block_ptr(cpu: u32) -> Option<*const PerCpu> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let ptr = BLOCKS[cpu as usize].load(Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ptr.cast_const())
+}
+
+/// A CPU's run queue, or `None` if that CPU has never installed a block.
+///
+/// Deliberately hands back the queue rather than the block. The two fields any
+/// CPU may touch on another's block are synchronised — this one by its own
+/// lock, `current_thread` by being atomic — but the GDT, TSS and IDT beside
+/// them are mutated by their owning CPU through `current_mut()`, and a
+/// `&'static PerCpu` would alias those.
+pub fn run_queue_of(cpu: u32) -> Option<&'static IrqSpinLock<RunQueue, crate::Irq>> {
+    let ptr = block_ptr(cpu)?;
+    // SAFETY: `finish_install` publishes only a block that is `static` or
+    // leaked, so it lives for `'static`, and it publishes last — after the
+    // block is fully constructed.
+    Some(unsafe { &(*ptr).run_queue })
+}
+
+/// The thread a CPU is running, or `None` if it has never installed a block.
+pub fn current_thread_of(cpu: u32) -> Option<u64> {
+    let ptr = block_ptr(cpu)?;
+    // SAFETY: as `run_queue_of`; the field is atomic, which is what makes a
+    // cross-CPU read of it well-defined.
+    Some(unsafe { (*ptr).current_thread.load(Ordering::Acquire) })
+}
+
+/// This CPU's run queue.
+pub fn run_queue() -> &'static IrqSpinLock<RunQueue, crate::Irq> {
+    &current().run_queue
+}
+
+/// The thread this CPU is running, or [`NO_THREAD`].
+pub fn current_thread() -> u64 {
+    current().current_thread.load(Ordering::Acquire)
+}
+
+/// Records the thread this CPU is running.
+///
+/// # Safety
+/// Must be called as part of a scheduling decision made with interrupts masked
+/// on this CPU. The slot is what says which context the next switch may save
+/// into, so a stale or foreign value puts two threads on one stack.
+pub unsafe fn set_current_thread(id: u64) {
+    current().current_thread.store(id, Ordering::Release);
+}
 
 /// Number of CPUs whose per-CPU block is live.
 pub fn installed_count() -> u32 {
@@ -270,6 +363,15 @@ unsafe fn finish_install(block: &mut PerCpu, cpu_id: u32) {
     let selectors = unsafe { gdt::build_and_load(&mut block.gdt, &block.tss, ist_top) };
     block.selectors = Some(selectors);
     unsafe { crate::idt::build_and_load(&mut block.idt) };
+
+    // Published last, so no other CPU can reach a half-built block through
+    // `block()`. A repeat install on the BSP republishes the same address.
+    assert!(
+        cpu_id < MAX_CPUS,
+        "cpu id {cpu_id} exceeds the {MAX_CPUS}-cpu block registry; its run queue would be \
+         unreachable to work stealing"
+    );
+    BLOCKS[cpu_id as usize].store(block as *mut PerCpu, Ordering::Release);
 
     if first_time {
         INSTALLED.fetch_add(1, Ordering::AcqRel);

@@ -387,6 +387,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "qunix-abi",
+ "qunix-sched",
  "qunix-sync",
  "x86_64",
 ]

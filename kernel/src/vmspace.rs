@@ -96,6 +96,38 @@ pub unsafe fn activate_kernel_root() {
     unsafe { AddressSpace::from_root(hhdm, root).activate() };
 }
 
+/// Loads `root` into CR3, or the kernel's own root when the incoming thread has
+/// no address space of its own.
+///
+/// Called on every dispatch. That is not belt-and-braces: a CPU that ran a user
+/// thread and then switched to a kernel thread kept the process's root in CR3,
+/// and nothing noticed, because the kernel half is identical in every root.
+/// With one CPU the exit path could guarantee the switch away happened before
+/// the tables were freed; with threads moving between CPUs it cannot, so each
+/// dispatch states which root it wants and the guarantee becomes structural.
+///
+/// # Safety
+/// The kernel half must map the calling code and stack, which every root this
+/// kernel builds does — that is the invariant `copy_kernel_half` maintains.
+pub unsafe fn activate_root(root: Option<u64>) {
+    let kernel = KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire);
+    assert_ne!(kernel, 0, "activate_root before record_kernel_root");
+    let wanted = root.unwrap_or(kernel);
+    let hhdm = crate::boot::hhdm_offset();
+    // Read before write. Writing CR3 flushes every non-global TLB entry, so
+    // rewriting the value already there would cost a full flush on every switch
+    // between two kernel threads — which is most of them.
+    // SAFETY: reads CR3 only.
+    let active = unsafe { AddressSpace::active(hhdm).root_frame() };
+    if active == wanted {
+        return;
+    }
+    // SAFETY: `wanted` is either the recorded kernel root, which is never
+    // freed, or a root owned by the thread about to run, which the scheduler's
+    // table keeps alive for as long as that thread exists.
+    unsafe { AddressSpace::from_root(hhdm, wanted).activate() };
+}
+
 /// An address space this kernel allocated and is responsible for.
 pub struct VmSpace {
     space: AddressSpace,

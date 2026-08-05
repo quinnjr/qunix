@@ -5,27 +5,28 @@
 //! "bring-up" here is not the classic INIT-SIPI-SIPI dance — it is handing each
 //! CPU an entry point and waiting for it to report in.
 //!
-//! # What an AP does, and what it does not
+//! # What an AP does
 //!
 //! Each AP installs its own per-CPU block — its own GDT, TSS, IDT and
-//! double-fault stack — enables its local APIC, unmasks interrupts, and then
-//! parks in `hlt`. It does **not** run scheduler threads.
+//! double-fault stack — enables its local APIC and its `SYSCALL` MSRs, adopts
+//! the stack Limine gave it as an idle thread, starts its own preemption timer,
+//! and enters the scheduler. From then on it is an ordinary scheduling CPU:
+//! it runs whatever is in its own run queue and steals from other CPUs when it
+//! is empty.
 //!
-//! That is a real limit, not an oversight, and it has a specific cause:
-//! `sched::Scheduler::current` is a single field naming one running thread. On
-//! one CPU that is the truth; with APs scheduling it would be two CPUs sharing
-//! one "what am I running" slot, and the first switch would have one CPU save
-//! its stack pointer into the other's context. `percpu::PerCpu` already carries
-//! a `current_thread` slot for exactly this, and moving `current` into it is
-//! what makes APs schedulable. Until that happens, parking is the honest
-//! behaviour: an AP that took work would corrupt the CPU that gave it.
+//! Through M1 they parked instead, because `sched::Scheduler::current` was a
+//! single field naming one running thread — one "what am I running" slot shared
+//! between CPUs, so the first switch would have had one CPU save its stack
+//! pointer into the other's context. `current` and the run queue now live in
+//! `percpu::PerCpu`, one of each per CPU, which is what makes this safe.
 //!
-//! Parking with interrupts *enabled* is not a step towards that. It is what a
-//! TLB shootdown requires: `hlt` with `IF` clear is not woken by a maskable
-//! interrupt at all, so an AP parked the way M1 parked them could never
-//! acknowledge an invalidation, and every initiator would spin forever. An AP
-//! here still takes no scheduling work — its LAPIC timer was never started, so
-//! the only interrupt that can reach it is an IPI.
+//! # Ordering during bring-up, and why each step is where it is
+//!
+//! The per-CPU block first, because a fault before an IDT exists triple-faults
+//! with no diagnostic. The local APIC before the mask, because a CPU that is in
+//! the TLB shootdown mask but cannot take the IPI hangs every initiator. The
+//! idle thread before the timer, because a tick that arrives before this CPU
+//! has a thread of its own would make `schedule` save its context into nothing.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use limine::mp::MpInfo;
@@ -133,21 +134,29 @@ unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     // exactly this page uncacheable.
     unsafe { qunix_hal_x86_64::apic::init(crate::boot::hhdm_offset()) };
 
+    // The timer and wakeup vectors are written into *this* CPU's IDT; the BSP
+    // installing them installed them only for itself.
+    crate::install_local_vectors();
+
+    // The `SYSCALL` MSRs are per-CPU. Done at bring-up rather than by the first
+    // user thread to run here, because a thread that armed them on the BSP and
+    // was then stolen by this processor would raise #UD on its next syscall.
+    // SAFETY: this CPU's per-CPU block and GDT are installed above.
+    unsafe { crate::syscall::init() };
+
+    // An idle thread of this CPU's own, adopting the stack Limine provided.
+    // Before the timer starts: a tick arriving with no current thread would
+    // have `schedule` save this context into nothing.
+    crate::sched::init();
+    qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
+
     // Interrupts on before the mask, not after. `mark_online` is a promise that
     // this CPU can acknowledge a TLB shootdown, and a CPU that is in the mask
-    // but cannot take the IPI hangs every initiator. The LAPIC timer is
-    // deliberately not started here: an AP has no run queue, so a tick would
-    // only lead into `preempt`.
+    // but cannot take the IPI hangs every initiator.
     x86_64::instructions::interrupts::enable();
     qunix_hal_x86_64::percpu::mark_online();
 
     ONLINE.fetch_add(1, Ordering::AcqRel);
 
-    // Parked. See the module docs: taking scheduler work from here would
-    // corrupt the CPU that queued it, because `sched.current` is not per-CPU
-    // yet. `hlt` in a loop rather than a spin so the core is not burned, and
-    // with interrupts enabled so a shootdown IPI actually wakes it.
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
-    }
+    crate::sched::idle_loop();
 }
