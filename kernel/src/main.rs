@@ -14,6 +14,7 @@ mod panic;
 mod sched;
 mod smp;
 mod thread;
+mod vmspace;
 mod testing;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -537,6 +538,95 @@ mod tests {
         );
         // The BSP must still be reading its own block, not an AP's.
         assert_eq!(percpu::cpu_id(), 0, "the BSP's GS was repointed by AP bring-up");
+    }
+
+    #[test_case]
+    fn a_fresh_address_space_can_be_activated_and_left() {
+        use qunix_hal_x86_64::paging::AddressSpace;
+        crate::frames::init();
+        crate::heap::init();
+
+        let hhdm = crate::boot::hhdm_offset();
+        let kernel_root = unsafe { AddressSpace::active(hhdm).root_frame() };
+
+        let mut vm = crate::vmspace::VmSpace::new().expect("no frame for a PML4");
+        assert_ne!(vm.root_frame(), kernel_root, "VmSpace reused the kernel's root");
+        vm.map_new_page(0x4000_0000, true, false).expect("failed to map a user page");
+
+        // The moment of truth: the instruction after `mov cr3` is fetched
+        // through the new tables. Reaching the next line at all proves the
+        // kernel half was copied -- a root without it triple-faults here.
+        unsafe { vm.activate() };
+        assert_eq!(
+            unsafe { AddressSpace::active(hhdm).root_frame() },
+            vm.root_frame(),
+            "cr3 does not hold the address space that was just activated"
+        );
+
+        // Back to the kernel's own tables before dropping, since `Drop`
+        // refuses to free the root that CR3 still points at.
+        let kernel_space = unsafe { AddressSpace::from_root(hhdm, kernel_root) };
+        unsafe { kernel_space.activate() };
+        drop(vm);
+    }
+
+    #[test_case]
+    fn user_pages_are_private_to_their_address_space() {
+        use qunix_hal_x86_64::paging::AddressSpace;
+        crate::frames::init();
+        crate::heap::init();
+
+        let hhdm = crate::boot::hhdm_offset();
+        let kernel_root = unsafe { AddressSpace::active(hhdm).root_frame() };
+        let kernel_space = unsafe { AddressSpace::from_root(hhdm, kernel_root) };
+
+        let mut a = crate::vmspace::VmSpace::new().expect("no frame");
+        let mut b = crate::vmspace::VmSpace::new().expect("no frame");
+        const VA: u64 = 0x5000_0000;
+        let pa_a = a.map_new_page(VA, true, false).expect("map a");
+        let pa_b = b.map_new_page(VA, true, false).expect("map b");
+
+        // Same virtual address, different physical frames. If these matched,
+        // two processes would share memory at the same address -- which is the
+        // whole thing an address space exists to prevent.
+        assert_ne!(pa_a, pa_b, "two address spaces mapped one frame at the same VA");
+
+        // Write through A's mapping, then read the same VA under B.
+        unsafe { a.activate() };
+        unsafe { (VA as *mut u64).write_volatile(0xA11CE) };
+        unsafe { b.activate() };
+        let seen = unsafe { (VA as *const u64).read_volatile() };
+        unsafe { kernel_space.activate() };
+
+        assert_eq!(seen, 0, "B saw A's write; the address spaces are not isolated");
+        drop(a);
+        drop(b);
+    }
+
+    #[test_case]
+    fn dropping_an_address_space_returns_every_frame_it_allocated() {
+        crate::frames::init();
+        crate::heap::init();
+
+        let before = crate::frames::free_bytes();
+        let owned;
+        {
+            let mut vm = crate::vmspace::VmSpace::new().expect("no frame");
+            for i in 0..4u64 {
+                vm.map_new_page(0x6000_0000 + i * 4096, true, false).expect("map");
+            }
+            owned = vm.owned_frames();
+            assert!(owned >= 5, "expected a root, tables and 4 pages, got {owned}");
+        }
+        // The negative direction: an address space that leaks its tables shows
+        // up here and nowhere else -- the kernel keeps running perfectly well
+        // while losing a few frames per process.
+        assert_eq!(
+            crate::frames::free_bytes(),
+            before,
+            "dropping a VmSpace leaked {} bytes",
+            before - crate::frames::free_bytes()
+        );
     }
 
     #[test_case]

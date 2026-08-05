@@ -186,6 +186,56 @@ impl AddressSpace {
         unsafe { OffsetPageTable::new(&mut *self.root, VirtAddr::new(self.hhdm_offset)) }
     }
 
+    /// Loads this address space into CR3.
+    ///
+    /// The first code in this project to write CR3 — until M1 Task 7 the kernel
+    /// ran on the tables Limine built and never switched. Two consequences
+    /// follow and neither is theoretical:
+    ///
+    /// The higher half must already be mapped in *this* table before the write.
+    /// The instruction after `mov cr3` is fetched through the new tables, so a
+    /// root without the kernel's own text mapped faults on the instruction that
+    /// would have handled the fault. [`copy_kernel_half`] is what establishes
+    /// that, and calling this on a bare `from_root` frame triple-faults.
+    ///
+    /// Writing CR3 flushes every non-global TLB entry, which is why no explicit
+    /// invalidation is needed here — and why switching address spaces is
+    /// expensive enough to be worth avoiding in a loop.
+    ///
+    /// # Safety
+    /// The root must contain a valid mapping for all currently-executing kernel
+    /// code, the current stack, and any data touched before the next switch.
+    pub unsafe fn activate(&self) {
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(self.root_frame()));
+        // Flags are preserved rather than zeroed: CR3 carries PCID bits on
+        // machines that enable them, and clobbering those silently changes
+        // which TLB tags apply.
+        let (_, flags) = Cr3::read();
+        unsafe { Cr3::write(frame, flags) };
+    }
+
+    /// Copies the kernel's higher-half PML4 entries into `self`.
+    ///
+    /// Every address space shares one kernel half. Copying the *top-level*
+    /// entries rather than the tables beneath them means the sharing is by
+    /// reference: a later kernel mapping becomes visible in every address space
+    /// without walking them all. It also means an address space must never free
+    /// tables reachable from these entries — they are not its own.
+    ///
+    /// Entries 256..512 are the higher half on x86-64: bit 47 of the virtual
+    /// address is the sign bit, so PML4 index >= 256 is exactly the set of
+    /// addresses with the top bits set.
+    ///
+    /// # Safety
+    /// `from` must be an address space whose higher half is the kernel's.
+    pub unsafe fn copy_kernel_half(&mut self, from: &AddressSpace) {
+        let src = unsafe { &*from.root };
+        let dst = unsafe { &mut *self.root };
+        for i in 256..512 {
+            dst[i] = src[i].clone();
+        }
+    }
+
     pub fn root_frame(&self) -> u64 {
         VirtAddr::from_ptr(self.root).as_u64() - self.hhdm_offset
     }
