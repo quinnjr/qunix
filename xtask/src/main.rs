@@ -45,6 +45,32 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
     Ok(target_dir().join("x86_64-qunix-kernel").join(profile).join("qunix-kernel"))
 }
 
+/// Cargo arguments for `xtask bench`, with any extra flags appended.
+///
+/// Split out from the spawn so the crate/feature selection is testable. Only
+/// host-buildable crates appear: criterion needs `std`, and the kernel is
+/// `no_std` running in QEMU, so it cannot be linked against at all.
+fn bench_args(extra: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "bench",
+        "--target",
+        "x86_64-unknown-linux-musl",
+        "-p",
+        "qunix-sync",
+        "-p",
+        "qunix-mm",
+        "-p",
+        "qunix-hal-x86_64",
+        "--features",
+        "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    args.extend(extra.iter().cloned());
+    args
+}
+
 mod attest;
 mod coverage;
 mod image;
@@ -145,6 +171,15 @@ fn main() -> Result<()> {
             // licence from the workspace.
             licensing::check(&root)?;
             attest::check(&root, None)?;
+            Ok(())
+        }
+        Some("bench") => {
+            let mut cmd = Command::new(env!("CARGO"));
+            cmd.current_dir(&root);
+            cmd.args(bench_args(&args[1..]));
+            if !cmd.status()?.success() {
+                bail!("benchmarks failed");
+            }
             Ok(())
         }
         Some("attest") => attest::check(&root, args.get(1).map(String::as_str)),

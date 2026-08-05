@@ -33,7 +33,7 @@ jobs:
       - name: Install QEMU and OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf
+          sudo apt-get install -y qemu-system-x86 ovmf clang lld
           # Must be a unified image. The split OVMF_CODE*.fd needs a companion
           # writable VARS pflash that the harness does not attach, so pointing
           # at one fails inside the firmware rather than here.
@@ -64,6 +64,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # criterion pulls in `alloca`, which compiles C. .cargo/config.toml points
+      # cc-rs and the linker at clang/LLD, so this is the whole C toolchain
+      # requirement -- no musl-gcc, no binutils.
+      - name: Install clang and LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
 
       # Fails when any crate's line coverage falls below the floor recorded in
       # coverage-baseline.toml. Needs no QEMU: only host-testable crates are

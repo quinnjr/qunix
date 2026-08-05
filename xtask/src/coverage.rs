@@ -146,8 +146,11 @@ fn render_baseline(measured: &BTreeMap<String, Lines>) -> String {
         "# Per-crate line coverage floor. A change may raise these or hold them,\n\
          # never drop them by more than the tolerance in xtask/src/coverage.rs.\n\
          #\n\
-         # Regenerate with `cargo xtask coverage --update` after genuinely\n\
-         # improving coverage; never to make a red build go green.\n",
+         # Regenerate with `cargo xtask coverage --update` when coverage\n\
+         # genuinely improves, or when a crate gains code that cannot be covered\n\
+         # at all -- xtask command dispatch that only spawns cargo is the usual\n\
+         # case. The second kind of update belongs in a PR that says which code\n\
+         # is uncoverable and why.\n",
     );
     for (name, lines) in measured {
         out.push_str(&format!("{name} = {:.2}\n", lines.percent()));
@@ -206,9 +209,11 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
     if !regressions.is_empty() {
         bail!(
             "coverage dropped in {n} crate(s):\n{list}\n\n\
-             Add tests for the new code, or explain in the PR why it cannot be \
-             covered. Do not lower the floor to make this pass — the floor \
-             records what was true, not what is convenient.",
+             Add tests for the new code. If it genuinely cannot be covered — \
+             `xtask` command dispatch that only spawns cargo is the usual case \
+             — run `cargo xtask coverage --update` and say in the PR which code \
+             is uncoverable and why. Lowering the floor is a decision to be \
+             argued for, not a way to make a red build green quietly.",
             n = regressions.len(),
             list = regressions.join("\n")
         );

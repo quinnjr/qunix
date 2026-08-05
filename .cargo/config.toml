@@ -20,5 +20,43 @@ rustflags = [
 runner = ["cargo", "run", "--quiet", "--package", "xtask",
           "--target", "x86_64-unknown-linux-musl", "--", "runner"]
 
+# The host target is built with clang and LLD, never a GNU toolchain.
+#
+# This is not only a preference. criterion depends on `alloca`, which compiles
+# a C translation unit, so building benchmarks drags in whatever cc-rs can
+# find; left to itself it looks for `x86_64-linux-musl-gcc`. `alloca.c` needs
+# only `stddef.h` and `stdint.h`, which clang supplies itself, so no musl C
+# toolchain has to exist at all.
+#
+# Linking needs nothing GNU either: rust-std ships musl's `crt*.o`, `libc.a`
+# and `libunwind.a` under `self-contained/`, and `-Clink-self-contained=yes`
+# makes rustc use them. clang is only the driver; `--target` keeps it from
+# defaulting to the glibc host, and `-fuse-ld=lld` keeps `ld.bfd` out.
+#
+# Verified by shadowing gcc, cc, musl-gcc and ld with failing stubs and
+# rebuilding from clean -- see the PR that introduced this.
+[env]
+CC_x86_64_unknown_linux_musl = "clang"
+
+[target.x86_64-unknown-linux-musl]
+linker = "clang"
+rustflags = [
+    "-Clink-self-contained=yes",
+    "-Clink-arg=--target=x86_64-unknown-linux-musl",
+    "-Clink-arg=-fuse-ld=lld",
+]
+
+# Build scripts and proc macros are compiled for the *host* triple regardless of
+# `--target`, and cargo links them with the host `cc` -- so covering only the
+# musl entry above still sent `alloca`'s build script through gcc. This is the
+# host half of the same rule.
+#
+# glibc still provides the C runtime for those host-only binaries; cargo builds
+# build scripts for the host triple and there is no musl host rustc here. The
+# compiler and linker are clang and LLD, which is what this is about.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-Clink-arg=-fuse-ld=lld"]
+
 [alias]
 xtask = "run --quiet --package xtask --target x86_64-unknown-linux-musl --"
