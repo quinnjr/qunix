@@ -80,19 +80,15 @@ pub fn init() {
         return;
     }
     let boot = ThreadId(0);
-    sched.threads.insert(boot, Thread::adopt_current(boot));
+    sched.threads.insert(boot, Thread::adopt_current());
     sched.current = boot;
-}
-
-pub fn is_initialised() -> bool {
-    INITIALISED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Creates a runnable kernel thread.
 pub fn spawn_kernel(entry: extern "C" fn(u64) -> !, arg: u64, prio: Priority) -> ThreadId {
     let mut sched = SCHED.lock();
     let id = sched.allocate_id();
-    let thread = Thread::new_kernel(id, entry, arg, prio);
+    let thread = Thread::new_kernel(entry, arg, prio);
     sched.threads.insert(id, thread);
     sched.queue.push(id, prio);
     id
@@ -214,7 +210,7 @@ fn reap() {
     {
         let mut sched = SCHED.lock();
         let current = sched.current;
-        let ids: alloc::vec::Vec<ThreadId> = sched.reapable.drain(..).collect();
+        let ids = core::mem::take(&mut sched.reapable);
         for id in ids {
             if id == current {
                 // Cannot free the stack we are standing on. Put it back for

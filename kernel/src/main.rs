@@ -128,6 +128,20 @@ pub extern "C" fn kmain() -> ! {
         heap::bump_remaining() / 1024
     );
 
+    sched::init();
+    // Not a demonstration for its own sake: this is the first code to run on a
+    // stack the kernel allocated rather than the one Limine handed it, so a
+    // fault here is the difference between "the scheduler compiles" and "the
+    // scheduler works" on real hardware paths the tests cannot reach.
+    let greeter = sched::spawn_kernel(greet, 0, qunix_sched::Priority::Normal);
+    println!("qunix: scheduler online, spawned {greeter:?}");
+    sched::yield_now();
+    println!(
+        "qunix: back on the boot thread, {} live, {} runnable",
+        sched::thread_count(),
+        sched::runnable_count()
+    );
+
     install_timer();
     map_lapic();
     // SAFETY: map_lapic() has just mapped the LAPIC page uncacheable at this
@@ -141,6 +155,12 @@ pub extern "C" fn kmain() -> ! {
     test_main();
 
     halt_forever();
+}
+
+/// The first thread the kernel ever schedules.
+extern "C" fn greet(_: u64) -> ! {
+    println!("qunix: hello from {:?} on its own stack", sched::current_id());
+    sched::exit_current();
 }
 
 fn halt_forever() -> ! {

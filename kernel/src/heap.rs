@@ -113,7 +113,7 @@ pub fn init() {
         // frame. Both halves of that are checked here, rather than resting on
         // `mapped` happening to stay aligned because the order hint only ever
         // fell -- which stopped being true the moment the hint learned to climb.
-        if order >= HUGE_ORDER && mapped % (1u64 << HUGE_ORDER) == 0 {
+        if order >= HUGE_ORDER && mapped.is_multiple_of(1u64 << HUGE_ORDER) {
             unsafe {
                 space
                     .map_2mib(

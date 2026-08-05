@@ -11,7 +11,7 @@
 
 use alloc::boxed::Box;
 use qunix_hal_x86_64::context::{self, Context};
-use qunix_sched::{Priority, ThreadId};
+use qunix_sched::Priority;
 
 /// Where a thread is in its life.
 ///
@@ -22,14 +22,10 @@ use qunix_sched::{Priority, ThreadId};
 pub enum ThreadState {
     Ready,
     Running,
-    /// Not runnable and not queued. Nothing produces this yet; it exists so
-    /// `Exited` cannot be confused with "waiting for something".
-    Blocked,
     Exited,
 }
 
 pub struct Thread {
-    pub id: ThreadId,
     /// Where this thread resumes. Null while it is the running thread — the
     /// value is only meaningful once `switch` has stored it.
     pub context: *mut Context,
@@ -54,7 +50,6 @@ impl Thread {
     /// Allocates a stack and prepares it so the first switch enters
     /// `entry(arg)`.
     pub fn new_kernel(
-        id: ThreadId,
         entry: extern "C" fn(u64) -> !,
         arg: u64,
         priority: Priority,
@@ -72,7 +67,7 @@ impl Thread {
         // and `stack_top` lies inside it and is 16-aligned.
         let ctx = unsafe { context::init_kernel_stack(stack_top, entry, arg) };
 
-        Self { id, context: ctx, stack: Some(stack), state: ThreadState::Ready, priority }
+        Self { context: ctx, stack: Some(stack), state: ThreadState::Ready, priority }
     }
 
     /// The idle thread for a CPU: no stack of its own is prepared because it
@@ -80,9 +75,8 @@ impl Thread {
     ///
     /// Its context is filled in by the first `switch` away from it, which is
     /// why it starts null.
-    pub fn adopt_current(id: ThreadId) -> Self {
+    pub fn adopt_current() -> Self {
         Self {
-            id,
             context: core::ptr::null_mut(),
             stack: None,
             state: ThreadState::Running,
