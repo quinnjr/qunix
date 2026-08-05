@@ -45,6 +45,7 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
     Ok(target_dir().join("x86_64-qunix-kernel").join(profile).join("qunix-kernel"))
 }
 
+mod attest;
 mod image;
 mod licensing;
 mod qemu;
@@ -142,8 +143,10 @@ fn main() -> Result<()> {
             // Linux-compatibility crate and silently inheriting a permissive
             // licence from the workspace.
             licensing::check(&root)?;
+            attest::check(&root, None)?;
             Ok(())
         }
+        Some("attest") => attest::check(&root, args.get(1).map(String::as_str)),
         other => bail!("unknown xtask command: {other:?}"),
     }
 }
