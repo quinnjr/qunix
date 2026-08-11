@@ -111,8 +111,31 @@ static HANDOFF_PRIORITY: [AtomicU8; MAX_CPUS as usize] =
 static STEALS: AtomicU64 = AtomicU64::new(0);
 
 /// Total threads taken from another CPU's run queue since boot.
+///
+/// Since boot, and never reset: a test that wants to prove *it* caused a steal
+/// must sample this before and compare, not assert it is non-zero. An absolute
+/// test passes on the strength of every earlier steal in the same boot, which
+/// is how a regression test for the stealing path came to be unable to fail.
 pub fn steal_count() -> u64 {
     STEALS.load(Ordering::Acquire)
+}
+
+/// Steal attempts abandoned because the remote queue was locked.
+///
+/// Counted because the `try_lock` in [`take_next`] cannot distinguish "no work
+/// anywhere" from "could not look". Since the reordering that puts the steal
+/// loop on the routine path -- it now runs whenever a CPU has no local runnable
+/// work, rather than almost never -- contention on it became load-bearing, and
+/// a CPU that skipped every victim runs its idle thread while runnable work
+/// exists one queue away. That is bounded: the next tick tries again, and
+/// `idle_loop` re-checks before halting. It is not a starvation bug, but it is
+/// invisible without this, and "the scheduler is idle while work is queued" is
+/// not a state anyone should have to infer.
+static STEAL_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Steal attempts abandoned because the remote queue was locked, since boot.
+pub fn steal_contention_count() -> u64 {
+    STEAL_CONTENDED.load(Ordering::Acquire)
 }
 
 /// Times each CPU has gone round [`idle_loop`].
@@ -341,11 +364,57 @@ pub fn exit_current() -> ! {
 ///
 /// Removal before dispatch is what stops two CPUs running one thread, and it is
 /// why both halves of this are `pop`/`steal` rather than a peek.
+///
+/// The order is local *runnable* work, then a steal, then this CPU's own idle
+/// thread. That middle step is not an optimisation. An earlier version popped
+/// whatever the local queue held and only stole when the queue was empty, and
+/// the local queue is essentially never empty: a CPU's idle thread is pushed
+/// back onto it the moment the CPU switches to anything else, so from the first
+/// dispatch onward the CPU always had *something* local and never looked
+/// elsewhere again.
+///
+/// The consequence was that work queued on a CPU which then stopped scheduling
+/// starved indefinitely, while every other CPU cycled between its own resident
+/// thread and its own idle thread with real work sitting one queue away.
+/// Ordering the idle thread last states the rule plainly: **before running
+/// nothing, look for something.**
+/// Whether this CPU should dispatch from its own queue rather than look
+/// elsewhere first.
+///
+/// The entire content of this function is *which question is asked*: whether
+/// the local queue holds runnable work, not whether it holds anything. A CPU's
+/// idle thread is pushed back onto its own queue whenever the CPU switches to
+/// something else, so "is there anything local" answers yes from the first
+/// dispatch onward and forever after — which is precisely the bug this
+/// replaced. "Is there anything local worth running" is a different question
+/// with a different answer.
+///
+/// Split out from [`take_next`] so that distinction is stated once and can be
+/// asserted without four processors. It is thin on purpose; the integration
+/// proof is `work_stranded_on_a_processor_that_stops_scheduling_is_migrated`.
+const fn prefers_local(local_runnable: usize) -> bool {
+    local_runnable > 0
+}
+
 fn take_next(cpu: u32) -> Option<ThreadId> {
-    // Locally first: a thread that last ran here has its stack, and possibly
-    // its address space, warm in this CPU's caches.
-    if let Some(id) = percpu::run_queue().lock().pop() {
-        return Some(id);
+    {
+        // Locally first: a thread that last ran here has its stack, and
+        // possibly its address space, warm in this CPU's caches.
+        //
+        // One acquisition for both the test and the take. Asking
+        // `runnable_len` under one lock and popping under another lets a thief
+        // empty the queue in between, and the `pop` would then return this
+        // CPU's idle thread from the branch that has just established there is
+        // real work to run.
+        let mut queue = percpu::run_queue().lock();
+        if prefers_local(queue.runnable_len()) {
+            // `pop` serves the highest non-empty band and `runnable_len`
+            // excludes the idle band, so a non-zero count here guarantees this
+            // is a real thread rather than the idle one.
+            if let Some(id) = queue.pop() {
+                return Some(id);
+            }
+        }
     }
     for other in each_online_cpu() {
         if other == cpu {
@@ -359,6 +428,10 @@ fn take_next(cpu: u32) -> Option<ThreadId> {
         // held at a time on this path, so two CPUs stealing from each other
         // cannot deadlock however the try_locks land.
         let Some(mut queue) = remote.try_lock() else {
+            // Counted, not merely skipped. A miss here is indistinguishable
+            // from an empty queue by every other observable, and after the
+            // reordering this loop is the routine path rather than a rarity.
+            STEAL_CONTENDED.fetch_add(1, Ordering::AcqRel);
             continue;
         };
         // Idle threads must never be stolen: an idle thread adopted the stack
@@ -374,7 +447,11 @@ fn take_next(cpu: u32) -> Option<ThreadId> {
             return Some(id);
         }
     }
-    None
+    // Nothing runnable anywhere, so this CPU's own idle thread is the answer.
+    // Only an idle-band thread can be here -- the runnable band was taken
+    // above -- and it is never taken from another CPU, because an idle thread
+    // adopted the stack its own CPU booted on.
+    percpu::run_queue().lock().pop()
 }
 
 /// Makes the thread that gave up this CPU runnable again.
@@ -652,5 +729,36 @@ mod tests {
         // unknown byte into the idle band, which is the one band that must
         // never be produced by accident.
         assert_ne!(priority_from_raw(9), Priority::Idle, "an unknown band decoded as Idle");
+    }
+
+    #[test_case]
+    fn a_queue_holding_only_an_idle_thread_is_not_local_work() {
+        // The distinction the dispatch order turns on, asserted in the
+        // direction that was broken. A queue holding only this CPU's idle
+        // thread is *not empty*, and a `take_next` that asked `is_empty` --
+        // or equivalently popped unconditionally -- took that idle thread and
+        // never reached the steal loop, so work queued on a CPU that stopped
+        // scheduling starved forever.
+        //
+        // The integration test proves the consequence on four processors;
+        // this pins the premise, and it is the half that a future
+        // simplification would delete.
+        let mut queue = qunix_sched::RunQueue::new();
+        queue.push(ThreadId(1), Priority::Idle);
+        assert!(!queue.is_empty(), "premise broken: a queued idle thread left the queue empty");
+        assert!(
+            !prefers_local(queue.runnable_len()),
+            "a queue holding only an idle thread was treated as local work; this CPU would \
+             run nothing while another CPU held runnable work it could have taken"
+        );
+
+        // And the positive direction, so a `prefers_local` hard-wired to false
+        // -- which would make every CPU scan every other queue on every
+        // dispatch and throw away cache locality -- does not pass.
+        queue.push(ThreadId(2), Priority::Normal);
+        assert!(
+            prefers_local(queue.runnable_len()),
+            "real local work was not treated as local work"
+        );
     }
 }

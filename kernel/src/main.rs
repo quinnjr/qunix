@@ -571,40 +571,50 @@ mod tests {
         let was = crate::sched::set_preemption(true);
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
         let ticks_before = crate::TICKS.load(Ordering::SeqCst);
+
+        // Masked before the first spawn rather than after the last, for the
+        // reason spelled out in `work_stranded_on_a_processor_that_stops_
+        // scheduling_is_migrated`: a tick in that window dispatches a spinner
+        // on this processor, which is the one thing this test says it has
+        // excluded ("the bootstrap processor provably dispatches none of
+        // them"). One fewer spinner than processors means this test recovers
+        // where the other would hang, so the consequence here is a false
+        // premise rather than a stopped suite -- which is worse to leave,
+        // because it fails nothing.
+        x86_64::instructions::interrupts::disable();
         for i in 0..spinners {
             crate::sched::spawn_kernel(spinner, i, Priority::Normal);
         }
 
-        x86_64::instructions::interrupts::disable();
         let all = u64::MAX >> (64 - spinners);
-        let mut budget = 200_000_000u64;
-        while SPIN_STARTED.load(Ordering::SeqCst) != all && budget > 0 {
-            core::hint::spin_loop();
-            budget -= 1;
-        }
+        let started_in_time = wait_by_ticks(|| SPIN_STARTED.load(Ordering::SeqCst) == all, 40);
+        assert_ne!(
+            started_in_time,
+            Err(TickWait::TickSourceStalled),
+            "the tick counter stopped advancing; no processor is taking timer interrupts"
+        );
 
         // Sampled only once every spinner is resident, so growth from before
         // they started cannot be mistaken for growth caused by preempting one.
         let idle_before: [u64; 64] = core::array::from_fn(|cpu| {
             if (cpu as u64) < cpus { crate::sched::idle_rounds(cpu as u32) } else { 0 }
         });
-        // Bounded in ticks rather than in spin iterations. The budget above is
-        // a count of instructions, which is a different amount of wall-clock on
-        // every host and under TCG is not close to the same -- and what is
-        // being waited for is a timer, measured in ticks. Ticks still advance
-        // here with interrupts masked on this processor: the application
-        // processors have timers of their own.
-        let deadline = ticks_before + 20;
+        // 20 ticks rather than the 40 the migration test allows: this waits
+        // for one preemption on any one processor, which is a single timer
+        // interrupt away, where migration additionally needs the stranded
+        // thread found and moved.
         let mut preempted = 0u64;
-        while crate::TICKS.load(Ordering::SeqCst) < deadline {
-            preempted = (1..cpus)
-                .filter(|cpu| crate::sched::idle_rounds(*cpu as u32) > idle_before[*cpu as usize])
-                .count() as u64;
-            if preempted > 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let _ = wait_by_ticks(
+            || {
+                preempted = (1..cpus)
+                    .filter(|cpu| {
+                        crate::sched::idle_rounds(*cpu as u32) > idle_before[*cpu as usize]
+                    })
+                    .count() as u64;
+                preempted > 0
+            },
+            20,
+        );
         // Interrupts stay masked through every assertion below and through the
         // store that stops the spinners. Re-enabling here instead left a window
         // this thread could not survive: it adopted the boot context, so it is
@@ -666,6 +676,138 @@ mod tests {
         if was_enabled {
             x86_64::instructions::interrupts::enable();
         }
+        wait_until(|| crate::sched::thread_count() == before, WAIT_BUDGET);
+        crate::sched::set_preemption(was);
+        assert_eq!(
+            crate::sched::thread_count(),
+            before,
+            "the spinners did not exit; later tests would inherit them"
+        );
+    }
+
+    #[test_case]
+    fn work_stranded_on_a_processor_that_stops_scheduling_is_migrated() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+        // Settled *before* the flags are armed, not after. `quiesce` waits for
+        // the run queues to drain, and a spinner surviving from an earlier
+        // test loops on `!SPIN_STOP` -- so clearing the flag first tells any
+        // such thread to keep going and guarantees the wait it is about to do
+        // can never succeed. Safe today only because the preceding test
+        // asserts its own threads are gone, which is a cross-test coupling
+        // nothing states; this ordering does not depend on it.
+        let before = quiesce();
+        SPIN_STARTED.store(0, Ordering::SeqCst);
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        // `SPIN_RAN` is deliberately not reset: this test never reads it, and
+        // resetting a counter it does not assert on only invites the next
+        // reader to wonder which of the two is the mistake.
+
+        // One more spinner than there are processors able to run them, all
+        // queued here -- `spawn_kernel` queues locally by design -- and then
+        // this processor stops scheduling by masking interrupts. The extra
+        // spinner can therefore only run if some other processor comes back for
+        // it after it has already taken one.
+        //
+        // That is the case `take_next` used to fail. An application processor's
+        // own idle thread is pushed onto its run queue the moment it switches
+        // away, so its local queue is never empty again; a `take_next` that
+        // popped whatever was local would take that idle thread and never reach
+        // the steal loop. Every processor then cycled between its own resident
+        // spinner and its own idle thread while real work sat one queue away,
+        // and the extra spinner never started at all.
+        //
+        // Deterministic, not a race: it failed on every run before the fix and
+        // the failure was not timing-dependent, because no amount of waiting
+        // makes a CPU that never looks elsewhere look elsewhere.
+        let cpus = crate::smp::cpu_count() as u64;
+        assert!(cpus >= 2, "qemu must be launched with -smp; only {cpus} cpu(s) reported");
+        let spinners = cpus;
+        assert!(spinners <= 64, "the spinner bitmap is a u64");
+
+        let was = crate::sched::set_preemption(true);
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+
+        // Masked *before* the first spawn, not after the last. A tick landing
+        // between the final `spawn_kernel` and the mask dispatches a spinner
+        // on this very processor -- which defeats the premise the whole test
+        // rests on, because a spinner this processor ran itself did not have
+        // to be migrated to start. With the old, broken `take_next` that is
+        // enough to make every spinner start and the test pass with the bug
+        // present: this CPU takes one locally, and the three application
+        // processors take the rest on their first schedule, when their queues
+        // genuinely are empty.
+        //
+        // It is also the window that cannot be recovered from. There is one
+        // spinner per processor here, so a tick that hands this thread's CPU
+        // to a Normal-band spinner leaves this idle-band thread with nowhere
+        // to run -- and it is the only thing that ever sets `SPIN_STOP`. The
+        // sibling test survives the same window only because it spawns one
+        // fewer spinner and some processor therefore runs out of work.
+        //
+        // `spawn_kernel` is correct under a mask: it takes `SCHED`, which is
+        // an `IrqSpinLock`, pushes to a leaf run queue, and sends an IPI --
+        // none of which need interrupts enabled on the sending processor, and
+        // the application processors still wake and steal.
+        x86_64::instructions::interrupts::disable();
+
+        // Sampled before anything is queued. `steal_count` counts since boot
+        // and is never reset, so an absolute `> 0` is satisfied by steals that
+        // earlier tests caused -- including the steals the *old* ordering
+        // performed, since an application processor's first dispatch after
+        // boot does find its queue empty. Only a delta says this test caused
+        // one.
+        let steals_before = crate::sched::steal_count();
+        for i in 0..spinners {
+            crate::sched::spawn_kernel(spinner, i, Priority::Normal);
+        }
+
+        let all = u64::MAX >> (64 - spinners);
+        let waited = wait_by_ticks(|| SPIN_STARTED.load(Ordering::SeqCst) == all, 40);
+
+        let started = SPIN_STARTED.load(Ordering::SeqCst);
+        let stolen = crate::sched::steal_count() - steals_before;
+        SPIN_STOP.store(true, Ordering::SeqCst);
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+
+        assert_ne!(
+            waited,
+            Err(TickWait::TickSourceStalled),
+            "the tick counter stopped advancing; no processor is taking timer interrupts, so \
+             nothing was learned about migration"
+        );
+        assert_eq!(
+            started,
+            all,
+            "only {} of {spinners} spinners started; {} were queued on a processor that had \
+             stopped scheduling, and no other processor came back for them",
+            started.count_ones(),
+            spinners - started.count_ones() as u64
+        );
+        // The mechanism, asserted as an exact count rather than a presence.
+        // Every spinner was queued on this processor and this processor
+        // dispatched nothing while masked, so every one of them had to be
+        // migrated -- which makes "this processor ran one itself" arithmetically
+        // impossible rather than merely unlikely. A `> 0` here would be
+        // satisfied by a single steal from any earlier test.
+        assert!(
+            stolen >= spinners,
+            "{} spinners started but only {stolen} of {spinners} were stolen; a thread queued \
+             on a processor that dispatches nothing can only start by migrating, so any \
+             shortfall means this processor ran work it was supposed to be unable to run",
+            started.count_ones()
+        );
+
         wait_until(|| crate::sched::thread_count() == before, WAIT_BUDGET);
         crate::sched::set_preemption(was);
         assert_eq!(
@@ -1395,6 +1537,56 @@ mod tests {
     /// orders of magnitude slower than under KVM, and a budget tuned to one is
     /// a spurious failure on the other.
     const WAIT_BUDGET: u32 = 20_000;
+
+    /// Spins until `condition` holds or `tick_budget` timer ticks have passed.
+    ///
+    /// Distinct from [`wait_until`], which cannot be used with interrupts
+    /// masked: it calls `yield_now`, and a thread that has masked interrupts
+    /// specifically to stop being scheduled must not invite a switch.
+    ///
+    /// Bounded in *ticks* rather than in spin iterations because what these
+    /// callers wait for is other processors making progress, and a count of
+    /// instructions is a different amount of wall-clock on every host — the
+    /// gap between KVM and TCG is orders of magnitude, and a budget tuned to
+    /// one is a spurious failure on the other. Ticks still advance while this
+    /// processor is masked: every CPU increments `TICKS` from its own timer.
+    ///
+    /// The instruction backstop is not redundant with that. If the tick source
+    /// itself stops — every CPU halted, a broken LAPIC path — a purely
+    /// tick-bounded loop never exits, and the harness reports a 120-second
+    /// timeout naming no test, which is the worst diagnostic this project can
+    /// produce. `Err` says which of the two ran out.
+    fn wait_by_ticks(mut condition: impl FnMut() -> bool, tick_budget: u64) -> Result<(), TickWait> {
+        let deadline = crate::TICKS.load(core::sync::atomic::Ordering::SeqCst) + tick_budget;
+        // Deliberately enormous: it exists to catch a dead tick source, not to
+        // bound the wait, so it must not be the limit that fires first on a
+        // slow host.
+        let mut backstop = 4_000_000_000u64;
+        loop {
+            if condition() {
+                return Ok(());
+            }
+            if crate::TICKS.load(core::sync::atomic::Ordering::SeqCst) >= deadline {
+                return Err(TickWait::Deadline);
+            }
+            if backstop == 0 {
+                return Err(TickWait::TickSourceStalled);
+            }
+            backstop -= 1;
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Why [`wait_by_ticks`] gave up.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TickWait {
+        /// The tick budget elapsed: the condition genuinely did not hold in
+        /// time, which is a real failure of whatever was being waited for.
+        Deadline,
+        /// The tick counter stopped advancing, so the deadline could never be
+        /// reached. Nothing was learned about the condition.
+        TickSourceStalled,
+    }
 
     fn wait_until_reaped(id: qunix_sched::ThreadId) -> bool {
         wait_until(|| !crate::sched::thread_id_is_live(id), WAIT_BUDGET)

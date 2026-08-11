@@ -219,6 +219,30 @@ Linux-compat code inherits the workspace licence. The syscall personality
 (`qunix-linux-abi`) is deliberately exempt — matching UAPI struct layouts is not
 the same as reimplementing the in-kernel driver API. See `LICENSING.md`.
 
+**Outside the GPL crates, every Linux-compatible API here is clean-roomed from
+the specification, never transcribed from the implementation.** The rule is
+about *where the knowledge came from*, not about how similar the result looks:
+
+- Work from what the interface is required to *do* — published UAPI headers,
+  `Documentation/`, the on-disk or on-wire format, `man` pages, the standards
+  the interface implements. Two people writing to the same specification
+  produce similar code, and that similarity is not derivation.
+- Do **not** work from Linux's `.c` files, its internal headers, or a
+  transcription of either. Do not paste kernel source into a prompt and ask for
+  a Rust version, and do not reproduce an algorithm you are recalling
+  specifically from having read that source.
+- The same applies to anything a model emits. A model can reproduce GPL source
+  it was trained on without saying so, and a plausible-looking function is not
+  evidence of independent derivation. If a generated block looks like it came
+  from somewhere, find out where before keeping it.
+- If an API genuinely cannot be implemented without reading the in-kernel
+  source, that is the signal it belongs in the `GPL-2.0` zone. Move it there
+  rather than weakening the rule.
+
+Structural compatibility is not derivation and is expected: ext4's on-disk
+layout, `struct stat`'s field order, and errno values are facts about a format
+that a compatible implementation must match exactly.
+
 ## Working on a milestone
 
 Each milestone gets a spec, then a plan, then execution:
@@ -255,7 +279,7 @@ silently change which one runs.
 
 QEMU runs with `-smp 4` and **every one of them schedules.** `current` and the
 run queue live in `percpu::PerCpu`, one of each per CPU; the thread table and
-the reapable list stay shared behind one lock. Four things about that are worth
+the reapable list stay shared behind one lock. Five things about that are worth
 knowing before touching the scheduler:
 
 - **A thread is removed from a run queue before it is dispatched** — `pop`
@@ -268,10 +292,21 @@ knowing before touching the scheduler:
 - **Idle threads are never stolen.** An idle thread adopted the stack its own
   CPU booted on, so running it elsewhere puts two CPUs on one stack.
   `RunQueue::runnable_len` excludes the idle band and the steal path checks it.
+- **A CPU steals before it runs its own idle thread**, not only when its queue
+  is empty. `take_next` takes local *runnable* work, then steals, then falls
+  back to the local idle thread. Ordering it the obvious way — local `pop`
+  first, steal only when the queue is empty — silently disables stealing after
+  the first dispatch, because a CPU's idle thread is pushed back onto its own
+  queue the moment it switches away, so the queue is never empty again. Work
+  queued on a CPU that then stops scheduling starved indefinitely while every
+  other CPU cycled between its resident thread and its idle thread with real
+  work one queue away. Before running nothing, look for something.
 - **The boot thread is an *idle*-band thread**, including while it is running
   the test suite. A Normal-band thread that never exits starves it, so a test
-  that spins rather than yields must mask interrupts for the duration or it is
-  never scheduled again.
+  that spins rather than yields must mask interrupts for the duration — and the
+  duration ends when those threads have been *told to stop*, not when the spin
+  ends. Re-enabling interrupts one line early cost a 120-second harness timeout
+  that named no test.
 
 Lock order: the thread table may be taken with no run-queue lock held, and a
 run queue is a leaf. Nothing takes the table while holding a queue, which is
