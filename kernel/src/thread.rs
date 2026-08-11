@@ -24,6 +24,11 @@ use crate::vmspace::VmSpace;
 pub enum ThreadState {
     Ready,
     Running,
+    /// Waiting for something to call `sched::unpark`. Distinct from `Ready`
+    /// because a blocked thread must be in no run queue: `Ready` means "may be
+    /// dispatched", and dispatching a thread waiting on an I/O completion runs
+    /// it at a suspension point it has not returned from.
+    Blocked,
     Exited,
 }
 
@@ -53,6 +58,12 @@ pub struct Thread {
     pub kernel_stack_top: u64,
     pub state: ThreadState,
     pub priority: Priority,
+    /// Whether this thread is parked, and whether a wakeup beat it there.
+    ///
+    /// Mutated only under the scheduler lock, by `sched::park` and
+    /// `sched::unpark`. It is *not* derivable from `state`: the window it
+    /// closes is precisely the one in which `state` has not been updated yet.
+    pub park: qunix_sched::ParkState,
     /// The address space this thread entered ring 3 on, for a user thread.
     ///
     /// Owned here because `syscall::enter_user` never returns: the frame that
@@ -108,6 +119,7 @@ impl Thread {
             kernel_stack_top: stack_top,
             state: ThreadState::Ready,
             priority,
+            park: qunix_sched::ParkState::default(),
             // Filled in by `sched::adopt_address_space` if this thread turns
             // out to be a user thread; a kernel thread never has one.
             address_space: None,
@@ -126,6 +138,9 @@ impl Thread {
             kernel_stack_top: 0,
             state: ThreadState::Running,
             priority: Priority::Idle,
+            // An idle thread that could not record a park would sleep through
+            // its own wakeups the first time anything in the boot path awaits.
+            park: qunix_sched::ParkState::default(),
             address_space: None,
         }
     }
