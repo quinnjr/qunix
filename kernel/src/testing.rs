@@ -74,6 +74,15 @@ struct MachineState {
     /// It adopted the boot context, so it is in the idle band, and
     /// `RunQueue::runnable_len` excludes that band from what a thief may take.
     cpu_id: u32,
+    /// Wake IPIs that could not be sent for want of a LAPIC base.
+    ///
+    /// Must not move during a test. Every processor has its LAPIC up by the
+    /// time the suite runs, so a drop here means a wake was posted from a
+    /// processor that could not advertise it -- and the thread it was meant for
+    /// is left waiting on a timer tick that may not be coming. Counted rather
+    /// than asserted at the source because `unpark` runs from interrupt
+    /// context, where a panic fires again on every subsequent tick.
+    wake_ipis_dropped: u64,
     /// Processes killed by a ring-3 fault.
     ///
     /// A test that expects one says so with [`expect_process_kills`]; every
@@ -155,22 +164,29 @@ fn assert_no_parked_thread_is_queued(name: &str) {
             // rather than waited for -- this runs after every test, so a real
             // violation will not be missed by all of them.
             let Some(queue) = queue.try_lock() else { continue };
-            if !queue.contains(id) {
-                continue;
+            // Both facts sampled while this queue is held, and the parked one
+            // re-read *first* so the pair is as close to simultaneous as this
+            // check can make it.
+            //
+            // A single re-check covers only one direction. The earlier version
+            // re-read `is_parked` after finding the id queued, which handles
+            // "queued, then legitimately unparked" but not its mirror: unparked
+            // and pushed, then popped, dispatched, and parked again by the time
+            // of the re-read. That reports a violation on a correct run, and a
+            // harness that fails honest runs is worse than one that misses a
+            // violation -- CLAUDE.md's ratchet section is about exactly that.
+            //
+            // Note the lock order: `is_parked` takes SCHED while this queue
+            // guard is alive, which is the reverse of the order the scheduler
+            // documents. It is safe only because nothing else does so, and
+            // `publish_handoff`'s enforcement covers the push itself, so this
+            // scan is a backstop rather than the primary guard.
+            if crate::sched::is_parked(id) && queue.contains(id) {
+                panic!(
+                    "after {name}: parked {id:?} is queued on cpu {cpu}; it can be dispatched, \
+                     and would resume at a suspension point it has not returned from"
+                );
             }
-            // Re-checked before failing. The parked set and the queue scan are
-            // two separate instants, and `unpark` legitimately clears `parked`
-            // *and* pushes the thread between them -- so finding a queued id
-            // from the earlier snapshot proves nothing on its own. Asserting
-            // there would be a harness that fails honest runs, which is worse
-            // than one that misses a violation: CLAUDE.md's ratchet section is
-            // about exactly this, and the answer there was to fix the test
-            // rather than widen the tolerance.
-            assert!(
-                !crate::sched::is_parked(id),
-                "after {name}: parked {id:?} is queued on cpu {cpu}; it can be dispatched, and \
-                 would resume at a suspension point it has not returned from"
-            );
         }
     }
 }
@@ -188,6 +204,7 @@ impl MachineState {
             preemption_enabled: crate::sched::preemption_enabled(),
             root_frame,
             cpu_id: qunix_hal_x86_64::percpu::cpu_id(),
+            wake_ipis_dropped: crate::sched::wake_ipi_dropped_count(),
             process_kills: crate::syscall::process_kills(),
         }
     }
@@ -223,6 +240,12 @@ impl MachineState {
              case every later gs:-relative read names the wrong block, or an idle-band thread \
              was stolen, in which case two cpus are on one stack",
             before.cpu_id, self.cpu_id
+        );
+        assert_eq!(
+            self.wake_ipis_dropped, before.wake_ipis_dropped,
+            "{name} dropped {} wake IPI(s): a wake was posted from a processor with no LAPIC \
+             base, so the thread it named is waiting on a tick that may never come",
+            self.wake_ipis_dropped - before.wake_ipis_dropped
         );
         assert_eq!(
             self.process_kills,

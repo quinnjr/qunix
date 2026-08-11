@@ -13,6 +13,15 @@ path = "src/main.rs"
 # cargo's generated harness entry point, so that entry point must exist.
 test = true
 
+[features]
+# Enforces scheduler invariants that cost a lock on the context-switch path:
+# `publish_handoff` refuses to queue a parked thread. Correctness-critical to
+# check and too expensive to leave on, because it adds a serialisation point per
+# switch that the shipped kernel does not have -- so the concurrency tests would
+# be measuring a different scheduler. `cargo xtask test` runs the suite both
+# with and without it.
+sched-invariants = []
+
 [dependencies]
 limine.workspace = true
 qunix-abi.workspace = true

@@ -17,7 +17,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 
 pub mod park;
-pub use park::{ParkOutcome, ParkState, WakeOutcome};
+pub use park::{ExitDisposition, ParkOutcome, ParkState, WakeOutcome, exit_disposition};
 
 /// Opaque handle to something schedulable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
