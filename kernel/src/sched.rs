@@ -499,6 +499,19 @@ pub fn park() {
         // once `hlt` has been entered, which is what wakes it.
         // SAFETY: no memory is touched and no stack slot is used.
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+
+        // Re-checked here, *before* looping back to park again. Without this
+        // the loop's next iteration calls `park` on a thread that has just been
+        // woken: `wake` cleared `parked` without setting `pending`, so the park
+        // succeeds, the thread blocks again, and the future is never re-polled.
+        // The wake is consumed and its effect discarded -- a hang whose cause
+        // is one missing check, and the exact bug the first `sleep_ticks` test
+        // found. The post-`schedule` check above cannot cover it: this path
+        // never reaches `schedule`, because there was nothing to switch to.
+        if !is_parked(me) {
+            qunix_hal_x86_64::Irq::restore(irq);
+            return;
+        }
     }
 }
 

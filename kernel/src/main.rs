@@ -42,7 +42,12 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // A bus-locked RMW, deliberately: the ~20-40 cycles it costs once per 10 ms
     // are unmeasurable, and a per-CPU timer on more than one core makes a
     // load/store pair lose counts.
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Before the EOI and before `preempt`. A sleeper whose deadline has passed
+    // must be runnable *when* the scheduler runs, not one tick later: expiring
+    // after `preempt` would let this processor pick its next thread while the
+    // one this tick released was still parked.
+    crate::task::expire_timers(now);
     // EOI before any switch. Switching first would leave the LAPIC waiting for
     // an EOI that only arrives when this thread runs again, so the CPU would
     // take no further timer interrupts until then -- which, if the thread is

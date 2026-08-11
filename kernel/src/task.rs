@@ -112,6 +112,194 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// How many sleeps can be outstanding at once.
+///
+/// A fixed table rather than a list, because the timer interrupt walks it:
+/// allocating in `expire_timers` would put the heap allocator on the interrupt
+/// path, and a linked list would need a node from somewhere.
+const CAPACITY: usize = 64;
+
+/// One outstanding sleep.
+///
+/// `deadline` is an absolute tick count, not a remaining count. A remaining
+/// count would have to be decremented by the handler for every entry on every
+/// tick, and a tick missed while interrupts were masked -- which happens on
+/// every context switch -- would silently lengthen every sleep in the table.
+#[derive(Clone, Copy)]
+struct Timer {
+    deadline: u64,
+    thread: ThreadId,
+}
+
+/// `IrqSpinLock`, not `SpinLock`: this is taken from the timer interrupt, so a
+/// plain spinlock would let a tick land on a processor that already holds it
+/// and spin against itself forever.
+static TIMERS: qunix_sync::IrqSpinLock<[Option<Timer>; CAPACITY], qunix_hal_x86_64::Irq> =
+    qunix_sync::IrqSpinLock::new([None; CAPACITY]);
+
+/// Why a sleep could not be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepError {
+    /// Every timer slot is occupied. Refused rather than dropped: a sleep that
+    /// silently failed to register is `Pending` forever with nothing scheduled
+    /// to wake it, which is a hung thread rather than a slow one.
+    Full,
+}
+
+/// Wakes every thread whose deadline has passed. Called from the timer handler.
+///
+/// Takes `now` rather than reading `TICKS` itself, so the handler's increment
+/// and this comparison cannot disagree about which tick this is.
+pub fn expire_timers(now: u64) {
+    let mut woken: [Option<ThreadId>; CAPACITY] = [None; CAPACITY];
+    let mut count = 0;
+    {
+        let mut timers = TIMERS.lock();
+        for slot in timers.iter_mut() {
+            // `>=`, not `==`. A tick can be missed -- interrupts are masked
+            // across every context switch -- and an equality test would step
+            // straight over the deadline and leave the thread parked forever.
+            if slot.is_some_and(|t| now >= t.deadline) {
+                woken[count] = slot.take().map(|t| t.thread);
+                count += 1;
+            }
+        }
+    }
+    // Unparked after the timer lock is released. `unpark` takes the scheduler
+    // lock and may take a run queue; holding TIMERS across that would order
+    // three locks in a way nothing else in the kernel does, from an interrupt.
+    for id in woken.iter().flatten() {
+        crate::sched::unpark(*id);
+    }
+}
+
+/// A future that completes once `deadline` has passed.
+struct Sleep {
+    deadline: u64,
+    /// Whether this sleeper holds a slot in [`TIMERS`].
+    ///
+    /// A deadline already in the past takes no slot, so this is not simply
+    /// "always true"; it is also what tells `drop` whether there is anything to
+    /// release.
+    registered: bool,
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: core::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if crate::TICKS.load(core::sync::atomic::Ordering::SeqCst) >= self.deadline {
+            return Poll::Ready(());
+        }
+        // Nothing is registered here. The slot was taken by `try_sleep_ticks`,
+        // before this future existed, which is why that is the fallible entry
+        // point and `poll` is infallible. Registering on first poll instead
+        // would mean a `poll` that can fail with no way to report it, and a
+        // re-poll -- which a spurious wake makes routine -- would take a second
+        // slot for one sleeper and leak the first.
+        //
+        // The waker is deliberately unused: `expire_timers` unparks the thread
+        // by id, which is the same thing this future's waker would do, and
+        // storing a waker per timer would put a `Waker` clone on the interrupt
+        // path for no gain. That is only correct because the thread *is* the
+        // task -- see the module docs.
+        Poll::Pending
+    }
+}
+
+impl Drop for Sleep {
+    /// Releases the slot if the sleeper is dropped before it fires.
+    ///
+    /// Reachable whenever an `await` is abandoned -- a cancelled read, a
+    /// `select` another arm won. Without this the slot is held by a thread that
+    /// is no longer waiting, and after `CAPACITY` cancellations every sleep in
+    /// the kernel is refused.
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let me = crate::sched::current_id();
+        let mut timers = TIMERS.lock();
+        for slot in timers.iter_mut() {
+            if slot.is_some_and(|t| t.thread == me && t.deadline == self.deadline) {
+                *slot = None;
+                return;
+            }
+        }
+    }
+}
+
+/// Sleeps for `ticks` timer ticks, or refuses if no timer slot is free.
+pub fn try_sleep_ticks(ticks: u64) -> Result<impl Future<Output = ()>, SleepError> {
+    let now = crate::TICKS.load(core::sync::atomic::Ordering::SeqCst);
+    let deadline = now.saturating_add(ticks);
+    // A deadline already reached takes no slot at all. Registering one would
+    // park the caller until the next tick for a sleep of zero, and on a
+    // processor whose timer is masked that is forever.
+    if deadline <= now {
+        return Ok(Sleep { deadline, registered: false });
+    }
+    let me = crate::sched::current_id();
+    let mut timers = TIMERS.lock();
+    let slot = timers.iter_mut().find(|s| s.is_none()).ok_or(SleepError::Full)?;
+    *slot = Some(Timer { deadline, thread: me });
+    Ok(Sleep { deadline, registered: true })
+}
+
+/// Sleeps for `ticks` timer ticks.
+///
+/// Panics if the timer table is full. Callers that can do something better than
+/// die should use [`try_sleep_ticks`]; this exists because most cannot, and a
+/// silent non-sleep is worse than a named panic.
+pub fn sleep_ticks(ticks: u64) -> impl Future<Output = ()> {
+    match try_sleep_ticks(ticks) {
+        Ok(sleep) => sleep,
+        Err(SleepError::Full) => panic!("no free timer slot for a {ticks}-tick sleep"),
+    }
+}
+
+/// Occupies every free timer slot. Returns how many it newly took.
+///
+/// The entries name `NO_THREAD`, an id `allocate_id` can never issue, so one
+/// expired by mistake is ignored by `unpark` rather than waking a real thread.
+#[cfg(test)]
+pub fn fill_timer_table_for_test() -> usize {
+    let mut timers = TIMERS.lock();
+    let mut taken = 0;
+    for slot in timers.iter_mut().filter(|s| s.is_none()) {
+        *slot = Some(Timer {
+            deadline: u64::MAX,
+            thread: ThreadId(qunix_hal_x86_64::percpu::NO_THREAD),
+        });
+        taken += 1;
+    }
+    taken
+}
+
+/// Registers a timer with an arbitrary deadline, naming no live thread.
+///
+/// Exists so `expire_timers` can be tested directly. Every other route into the
+/// table goes through `try_sleep_ticks`, which refuses a deadline that has
+/// already passed -- so the case the `>=` comparison exists for is unreachable
+/// from the public API, and mutating it to `==` failed no test.
+#[cfg(test)]
+pub fn insert_timer_for_test(deadline: u64) {
+    let mut timers = TIMERS.lock();
+    let slot = timers.iter_mut().find(|s| s.is_none()).expect("the timer table was full");
+    *slot = Some(Timer { deadline, thread: ThreadId(qunix_hal_x86_64::percpu::NO_THREAD) });
+}
+
+/// Empties the timer table.
+#[cfg(test)]
+pub fn clear_timer_table_for_test() {
+    TIMERS.lock()[..].fill(None);
+}
+
+#[cfg(test)]
+pub fn free_timer_slots_for_test() -> usize {
+    TIMERS.lock().iter().filter(|s| s.is_none()).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +449,121 @@ mod tests {
             FLAG_WAKER.load(Ordering::Acquire),
             me.0,
             "the future was polled with a waker naming some other thread"
+        );
+    }
+
+    #[test_case]
+    fn a_sleep_is_woken_by_the_timer_interrupt() {
+        // The milestone's sharpest risk, tested directly: nothing but the timer
+        // handler makes this thread runnable again. If a `Waker` cannot be
+        // driven from interrupt context, this is where it shows.
+        let start = crate::TICKS.load(Ordering::SeqCst);
+        block_on(sleep_ticks(3));
+        let elapsed = crate::TICKS.load(Ordering::SeqCst) - start;
+        assert!(elapsed >= 3, "slept {elapsed} ticks, asked for 3");
+        // Bounded above as well. A sleep that returned only when something
+        // *else* happened to wake the thread would satisfy the lower bound on a
+        // busy machine and say nothing about the timer path.
+        assert!(elapsed < 100, "slept {elapsed} ticks for a 3-tick sleep");
+    }
+
+    #[test_case]
+    fn a_sleep_of_zero_ticks_does_not_park() {
+        // A deadline already in the past must be `Ready` on the first poll. If
+        // it registered instead, the thread would park until the *next* tick
+        // for a sleep it was told took no time -- and on a processor whose
+        // timer is masked, forever.
+        let free_before = free_timer_slots_for_test();
+        let start = crate::TICKS.load(Ordering::SeqCst);
+        block_on(sleep_ticks(0));
+        assert_eq!(crate::TICKS.load(Ordering::SeqCst) - start, 0, "a zero-tick sleep waited");
+
+        // Asserted while the future is still alive. Checking after it is
+        // dropped proves nothing: `Sleep::drop` releases the slot, so a
+        // zero-tick sleep that wrongly took one would look identical.
+        let sleep = try_sleep_ticks(0).expect("a zero-tick sleep was refused");
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "a zero-tick sleep took a timer slot; a deadline already reached needs no timer"
+        );
+        drop(sleep);
+    }
+
+    #[test_case]
+    fn a_full_timer_table_refuses_rather_than_returning_a_sleep_that_never_fires() {
+        // The negative direction, and the one that matters: a registration that
+        // silently failed produces a future that is `Pending` forever with
+        // nothing scheduled to wake it. Refusing is the only outcome a caller
+        // can act on.
+        //
+        // The table is filled directly rather than by spawning CAPACITY
+        // threads, because the assertion is about the registration path, not
+        // about the scheduler's ability to hold that many threads.
+        fill_timer_table_for_test();
+        assert_eq!(free_timer_slots_for_test(), 0, "the table did not fill");
+        assert!(
+            matches!(try_sleep_ticks(1), Err(SleepError::Full)),
+            "a full timer table accepted another sleeper"
+        );
+        clear_timer_table_for_test();
+        assert!(try_sleep_ticks(1).is_ok(), "the table stayed full after being cleared");
+    }
+
+    #[test_case]
+    fn an_expired_timer_frees_its_slot() {
+        // Otherwise the table fills permanently after CAPACITY sleeps and every
+        // later sleep in the kernel is refused -- long after the code that
+        // filled it ran.
+        let free_before = free_timer_slots_for_test();
+        block_on(sleep_ticks(1));
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "a completed sleep left its slot occupied"
+        );
+    }
+
+    #[test_case]
+    fn a_deadline_already_passed_is_expired_rather_than_stepped_over() {
+        // `expire_timers` compares `now >= deadline`, and the reason is a tick
+        // it never saw: interrupts are masked across every context switch, and
+        // `try_sleep_ticks` can be preempted between reading `TICKS` and
+        // inserting its slot. An `==` test steps straight over the deadline and
+        // leaves the sleeper parked forever.
+        //
+        // Driven directly rather than through a sleep, because every public
+        // route into the table refuses a deadline that has already passed -- so
+        // the case the comparison exists for is unreachable from the API, and
+        // mutating `>=` to `==` failed no test at all.
+        //
+        // The entry names `NO_THREAD`, an id `allocate_id` can never issue, so
+        // expiring it wakes nothing.
+        let free_before = free_timer_slots_for_test();
+        let now = crate::TICKS.load(Ordering::SeqCst);
+        insert_timer_for_test(now);
+        assert_eq!(free_timer_slots_for_test(), free_before - 1, "the timer was not registered");
+
+        // A *later* tick than the deadline, never the exact one.
+        expire_timers(now + 5);
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "a deadline that had already passed was stepped over; the sleeper would wait forever"
+        );
+    }
+
+    #[test_case]
+    fn abandoning_a_sleep_before_it_fires_frees_its_slot() {
+        // Cancellation is not hypothetical: T4's read futures are dropped
+        // whenever a request is abandoned. A slot leaked per cancellation fills
+        // the table permanently, and every later sleep is refused.
+        let free_before = free_timer_slots_for_test();
+        drop(try_sleep_ticks(1_000_000).expect("the timer table was full"));
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "an abandoned sleep left its slot occupied"
         );
     }
 
