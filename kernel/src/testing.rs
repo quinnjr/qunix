@@ -83,6 +83,15 @@ struct MachineState {
     /// than asserted at the source because `unpark` runs from interrupt
     /// context, where a panic fires again on every subsequent tick.
     wake_ipis_dropped: u64,
+    /// Completions the block driver refused, or used indices it would not
+    /// follow.
+    ///
+    /// Must not move. Every one strands the thread that submitted the request
+    /// -- it is never marked done, so it parks forever -- and leaks its
+    /// descriptor chain, because the chain is only freed on the completion
+    /// path. Both are silent, and the second surfaces much later as a
+    /// `QueueFull` in code that has nothing to do with the cause.
+    device_faults: u64,
     /// Processes killed by a ring-3 fault.
     ///
     /// A test that expects one says so with [`expect_process_kills`]; every
@@ -205,6 +214,7 @@ impl MachineState {
             root_frame,
             cpu_id: qunix_hal_x86_64::percpu::cpu_id(),
             wake_ipis_dropped: crate::sched::wake_ipi_dropped_count(),
+            device_faults: crate::block::device_faults(),
             process_kills: crate::syscall::process_kills(),
         }
     }
@@ -246,6 +256,12 @@ impl MachineState {
             "{name} dropped {} wake IPI(s): a wake was posted from a processor with no LAPIC \
              base, so the thread it named is waiting on a tick that may never come",
             self.wake_ipis_dropped - before.wake_ipis_dropped
+        );
+        assert_eq!(
+            self.device_faults, before.device_faults,
+            "{name} caused {} block completion(s) to be refused; each one strands the thread \
+             that submitted it and leaks its descriptor chain",
+            self.device_faults - before.device_faults
         );
         assert_eq!(
             self.process_kills,

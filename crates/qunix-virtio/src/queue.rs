@@ -239,17 +239,23 @@ impl SplitQueue {
         out
     }
 
-    /// Copies the device's used ring in from DMA memory.
+    /// Copies the device's used ring in from an already-taken snapshot.
     ///
-    /// A copy rather than a borrow: the device may write it at any moment, so
-    /// the driver decides once what it saw and works from that. Reading the
-    /// same field twice and getting two answers is how a completion gets
-    /// processed against a stale id.
-    pub fn ingest_used(&mut self, bytes: &[u8]) -> Option<u16> {
+    /// Takes `idx` as a parameter rather than reading it out of `bytes`,
+    /// because the *order* of those two reads is the whole protocol: the driver
+    /// must load `used.idx`, acquire-fence, and only then read the entries it
+    /// gates. Deriving both from one slice leaves the compiler free to schedule
+    /// the entry loads first, and a stale entry whose head has since been
+    /// recycled passes every liveness check the driver has.
+    ///
+    /// The caller is also responsible for reading that memory *volatilely*. A
+    /// `&[u8]` over a region the device is writing tells the compiler the bytes
+    /// do not change for the reference's lifetime, which is not true and is not
+    /// a promise the driver can make.
+    pub fn ingest_used(&mut self, bytes: &[u8], idx: u16) -> Option<u16> {
         if bytes.len() < RING_HEADER + 8 * self.size as usize {
             return None;
         }
-        let idx = u16::from_le_bytes([bytes[2], bytes[3]]);
         for slot in 0..self.size as usize {
             let base = RING_HEADER + slot * 8;
             self.used_ring[slot] = UsedElem {
@@ -420,8 +426,8 @@ mod tests {
         // silently leaves stale completions in the mirror.
         let mut q = SplitQueue::new(QUEUE_SIZE);
         let short = alloc::vec![0u8; RING_HEADER + 8 * QUEUE_SIZE as usize - 1];
-        assert_eq!(q.ingest_used(&short), None, "a short used ring was ingested");
+        assert_eq!(q.ingest_used(&short, 0), None, "a short used ring was ingested");
         let exact = alloc::vec![0u8; RING_HEADER + 8 * QUEUE_SIZE as usize];
-        assert_eq!(q.ingest_used(&exact), Some(0), "an exactly-sized used ring was refused");
+        assert_eq!(q.ingest_used(&exact, 7), Some(7), "an exactly-sized used ring was refused");
     }
 }

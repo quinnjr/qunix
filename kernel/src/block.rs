@@ -63,6 +63,13 @@ pub enum BlockError {
     MsixOutsideBar,
     /// The device reported a failure for this request.
     Device(BlkStatus),
+    /// The request was still outstanding at its deadline.
+    ///
+    /// The device never completed it: it may not have fetched the descriptor,
+    /// the completion interrupt may not have been delivered, or the completion
+    /// may have been refused. All of those are otherwise a thread parked
+    /// forever, which reports nothing.
+    Timeout,
 }
 
 /// One in-flight request.
@@ -109,6 +116,30 @@ static COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn completions() -> u64 {
     COMPLETIONS.load(Ordering::Acquire)
+}
+
+/// Completions the driver refused, or used indices it would not follow.
+///
+/// Every one of these strands a thread and leaks a descriptor chain, so the
+/// harness requires it not to move. A device that misbehaves this way is not
+/// something the driver can recover from silently, and "the machine hangs" is
+/// not a diagnosis.
+static DEVICE_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn device_faults() -> u64 {
+    DEVICE_FAULTS.load(Ordering::Acquire)
+}
+
+/// Polls that found a request still outstanding — i.e. that parked.
+///
+/// Exposed so a test can require the *asynchronous* path to have run. A
+/// completion that lands before the first poll makes the future `Ready`
+/// immediately, and the park/unpark path this milestone exists for never
+/// executes — while every assertion about the data still holds.
+static PENDING_POLLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn pending_polls() -> u64 {
+    PENDING_POLLS.load(Ordering::Acquire)
 }
 
 /// Bytes of metadata per slot: a 16-byte header and a 1-byte status.
@@ -230,7 +261,7 @@ unsafe fn install_msix(transport: &mut Transport) -> Result<(), BlockError> {
 /// Reads `buf.len()` bytes starting at sector `lba`.
 pub async fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
     let head = submit(lba, buf.len(), None)?;
-    let status = Completion { head }.await;
+    let status = Completion { head, deadline: deadline_for(head)? }.await;
     let result = finish(head, status, Some(buf));
     result
 }
@@ -238,8 +269,27 @@ pub async fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
 /// Writes `buf` starting at sector `lba`.
 pub async fn write_at(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let head = submit(lba, buf.len(), Some(buf))?;
-    let status = Completion { head }.await;
+    let status = Completion { head, deadline: deadline_for(head)? }.await;
     finish(head, status, None)
+}
+
+/// A timer that fires if the request is still outstanding at the deadline.
+///
+/// The chain is released if no timer slot is free, so a request that cannot be
+/// bounded is refused rather than submitted unbounded — an unbounded request is
+/// the hang this whole mechanism exists to prevent.
+fn deadline_for(head: u16) -> Result<crate::task::Sleep, BlockError> {
+    match crate::task::try_sleep_ticks(REQUEST_TIMEOUT_TICKS) {
+        Ok(sleep) => Ok(sleep),
+        Err(_) => {
+            let mut guard = DEVICE.lock();
+            if let Some(blk) = guard.as_mut() {
+                blk.queue.free_chain(head);
+                blk.slots[head as usize] = None;
+            }
+            Err(BlockError::QueueFull)
+        }
+    }
 }
 
 /// Validates, builds and publishes a request chain. Returns its head.
@@ -341,25 +391,66 @@ fn write_rings(blk: &Blk) {
     core::sync::atomic::fence(Ordering::SeqCst);
 }
 
-/// A request's completion.
+/// How long a request may be outstanding before the driver gives up on it.
+///
+/// At roughly 10 ms a tick this is about five seconds. A virtio-blk read that
+/// has not completed by then is not slow, it is lost — and the alternative is
+/// the failure this kernel is worst at reporting: a thread parked forever on a
+/// completion that cannot arrive, surfacing as a harness timeout that names no
+/// test and no cause.
+const REQUEST_TIMEOUT_TICKS: u64 = 500;
+
+/// The status byte value used to report a request the device never completed.
+///
+/// Distinct from every value the specification defines, so it decodes as
+/// `BlkStatus::Unknown` rather than colliding with a real verdict.
+const STATUS_TIMED_OUT: u8 = 0xfe;
+
+/// A request's completion, or the deadline by which it must arrive.
+///
+/// The timer half is not decoration. Nothing else bounds the wait: the device
+/// may never fetch the descriptor, the interrupt may be masked or misrouted, a
+/// completion may be refused — and every one of those leaves the thread parked
+/// with nothing able to wake it. Reusing T3's timer wheel means the deadline
+/// *also* unparks the thread, so the future is polled again and can report the
+/// failure rather than the machine simply stopping.
 struct Completion {
     head: u16,
+    deadline: crate::task::Sleep,
 }
 
 impl Future for Completion {
     type Output = u8;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u8> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u8> {
+        // The device first: a completion that arrives in the same tick as the
+        // deadline is a completion, not a timeout.
+        let this = unsafe { self.get_unchecked_mut() };
+        if let Poll::Ready(status) = Self::poll_device(this.head) {
+            return Poll::Ready(status);
+        }
+        if Pin::new(&mut this.deadline).poll(cx).is_ready() {
+            return Poll::Ready(STATUS_TIMED_OUT);
+        }
+        Poll::Pending
+    }
+}
+
+impl Completion {
+    fn poll_device(head: u16) -> Poll<u8> {
         let guard = DEVICE.lock();
         let Some(blk) = guard.as_ref() else { return Poll::Ready(0xff) };
-        match blk.slots[self.head as usize] {
+        match blk.slots[head as usize] {
             Some(slot) if slot.done => Poll::Ready(slot.status),
             // The waker is deliberately unused: `handle_completion` unparks the
             // thread recorded in the slot, which is the same thread this future
             // is being polled on and the same thing the waker would do. That is
             // only true because the thread *is* the task -- see `task`'s module
             // documentation.
-            _ => Poll::Pending,
+            _ => {
+                PENDING_POLLS.fetch_add(1, Ordering::AcqRel);
+                Poll::Pending
+            }
         }
     }
 }
@@ -376,6 +467,9 @@ fn finish(head: u16, status: u8, into: Option<&mut [u8]>) -> Result<(), BlockErr
     }
     blk.queue.free_chain(head);
     blk.slots[head as usize] = None;
+    if status == STATUS_TIMED_OUT {
+        return Err(BlockError::Timeout);
+    }
     match status_from_byte(status) {
         BlkStatus::Ok => Ok(()),
         other => Err(BlockError::Device(other)),
@@ -393,17 +487,53 @@ pub fn handle_completion() {
         let mut guard = DEVICE.lock();
         let Some(blk) = guard.as_mut() else { return };
         let layout = ring_layout(QUEUE_SIZE);
-        let used_len = ring_layout(QUEUE_SIZE).bytes - layout.used;
+        let used_len = layout.bytes - layout.used;
+        let used_base = blk.ring_virt + layout.used as u64;
+
+        // The device writes this memory while the driver reads it, so both the
+        // ordering and the aliasing matter.
+        //
+        // `used.idx` is loaded first and *volatilely*, then an acquire fence,
+        // then the entries. That order is the protocol: the index is what makes
+        // the entries below it valid. Reading them from one `&[u8]` -- which is
+        // what this did -- both tells the compiler the bytes cannot change,
+        // which is false, and leaves it free to schedule the entry loads first.
+        // A stale entry whose head has since been recycled by `finish` passes
+        // `take_used`'s liveness check, and the driver then reads a status byte
+        // the device has not written and copies a bounce buffer it is still
+        // filling. Wrong data, reported as success.
         // SAFETY: the used ring is inside the frame this module allocated and
-        // told the device about.
-        let bytes = unsafe {
-            core::slice::from_raw_parts((blk.ring_virt + layout.used as u64) as *const u8, used_len)
-        };
-        let Some(device_idx) = blk.queue.ingest_used(bytes) else { return };
+        // told the device about; `used_len` is what `ring_layout` reserved.
+        let device_idx = unsafe { core::ptr::read_volatile((used_base + 2) as *const u16) };
+        core::sync::atomic::fence(Ordering::Acquire);
+
+        // Copied out volatilely rather than borrowed, for the same reason.
+        // Header, entries, and the two-byte event-suppression footer that
+        // `ring_layout` reserves -- sized from the layout rather than from a
+        // remembered sum, which is what got this wrong first time.
+        let mut snapshot = [0u8; 4 + 8 * QUEUE_SIZE as usize + 2];
+        for (i, byte) in snapshot.iter_mut().enumerate().take(used_len) {
+            // SAFETY: inside the used ring established above.
+            *byte = unsafe { core::ptr::read_volatile((used_base + i as u64) as *const u8) };
+        }
+        if blk.queue.ingest_used(&snapshot[..used_len], device_idx).is_none() {
+            return;
+        }
+
+        // The device chose `device_idx`, so the distance it claims to have
+        // advanced is device-supplied too. More than the ring holds means the
+        // device is lying: consuming that many entries would walk the mirror
+        // repeatedly, and every pass can mark a *live* request done from a
+        // status byte the device never wrote.
+        let pending = device_idx.wrapping_sub(blk.last_used);
+        if pending > QUEUE_SIZE {
+            DEVICE_FAULTS.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
         // Consumed in order from the last index seen. Reading only the newest
         // entry would drop every completion that arrived while this handler was
         // between the read and the lock.
-        while blk.last_used != device_idx {
+        for _ in 0..pending {
             let slot = blk.last_used % QUEUE_SIZE;
             if let Some((head, _len)) = blk.queue.take_used(slot) {
                 let status_virt =
@@ -417,6 +547,14 @@ pub fn handle_completion() {
                     count += 1;
                 }
                 COMPLETIONS.fetch_add(1, Ordering::AcqRel);
+            } else {
+                // A completion the driver refused: an id past the ring, or one
+                // naming a descriptor that was never submitted. Counted rather
+                // than dropped in silence, because dropping it strands the
+                // thread that submitted the chain -- it is never marked done,
+                // so it parks forever -- and leaks the chain, since `free_chain`
+                // only runs from `finish`. Both are invisible without this.
+                DEVICE_FAULTS.fetch_add(1, Ordering::AcqRel);
             }
             blk.last_used = blk.last_used.wrapping_add(1);
         }
@@ -469,24 +607,70 @@ mod tests {
         // exists to avoid.
         ready();
         let before = completions();
+        let polls_before = pending_polls();
         let mut buf = [0u8; SECTOR_BYTES];
         block_on(read_at(3, &mut buf)).expect("the read failed");
+        // Exactly one, not "more than before". A handler that counted twice per
+        // entry, or re-drained an already-consumed slot, satisfies a `>`.
+        assert_eq!(
+            completions(),
+            before + 1,
+            "the handler took {} used-ring entries for one request",
+            completions() - before
+        );
+        // And the request must actually have *parked*. If the completion lands
+        // before the first poll the future is Ready immediately, the
+        // park/unpark path this milestone exists for never runs, and every
+        // other assertion here still holds -- a green result would then say
+        // only that the device is fast on this host, which CLAUDE.md rules out
+        // as coverage.
         assert!(
-            completions() > before,
-            "the request completed without the interrupt handler taking it from the used ring"
+            pending_polls() > polls_before,
+            "the request was already complete at its first poll; the asynchronous path did \
+             not run"
         );
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 3);
     }
 
+    /// A sector no read test touches, reserved for the write test.
+    ///
+    /// Above every LBA the read tests use, so a write cannot make one of them
+    /// pass or fail for the wrong reason.
+    const SCRATCH_SECTOR: u64 = 11;
+
     #[test_case]
     fn a_write_is_visible_to_a_later_read() {
+        // The payload is derived from what is on the sector *now*, and that is
+        // the whole test.
+        //
+        // The disk persists across boots and across runs -- deliberately, so a
+        // write survives to be read back -- and the previous version of this
+        // test wrote a fixed payload. From the second boot onward, including
+        // the second boot of a single `cargo xtask test`, the sector already
+        // held exactly that payload before the write. `write_at` could have
+        // been deleted, or have written the wrong sector, or have flipped
+        // REQUEST_OUT to REQUEST_IN, and the read-back would still have
+        // matched. The only test of the write path could not fail.
+        //
+        // Inverting the current contents makes the payload different on every
+        // run by construction.
         ready();
-        let mut out = [0xa5u8; SECTOR_BYTES];
-        out[0..8].copy_from_slice(&0xdead_beefu64.to_le_bytes());
-        block_on(write_at(11, &out)).expect("the write failed");
+        let mut prior = [0u8; SECTOR_BYTES];
+        block_on(read_at(SCRATCH_SECTOR, &mut prior)).expect("the prior read failed");
+        let mut out = [0u8; SECTOR_BYTES];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = !prior[i];
+        }
+        assert_ne!(
+            out, prior,
+            "the payload equals what is already on the sector; this test cannot fail"
+        );
+
+        block_on(write_at(SCRATCH_SECTOR, &out)).expect("the write failed");
         let mut back = [0u8; SECTOR_BYTES];
-        block_on(read_at(11, &mut back)).expect("the read failed");
+        block_on(read_at(SCRATCH_SECTOR, &mut back)).expect("the read failed");
         assert_eq!(back, out, "what came back is not what went out");
+        assert_ne!(back, prior, "the sector still holds what it held before the write");
     }
 
     #[test_case]
