@@ -277,6 +277,8 @@ fn main() -> Result<()> {
                 "--target",
                 "x86_64-unknown-linux-musl",
                 "-p",
+                "qunix-virtio",
+                "-p",
                 "qunix-sync",
                 "-p",
                 "qunix-mm",
@@ -289,7 +291,7 @@ fn main() -> Result<()> {
                 "-p",
                 "xtask",
                 "--features",
-                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std",
+                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std,qunix-virtio/std",
             ]);
             if release {
                 host.arg("--release");
