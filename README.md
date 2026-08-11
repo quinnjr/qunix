@@ -116,3 +116,12 @@ These are deliberate and scoped to later milestones, not oversights:
 Permissive (`MIT OR Apache-2.0`) for qunix's own code; `GPL-2.0` for the Linux
 compatibility layer when it lands. The split is enforced at build time — see
 [`LICENSING.md`](LICENSING.md).
+
+Outside those GPL crates, qunix's Linux-compatible interfaces are **clean-roomed
+from the specification** — published UAPI headers, `Documentation/`, on-disk
+formats, `man` pages and the standards themselves — and not transcribed from
+Linux's implementation. The distinction is the provenance of the knowledge, not
+the resemblance of the result: two implementations written to one specification
+look alike, and a format that must interoperate byte-for-byte has only one
+correct shape. Where an interface genuinely cannot be built without reading the
+in-kernel source, it belongs in the `GPL-2.0` zone instead.

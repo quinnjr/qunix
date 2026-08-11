@@ -49,6 +49,38 @@ run) is a different thing from the *driver API* (`qunix-linux-compat`,
 reimplementing in-kernel interfaces). Only the latter is derivative in the sense
 that matters here.
 
+## Clean-room rule for the permissive zone
+
+Outside the copyleft crates, every Linux-compatible interface is written from
+the **specification**, never transcribed from Linux's implementation.
+
+Permitted sources: published UAPI headers, `Documentation/`, on-disk and
+on-wire format descriptions, `man` pages, and the standards an interface
+implements. Not permitted: Linux's `.c` files, its internal headers, or a
+transcription of either — including pasting kernel source into a language model
+and keeping what comes back, and including reproducing from memory an algorithm
+known specifically from having read that source.
+
+The rule is about the provenance of the knowledge, not the resemblance of the
+result. Two implementations written to one specification look alike, and a
+format that must interoperate byte-for-byte has exactly one correct shape:
+ext4's on-disk layout, `struct stat`'s field order and errno values are facts
+about a format, and matching them is the point rather than a derivation.
+
+Machine-generated code gets the same scrutiny and a little more suspicion. A
+model can emit GPL source it was trained on without attribution, and fluency is
+not evidence of independent derivation — if a generated block looks like it came
+from somewhere, establish where before keeping it.
+
+Where an interface genuinely cannot be implemented without reading the in-kernel
+source, that is the signal it belongs in the copyleft zone. Move it there rather
+than weakening this rule; the boundary is cheap to move and expensive to
+relitigate.
+
+Unenforceable by `xtask`, deliberately: no build check can see where knowledge
+came from. It is a rule for people and for review, which is why it is written
+here rather than implied.
+
 ## Enforcement
 
 Every crate today declares `license.workspace = true`, which resolves to

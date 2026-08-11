@@ -219,6 +219,30 @@ Linux-compat code inherits the workspace licence. The syscall personality
 (`qunix-linux-abi`) is deliberately exempt — matching UAPI struct layouts is not
 the same as reimplementing the in-kernel driver API. See `LICENSING.md`.
 
+**Outside the GPL crates, every Linux-compatible API here is clean-roomed from
+the specification, never transcribed from the implementation.** The rule is
+about *where the knowledge came from*, not about how similar the result looks:
+
+- Work from what the interface is required to *do* — published UAPI headers,
+  `Documentation/`, the on-disk or on-wire format, `man` pages, the standards
+  the interface implements. Two people writing to the same specification
+  produce similar code, and that similarity is not derivation.
+- Do **not** work from Linux's `.c` files, its internal headers, or a
+  transcription of either. Do not paste kernel source into a prompt and ask for
+  a Rust version, and do not reproduce an algorithm you are recalling
+  specifically from having read that source.
+- The same applies to anything a model emits. A model can reproduce GPL source
+  it was trained on without saying so, and a plausible-looking function is not
+  evidence of independent derivation. If a generated block looks like it came
+  from somewhere, find out where before keeping it.
+- If an API genuinely cannot be implemented without reading the in-kernel
+  source, that is the signal it belongs in the `GPL-2.0` zone. Move it there
+  rather than weakening the rule.
+
+Structural compatibility is not derivation and is expected: ext4's on-disk
+layout, `struct stat`'s field order, and errno values are facts about a format
+that a compatible implementation must match exactly.
+
 ## Working on a milestone
 
 Each milestone gets a spec, then a plan, then execution:
