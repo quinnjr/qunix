@@ -227,17 +227,29 @@ impl SplitQueue {
         out
     }
 
-    /// The available ring as the device reads it: flags, index, then the slots.
-    pub fn avail_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(RING_HEADER + 2 * self.avail_ring.len() + 2);
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
-        out.extend_from_slice(&self.avail_idx.to_le_bytes());
+    /// The available ring's *slots*, without its index.
+    ///
+    /// The index is deliberately excluded, because publishing it is a separate
+    /// step with a barrier in front of it. The spec's order is: write the
+    /// descriptor and the ring slot, barrier, then advance `idx` — the index is
+    /// what makes the slot valid, so a device that polls the ring can otherwise
+    /// see an incremented index over a slot still holding its previous
+    /// occupant, and fetch a descriptor belonging to a request that has already
+    /// been freed. Returning them together in one blob made that ordering
+    /// impossible to express.
+    pub fn avail_slots_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 * self.avail_ring.len() + 2);
         for slot in &self.avail_ring {
             out.extend_from_slice(&slot.to_le_bytes());
         }
         out.extend_from_slice(&0u16.to_le_bytes()); // used_event
         out
     }
+
+    /// Byte offset of the available ring's index within the ring structure.
+    pub const AVAIL_IDX_OFFSET: usize = 2;
+    /// Byte offset of the available ring's first slot.
+    pub const AVAIL_SLOTS_OFFSET: usize = RING_HEADER;
 
     /// Copies the device's used ring in from an already-taken snapshot.
     ///

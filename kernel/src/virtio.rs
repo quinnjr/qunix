@@ -118,6 +118,8 @@ pub enum ProbeError {
     WindowTooLarge(u32),
     /// A device window could not be mapped.
     MapFailed(u64),
+    /// The device never cleared its status after a reset.
+    ResetTimeout,
     /// The device's queue is smaller than the driver's ring.
     QueueTooSmall(u16),
     /// The device cleared `FEATURES_OK`, refusing the feature set.
@@ -320,9 +322,25 @@ impl Transport {
                 return Err(ProbeError::BadNotifyOffset(notify_off));
             }
             self.queue_notify_off = notify_off;
-            self.common.write::<u16>(common::QUEUE_ENABLE, 1);
         }
         Ok(())
+    }
+
+    /// Enables queue 0, after everything about it has been configured.
+    ///
+    /// Separate from [`configure_queue`](Self::configure_queue) because the
+    /// specification requires every queue field to be set *before*
+    /// `queue_enable`, and a device is entitled to latch them at that moment.
+    /// Binding the MSI-X vector afterwards -- which is what this did -- works
+    /// under QEMU, which does not latch, and on a device that does would send
+    /// completions to vector 0 or nowhere: every request parked forever. The
+    /// same class as the bus-master bit, and just as invisible here.
+    pub fn enable_queue(&mut self) {
+        // SAFETY: both offsets are inside the common window.
+        unsafe {
+            self.common.write::<u16>(common::QUEUE_SELECT, 0);
+            self.common.write::<u16>(common::QUEUE_ENABLE, 1);
+        }
     }
 
     /// Binds queue 0's completions to an MSI-X table entry.
@@ -684,9 +702,15 @@ pub unsafe fn probe(device_id: u16) -> Result<Transport, ProbeError> {
     while transport.status() != 0 {
         spins += 1;
         // Bounded, because an unbounded wait on a device register is a hang
-        // with no message -- the failure mode this kernel is worst at
-        // reporting.
-        assert!(spins < RESET_SPIN_LIMIT, "virtio device did not reset");
+        // with no message. *Reported* rather than asserted, because every other
+        // way this device can misbehave already returns a `ProbeError` the
+        // caller can act on -- a device that will not reset is exactly as much
+        // "the device is broken" as one that reports FAILED, and panicking on
+        // only one of them made whether a bad device halts the machine depend
+        // on which stage it broke at.
+        if spins >= RESET_SPIN_LIMIT {
+            return Err(ProbeError::ResetTimeout);
+        }
         core::hint::spin_loop();
     }
     transport.set_status(STATUS_ACKNOWLEDGE);
@@ -699,7 +723,35 @@ mod tests {
     use super::*;
 
     #[test_case]
+    fn the_transport_tests_leave_the_block_device_usable() {
+        // Named to sort *after* every other test in this module, because that
+        // is the only way to run last: `#[test_case]` collection is alphabetical
+        // by path, and this module is itself the last one. An earlier version
+        // of this test lived in `main.rs`, whose module sorts before `virtio` --
+        // so it ran before the resets it was meant to survive and proved
+        // nothing.
+        //
+        // Every test above resets the device, and one re-points queue 0 at a
+        // different ring. The block driver's own view is invalidated by each of
+        // them, so `init` rebuilds it here; without that the read below parks on
+        // a queue the device no longer reads, and its deadline reports it.
+        unsafe { crate::block::init() }.expect("the block device did not come back up");
+        let mut buf = [0u8; 512];
+        crate::task::block_on(crate::block::read_at(5, &mut buf)).expect("the read failed");
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            5,
+            "sector 5 does not identify itself after the transport tests ran"
+        );
+    }
+
+    #[test_case]
     fn the_device_is_found_and_reaches_the_driver_state() {
+        // `probe` resets the device, and the block driver may hold a
+        // `Transport` describing the ring this reset just discarded. Telling it
+        // to re-establish the device is what keeps the two from silently
+        // disagreeing -- see `block::invalidate_for_test`.
+        crate::block::invalidate_for_test();
         // `probe` leaves the device reset and acknowledged, which is the state
         // feature negotiation is defined from. A device that skipped the reset
         // would accept the handshake and keep configuration from whatever
@@ -715,6 +767,11 @@ mod tests {
 
     #[test_case]
     fn a_device_offering_nothing_is_refused_rather_than_driven_as_legacy() {
+        // `probe` resets the device, and the block driver may hold a
+        // `Transport` describing the ring this reset just discarded. Telling it
+        // to re-establish the device is what keeps the two from silently
+        // disagreeing -- see `block::invalidate_for_test`.
+        crate::block::invalidate_for_test();
         // Negotiation asserted by *offering* nothing. A driver that does not
         // require VIRTIO_F_VERSION_1 is speaking the modern ring layout to a
         // device that may be using the legacy one -- the structures sit at
@@ -735,6 +792,11 @@ mod tests {
 
     #[test_case]
     fn the_device_accepts_a_ring_and_goes_live() {
+        // `probe` resets the device, and the block driver may hold a
+        // `Transport` describing the ring this reset just discarded. Telling it
+        // to re-establish the device is what keeps the two from silently
+        // disagreeing -- see `block::invalidate_for_test`.
+        crate::block::invalidate_for_test();
         // The handshake's last two steps, against a ring in real DMA memory.
         // Configuring a queue is where a device rejects the driver most
         // readily -- an address it cannot reach, a size larger than its own
@@ -777,6 +839,11 @@ mod tests {
 
     #[test_case]
     fn a_ring_larger_than_the_device_will_accept_is_refused() {
+        // `probe` resets the device, and the block driver may hold a
+        // `Transport` describing the ring this reset just discarded. Telling it
+        // to re-establish the device is what keeps the two from silently
+        // disagreeing -- see `block::invalidate_for_test`.
+        crate::block::invalidate_for_test();
         // The device states the largest ring it will take. Writing a larger one
         // back has it read descriptors past the end of its own table -- and it
         // would, because nothing between the driver and the DMA engine checks.

@@ -188,6 +188,43 @@ const _: () = assert!(
     "a slot's status byte overlaps the next slot's header"
 );
 
+/// Frames held only until `init` succeeds.
+///
+/// A `Drop` guard rather than a cleanup arm on each `?`, because there are six
+/// fallible steps after the first allocation and an early return from any of
+/// them would otherwise leak everything taken so far.
+#[derive(Default)]
+struct FrameGuard {
+    held: [Option<(u64, u8)>; 3],
+    used: usize,
+}
+
+impl FrameGuard {
+    fn take(&mut self, order: u8) -> Option<u64> {
+        let phys = crate::frames::alloc(order)?;
+        self.held[self.used] = Some((phys, order));
+        self.used += 1;
+        Some(phys)
+    }
+
+    /// Hands ownership to the caller; nothing is freed on drop.
+    fn keep(&mut self) {
+        self.used = 0;
+        self.held = [None; 3];
+    }
+}
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        for slot in self.held.iter().flatten() {
+            // SAFETY: each frame came from `frames::alloc` in `take` and, since
+            // `keep` was not called, was never handed to the device or to any
+            // other owner.
+            unsafe { crate::frames::free(slot.0, slot.1) };
+        }
+    }
+}
+
 /// Brings up the block device. Idempotent.
 ///
 /// # Safety
@@ -205,11 +242,16 @@ pub unsafe fn init() -> Result<(), BlockError> {
     transport.negotiate(VIRTIO_F_VERSION_1).map_err(BlockError::Probe)?;
 
     let layout = ring_layout(QUEUE_SIZE);
-    let ring_phys = crate::frames::alloc(0).ok_or(BlockError::OutOfMemory)?;
+    // Every frame is released again on any later failure. `init` is documented
+    // idempotent and a caller may retry it, and each failed attempt otherwise
+    // strands 66 pages with nothing able to reclaim them. A guard, because `?`
+    // has no cleanup clause and this kernel does not unwind.
+    let mut frames = FrameGuard::default();
+    let ring_phys = frames.take(0).ok_or(BlockError::OutOfMemory)?;
     // 64 slots at META_STRIDE, which a const assertion pins inside one frame.
-    let meta_phys = crate::frames::alloc(0).ok_or(BlockError::OutOfMemory)?;
+    let meta_phys = frames.take(0).ok_or(BlockError::OutOfMemory)?;
     // 64 slots of 4 KiB is 256 KiB: order 6.
-    let data_phys = crate::frames::alloc(6).ok_or(BlockError::OutOfMemory)?;
+    let data_phys = frames.take(6).ok_or(BlockError::OutOfMemory)?;
     let hhdm = crate::boot::hhdm_offset();
 
     // Zeroed before the device is told about any of it. The device reads the
@@ -224,12 +266,19 @@ pub unsafe fn init() -> Result<(), BlockError> {
         core::ptr::write_bytes((hhdm + data_phys) as *mut u8, 0, SLOT_BYTES * QUEUE_SIZE as usize);
     }
 
+    // Configure, bind the interrupt, *then* enable. The specification requires
+    // every queue field to be set before `queue_enable`, and a device may latch
+    // them there -- so binding MSI-X afterwards works under QEMU and sends
+    // completions nowhere on a device that latches.
     transport.configure_queue(layout, ring_phys).map_err(BlockError::Probe)?;
     // SAFETY: the caller guarantees the LAPIC is mapped and this runs on the
     // bootstrap processor.
     unsafe { install_msix(&mut transport)? };
+    transport.enable_queue();
     transport.finish().map_err(BlockError::Probe)?;
 
+    // Committed: from here the frames belong to the driver, not the guard.
+    frames.keep();
     *guard = Some(Blk {
         transport,
         queue: SplitQueue::new(QUEUE_SIZE),
@@ -412,7 +461,8 @@ fn submit(lba: u64, len: usize, out: Option<&[u8]>) -> Result<u16, BlockError> {
 fn write_rings(blk: &Blk) {
     let layout = ring_layout(QUEUE_SIZE);
     let desc = blk.queue.desc_bytes();
-    let avail = blk.queue.avail_bytes();
+    let slots = blk.queue.avail_slots_bytes();
+    // The descriptor table and the ring slot first, *without* the index.
     // SAFETY: both offsets are inside the ring frame this module allocated, and
     // `ring_layout` is what told the device where they are.
     unsafe {
@@ -422,16 +472,29 @@ fn write_rings(blk: &Blk) {
             desc.len(),
         );
         core::ptr::copy_nonoverlapping(
-            avail.as_ptr(),
-            (blk.ring_virt + layout.avail as u64) as *mut u8,
-            avail.len(),
+            slots.as_ptr(),
+            (blk.ring_virt + layout.avail as u64 + SplitQueue::AVAIL_SLOTS_OFFSET as u64) as *mut u8,
+            slots.len(),
         );
     }
-    // The device may read the ring the instant it is notified, and the
-    // notification is a store to a device register. Without a fence the two
-    // stores can reach memory in the other order, and the device reads a
-    // descriptor table that does not yet describe the request it was told
-    // about.
+    // Then the barrier, then the index. This order is the protocol, not
+    // caution: the index is what makes the slot valid, so a device permitted to
+    // poll the ring can otherwise observe an incremented index over a slot
+    // still holding its previous occupant -- a head that `finish` has since
+    // freed -- and fetch a descriptor for a request nobody made. Publishing
+    // both in one copy, as this did, cannot express the ordering at all.
+    core::sync::atomic::fence(Ordering::Release);
+    // SAFETY: inside the ring frame, at the offset `ring_layout` reserved.
+    unsafe {
+        core::ptr::write_volatile(
+            (blk.ring_virt + layout.avail as u64 + SplitQueue::AVAIL_IDX_OFFSET as u64) as *mut u16,
+            blk.queue.avail_index(),
+        );
+    }
+    // And a full fence before the notification, which is a store to a device
+    // register: without it the two stores can reach memory in the other order
+    // and the device reads a ring that does not yet describe the request it was
+    // told about.
     core::sync::atomic::fence(Ordering::SeqCst);
 }
 
@@ -609,6 +672,23 @@ pub fn handle_completion() {
     for id in woken.iter().flatten() {
         crate::sched::unpark(*id);
     }
+}
+
+/// Forgets the configured device.
+///
+/// The virtio transport tests call `probe`, which *resets* the device — and one
+/// of them re-points queue 0 at a different ring and drives it back to
+/// `DRIVER_OK` without re-binding MSI-X. This driver's `Blk` still describes
+/// the ring the device has forgotten, and `init` is idempotent, so it would
+/// never re-establish it: the next request would park forever on a queue the
+/// device does not read.
+///
+/// Today that is green only because `mod block;` precedes `mod virtio;` and the
+/// block tests therefore run first — an accident of two lines, written down
+/// nowhere. Calling this makes the dependency a fact rather than an ordering.
+#[cfg(test)]
+pub fn invalidate_for_test() {
+    *DEVICE.lock() = None;
 }
 
 #[cfg(test)]
