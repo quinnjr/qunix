@@ -2003,6 +2003,30 @@ mod tests {
     /// for it is the fix, and it does not weaken the assertion — a genuine
     /// leak never satisfies this, so the budget expires and the caller's
     /// assertion reports the shortfall exactly as before.
+    /// Whether building a process's address space consumes frames, measured
+    /// without racing the process.
+    ///
+    /// Asserting this of a *spawned* process races the process itself: on a
+    /// busy machine it can load, run and exit between two reads of the counter,
+    /// and the counter is then back where it started -- a true observation of a
+    /// finished process, reported as "loading consumed nothing". Building the
+    /// space here consumes frames with nothing able to free them until the
+    /// probe is dropped.
+    ///
+    /// Extracted because both callers had it inline and the file already
+    /// establishes the helper convention next door.
+    fn loading_consumes_frames(image: &[u8], before: u64) -> bool {
+        let probe = crate::process::Process::from_elf(image).expect("the image failed to load");
+        let with_probe = crate::frames::free_bytes();
+        drop(probe);
+        assert_eq!(
+            crate::frames::free_bytes(),
+            before,
+            "dropping a loaded process did not return its frames"
+        );
+        with_probe < before
+    }
+
     fn wait_until_frames_return(target: u64) -> bool {
         wait_until(|| crate::frames::free_bytes() == target, WAIT_BUDGET)
     }
@@ -2044,27 +2068,7 @@ mod tests {
         // another processor would move the baseline under this measurement.
         quiesce();
         let before = crate::frames::free_bytes();
-        // Measured on a process that is *not* running, then spawned.
-        //
-        // Asserting "the spawn consumed frames" by reading the counter after
-        // `spawn_elf` is a race with the process itself: on a busy machine it
-        // can load, run and exit between the two reads, and the counter is then
-        // back where it started -- a true observation of a finished process,
-        // reported as "loading consumed nothing". That is what a virtio device
-        // and four more test threads made routine. Building the address space
-        // here consumes frames with nothing able to free them until this scope
-        // ends, which is deterministic.
-        let consumed = {
-            let probe = crate::process::Process::from_elf(image).expect("init failed to load");
-            let with_probe = crate::frames::free_bytes();
-            drop(probe);
-            assert_eq!(
-                crate::frames::free_bytes(),
-                before,
-                "dropping a loaded process did not return its frames"
-            );
-            with_probe < before
-        };
+        let consumed = loading_consumes_frames(image, before);
         let id = crate::process::spawn_elf(image).expect("init failed to load");
         assert!(consumed, "loading a process consumed no frames; the measurement below proves nothing");
         assert!(wait_until_reaped(id), "{id:?} never exited and was never reaped");
@@ -2110,20 +2114,7 @@ mod tests {
 
         quiesce();
         let before = crate::frames::free_bytes();
-        // Deterministic, for the reason the clean-exit test above explains: a
-        // spawned process can finish between two reads of the counter.
-        let consumed = {
-            let probe =
-                crate::process::Process::from_elf(&image).expect("the faulting image failed");
-            let with_probe = crate::frames::free_bytes();
-            drop(probe);
-            assert_eq!(
-                crate::frames::free_bytes(),
-                before,
-                "dropping a loaded process did not return its frames"
-            );
-            with_probe < before
-        };
+        let consumed = loading_consumes_frames(&image, before);
         let id = crate::process::spawn_elf(&image).expect("the faulting image failed to load");
         assert!(consumed, "loading a process consumed no frames; the measurement below proves nothing");
         assert!(wait_until_reaped(id), "{id:?} survived its fault, or was never reaped");

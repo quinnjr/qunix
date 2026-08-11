@@ -42,6 +42,10 @@ pub const COMPLETION_VECTOR: u8 = 35;
 /// actually asks for.
 const SLOT_BYTES: usize = 4096;
 /// The largest transfer, in sectors.
+///
+/// The bound `submit` actually applies, so a caller reading this and a caller
+/// reading the code cannot disagree — it used to be stated here and enforced
+/// against `SLOT_BYTES` separately.
 pub const MAX_SECTORS: usize = SLOT_BYTES / SECTOR_BYTES;
 
 /// Sectors on the attached disk.
@@ -321,7 +325,9 @@ unsafe fn install_msix(transport: &mut Transport) -> Result<(), BlockError> {
     let table_virt = crate::virtio::map_device_window(table_phys, table_bytes)
         .ok_or(BlockError::OutOfMemory)?;
 
-    let table = pci::MsixTable { base: table_virt, entries: msix.entries };
+    // SAFETY: `table_virt` was just mapped uncacheable, and its length was
+    // checked against the BAR that holds it, for `msix.entries` entries.
+    let table = unsafe { pci::MsixTable::new(table_virt, msix.entries) };
     let address = pci::msix_message_address(
         qunix_hal_x86_64::apic::phys_base(),
         // Delivered to the bootstrap processor. Any processor would do -- the
@@ -390,7 +396,7 @@ fn submit(lba: u64, len: usize, out: Option<&[u8]>) -> Result<u16, BlockError> {
     if len == 0 || len % SECTOR_BYTES != 0 {
         return Err(BlockError::Unaligned);
     }
-    if len > SLOT_BYTES {
+    if len > MAX_SECTORS * SECTOR_BYTES {
         return Err(BlockError::TooLarge);
     }
 
@@ -702,6 +708,26 @@ mod tests {
         unsafe { init() }.expect("the block device did not come up");
     }
 
+    /// Runs `body` and requires it not to have needed the request deadline.
+    ///
+    /// Every `block_on` here parks on a completion only the MSI-X handler can
+    /// deliver, and the request timeout is what stops that being a harness
+    /// timeout naming no test. But a timeout is still a *failure* of the thing
+    /// under test, and one that returns `Err(Timeout)` from deep inside a
+    /// helper reads as "the read failed" rather than as "no completion ever
+    /// arrived". Requiring the fault counters to stay put says which.
+    fn without_device_faults(what: &str, body: impl FnOnce()) {
+        let faults = device_faults();
+        body();
+        assert_eq!(
+            device_faults(),
+            faults,
+            "{what}: the driver refused {} completion(s); each strands a thread and leaks a \
+             descriptor chain",
+            device_faults() - faults
+        );
+    }
+
     #[test_case]
     fn a_sector_reads_back_the_lba_it_was_written_with() {
         // The disk is generated with each sector beginning with its own LBA, so
@@ -710,7 +736,9 @@ mod tests {
         // off-by-one anywhere in the descriptor chain.
         ready();
         let mut buf = [0u8; SECTOR_BYTES];
-        block_on(read_at(7, &mut buf)).expect("the read failed");
+        without_device_faults("reading sector 7", || {
+            block_on(read_at(7, &mut buf)).expect("the read failed");
+        });
         assert_eq!(
             u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             7,
@@ -790,7 +818,9 @@ mod tests {
             "the payload equals what is already on the sector; this test cannot fail"
         );
 
-        block_on(write_at(SCRATCH_SECTOR, &out)).expect("the write failed");
+        without_device_faults("writing the scratch sector", || {
+            block_on(write_at(SCRATCH_SECTOR, &out)).expect("the write failed");
+        });
         let mut back = [0u8; SECTOR_BYTES];
         block_on(read_at(SCRATCH_SECTOR, &mut back)).expect("the read failed");
         assert_eq!(back, out, "what came back is not what went out");

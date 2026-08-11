@@ -31,6 +31,16 @@ pub struct Bdf {
 }
 
 impl Bdf {
+    pub const fn device(&self) -> u8 {
+        self.device
+    }
+
+    pub const fn function(&self) -> u8 {
+        self.function
+    }
+}
+
+impl Bdf {
     /// Refuses a device or function that does not fit its field.
     ///
     /// Truncating instead would address a *different* device: device 32 has the
@@ -119,11 +129,23 @@ const NO_VENDOR: u16 = 0xffff;
 /// # Safety
 /// Port I/O, as [`config_read32`].
 pub unsafe fn find_device(vendor: u16, device: u16) -> Option<Bdf> {
+    // SAFETY: the caller's obligation, forwarded to each read.
+    scan_for(vendor, device, |bdf| unsafe { config_read32(bdf, 0) })
+}
+
+/// The scan itself, over a reader.
+///
+/// Separated from the port I/O for the reason `config_snapshot` gives: the only
+/// interesting parts are the iteration order and the multi-function break, and
+/// inline port I/O puts both out of reach of a host test. If that break fired
+/// one level too eagerly -- on any absent function rather than on function 0 --
+/// a device sitting behind an absent slot would be missed, and the symptom is
+/// `NotFound` for a device that is right there.
+pub fn scan_for(vendor: u16, device: u16, read_id: impl Fn(Bdf) -> u32) -> Option<Bdf> {
     for slot in 0..32u8 {
         for function in 0..8u8 {
             let bdf = Bdf::new(0, slot, function)?;
-            // SAFETY: the caller's obligation, forwarded.
-            let id = unsafe { config_read32(bdf, 0) };
+            let id = read_id(bdf);
             let (got_vendor, got_device) = ((id & 0xffff) as u16, (id >> 16) as u16);
             if got_vendor == NO_VENDOR {
                 // Function 0 absent means the whole slot is absent; a
@@ -282,10 +304,25 @@ pub const fn msix_message_data(vector: u8) -> u32 {
 /// A device's MSI-X table, mapped.
 #[derive(Debug, Clone, Copy)]
 pub struct MsixTable {
-    /// Virtual address of entry 0.
-    pub base: u64,
-    /// Entries the device declared.
-    pub entries: u16,
+    base: u64,
+    entries: u16,
+}
+
+impl MsixTable {
+    /// Names a mapped MSI-X table.
+    ///
+    /// `unsafe` on the *constructor*, not only on `program`: the invariant is a
+    /// property of the value, and a safely-constructible `MsixTable` can be
+    /// built pointing anywhere, copied, stored and passed around with nothing
+    /// marking it as dangerous — leaving the one call that can cause harm to
+    /// carry an obligation established far away.
+    ///
+    /// # Safety
+    /// `base` must be a mapped, uncacheable MSI-X table with at least `entries`
+    /// entries.
+    pub const unsafe fn new(base: u64, entries: u16) -> Self {
+        Self { base, entries }
+    }
 }
 
 /// Bytes per MSI-X table entry: address low, address high, data, vector control.
@@ -406,6 +443,15 @@ mod tests {
         assert_eq!(msix.entries, 1, "a one-entry table was read as {}", msix.entries);
         assert_eq!(msix.bar, 4, "the table BAR index is wrong");
         assert_eq!(msix.offset, 0, "the table offset is wrong");
+
+        // The negative direction of a device-controlled parse, which is the
+        // direction this project keeps losing: a capability whose 12-byte body
+        // runs past the window is refused rather than assembled from whatever
+        // the snapshot buffer held.
+        assert!(
+            parse_msix(&cfg, Capability { id: CAP_ID_MSIX, offset: 0xfc }).is_none(),
+            "a capability body past the window was parsed"
+        );
     }
 
     #[test]
@@ -431,7 +477,9 @@ mod tests {
         // past its stated size writes into whatever follows the table in the
         // BAR -- which is more device registers.
         let mut backing = [0u32; 8];
-        let table = MsixTable { base: backing.as_mut_ptr() as u64, entries: 2 };
+        // SAFETY: `backing` is two entries of four dwords, which is exactly
+        // what `entries: 2` claims.
+        let table = unsafe { MsixTable::new(backing.as_mut_ptr() as u64, 2) };
         // SAFETY: `backing` is two entries of four dwords, which is exactly
         // what `entries: 2` claims.
         unsafe {
@@ -443,6 +491,46 @@ mod tests {
         assert_eq!(backing[5], 0, "the address high half was not written");
         assert_eq!(backing[6], 35, "the data word was not written");
         assert_eq!(backing[7], 0, "the entry was left masked");
+    }
+
+    #[test]
+    fn a_slot_whose_first_function_is_absent_is_skipped_entirely() {
+        // The multi-function break. A device must implement function 0, so an
+        // absent one means the whole slot is absent -- but if the break fired
+        // on *any* absent function instead, the scan would stop at the first
+        // gap and miss every device after it.
+        use core::cell::RefCell;
+        let probed = RefCell::new(alloc::vec::Vec::new());
+        let found = scan_for(0x1af4, 0x1042, |bdf| {
+            probed.borrow_mut().push((bdf.device(), bdf.function()));
+            // Slot 0 absent entirely; the device sits at slot 5, function 0.
+            if bdf.device() == 5 && bdf.function() == 0 { 0x1042_1af4 } else { 0xffff_ffff }
+        });
+        assert_eq!(found, Bdf::new(0, 5, 0), "a device behind an absent slot was missed");
+        let probed = probed.borrow();
+        // Slot 0's absent function 0 must have ended that slot, not the scan.
+        assert!(
+            !probed.iter().any(|&(d, f)| d == 0 && f > 0),
+            "an absent function 0 did not end its slot: {probed:?}"
+        );
+        assert!(probed.iter().any(|&(d, f)| d == 5 && f == 0), "slot 5 was never probed");
+    }
+
+    #[test]
+    fn a_device_on_a_later_function_of_a_present_slot_is_found() {
+        // The other half: function 0 present means the remaining functions are
+        // worth probing, so a device at function 3 must be reached.
+        let found = scan_for(0x1af4, 0x1042, |bdf| match (bdf.device(), bdf.function()) {
+            (2, 0) => 0x0001_1af4,
+            (2, 3) => 0x1042_1af4,
+            _ => 0xffff_ffff,
+        });
+        assert_eq!(found, Bdf::new(0, 2, 3), "a device on a later function was missed");
+    }
+
+    #[test]
+    fn an_empty_bus_yields_nothing() {
+        assert_eq!(scan_for(0x1af4, 0x1042, |_| 0xffff_ffff), None);
     }
 
     #[test]

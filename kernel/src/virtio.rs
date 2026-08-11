@@ -70,6 +70,12 @@ pub const STATUS_FAILED: u8 = 128;
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 /// Offsets within the common configuration structure.
+///
+/// Every constant here is a *byte offset*, and the suffix on `QUEUE_SIZE_REG`
+/// says so because the unsuffixed name already means something else in this
+/// file: `qunix_virtio::QUEUE_SIZE` is the driver's ring depth. Two same-named
+/// small integers of compatible types in one scope is a substitution the
+/// compiler cannot catch.
 mod common {
     pub const DEVICE_FEATURE_SELECT: u64 = 0;
     pub const DEVICE_FEATURE: u64 = 4;
@@ -78,7 +84,7 @@ mod common {
     pub const NUM_QUEUES: u64 = 18;
     pub const DEVICE_STATUS: u64 = 20;
     pub const QUEUE_SELECT: u64 = 22;
-    pub const QUEUE_SIZE: u64 = 24;
+    pub const QUEUE_SIZE_REG: u64 = 24;
     pub const QUEUE_MSIX_VECTOR: u64 = 26;
     pub const QUEUE_ENABLE: u64 = 28;
     pub const QUEUE_NOTIFY_OFF: u64 = 30;
@@ -181,6 +187,14 @@ pub struct Transport {
     common: Window,
     notify: Window,
     notify_multiplier: u32,
+    /// Mapped and held, though nothing reads them yet.
+    ///
+    /// Not decoration: a device that cannot produce all four structures is not
+    /// a modern virtio device, and `probe` refuses one that does not -- so
+    /// mapping them is how that requirement is enforced rather than assumed.
+    /// The ISR window is what a shared-interrupt configuration would read, and
+    /// the device window carries the block device's capacity, which the
+    /// device-error test's `DISK_SECTORS` currently duplicates by hand.
     #[allow(dead_code)]
     isr: Window,
     #[allow(dead_code)]
@@ -274,7 +288,7 @@ impl Transport {
         // SAFETY: both offsets are inside the common window.
         unsafe {
             self.common.write::<u16>(common::QUEUE_SELECT, 0);
-            self.common.read::<u16>(common::QUEUE_SIZE)
+            self.common.read::<u16>(common::QUEUE_SIZE_REG)
         }
     }
 
@@ -294,7 +308,7 @@ impl Transport {
         // when it was mapped.
         unsafe {
             self.common.write::<u16>(common::QUEUE_SELECT, 0);
-            let device_size = self.common.read::<u16>(common::QUEUE_SIZE);
+            let device_size = self.common.read::<u16>(common::QUEUE_SIZE_REG);
             // The device states the largest ring it will accept. Writing a
             // larger one back would have it read descriptors past the end of
             // its own table, at addresses derived from a ring that is not
@@ -302,7 +316,7 @@ impl Transport {
             if device_size < size {
                 return Err(ProbeError::QueueTooSmall(device_size));
             }
-            self.common.write::<u16>(common::QUEUE_SIZE, size);
+            self.common.write::<u16>(common::QUEUE_SIZE_REG, size);
             self.common.write::<u64>(common::QUEUE_DESC, ring_phys + layout.desc as u64);
             self.common.write::<u64>(common::QUEUE_DRIVER, ring_phys + layout.avail as u64);
             self.common.write::<u64>(common::QUEUE_DEVICE, ring_phys + layout.used as u64);
@@ -379,6 +393,12 @@ impl Transport {
         Ok(())
     }
 
+    /// How many queues the device offers.
+    ///
+    /// Reported, not selectable: every other method here addresses queue 0, and
+    /// there is no `queue` parameter anywhere. A caller reading this and
+    /// expecting to configure queue 1 would silently reconfigure queue 0
+    /// instead -- so the limitation is stated here rather than discovered.
     pub fn num_queues(&self) -> u16 {
         // SAFETY: the offset is inside the common window.
         unsafe { self.common.read::<u16>(common::NUM_QUEUES) }
