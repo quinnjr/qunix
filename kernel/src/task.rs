@@ -174,14 +174,28 @@ pub fn expire_timers(now: u64) {
 }
 
 /// A future that completes once `deadline` has passed.
-struct Sleep {
+///
+/// Named rather than returned as `impl Future`, so it can be stored in a struct
+/// and so a test can observe which slot it owns. An anonymous return type hides
+/// the field that distinguishes "a slot was freed" from "*this* sleeper's slot
+/// was freed", which is the difference the twin-sleep case turns on.
+pub struct Sleep {
     deadline: u64,
-    /// Whether this sleeper holds a slot in [`TIMERS`].
+    /// Which slot in [`TIMERS`] this sleeper holds, if any.
     ///
-    /// A deadline already in the past takes no slot, so this is not simply
-    /// "always true"; it is also what tells `drop` whether there is anything to
-    /// release.
-    registered: bool,
+    /// An index rather than a flag, because `drop` has to release *this*
+    /// sleeper's slot and nothing else. Matching on `(thread, deadline)`
+    /// instead -- which is what this did -- identifies a slot only when the
+    /// pair is unique, and the module docs advertise the case that breaks it:
+    /// two futures awaited inside one thread. `join(sleep_ticks(5),
+    /// sleep_ticks(5))` registers two slots with identical pairs, and dropping
+    /// either frees whichever the scan reaches first. The survivor is then
+    /// `Pending` with nothing scheduled to wake it, and the dropped one's slot
+    /// is held forever -- the exact leak the cancellation test exists to
+    /// prevent, reintroduced by the way the slot was found.
+    ///
+    /// `None` for a deadline already in the past, which takes no slot at all.
+    slot: Option<usize>,
 }
 
 impl Future for Sleep {
@@ -215,35 +229,39 @@ impl Drop for Sleep {
     /// is no longer waiting, and after `CAPACITY` cancellations every sleep in
     /// the kernel is refused.
     fn drop(&mut self) {
-        if !self.registered {
+        let Some(index) = self.slot else {
             return;
-        }
-        let me = crate::sched::current_id();
+        };
         let mut timers = TIMERS.lock();
-        for slot in timers.iter_mut() {
-            if slot.is_some_and(|t| t.thread == me && t.deadline == self.deadline) {
-                *slot = None;
-                return;
-            }
+        // Checked, not assumed. `expire_timers` clears the slot when the
+        // deadline passes and the index is then free for another sleeper, so a
+        // fired-then-dropped `Sleep` must not release whatever took its place.
+        // The deadline distinguishes them because a reused slot carries a
+        // different one.
+        if timers[index].is_some_and(|t| t.deadline == self.deadline) {
+            timers[index] = None;
         }
     }
 }
 
 /// Sleeps for `ticks` timer ticks, or refuses if no timer slot is free.
-pub fn try_sleep_ticks(ticks: u64) -> Result<impl Future<Output = ()>, SleepError> {
+pub fn try_sleep_ticks(ticks: u64) -> Result<Sleep, SleepError> {
     let now = crate::TICKS.load(core::sync::atomic::Ordering::SeqCst);
     let deadline = now.saturating_add(ticks);
     // A deadline already reached takes no slot at all. Registering one would
     // park the caller until the next tick for a sleep of zero, and on a
     // processor whose timer is masked that is forever.
     if deadline <= now {
-        return Ok(Sleep { deadline, registered: false });
+        return Ok(Sleep { deadline, slot: None });
     }
     let me = crate::sched::current_id();
     let mut timers = TIMERS.lock();
-    let slot = timers.iter_mut().find(|s| s.is_none()).ok_or(SleepError::Full)?;
-    *slot = Some(Timer { deadline, thread: me });
-    Ok(Sleep { deadline, registered: true })
+    let index = timers
+        .iter()
+        .position(|s| s.is_none())
+        .ok_or(SleepError::Full)?;
+    timers[index] = Some(Timer { deadline, thread: me });
+    Ok(Sleep { deadline, slot: Some(index) })
 }
 
 /// Sleeps for `ticks` timer ticks.
@@ -251,7 +269,7 @@ pub fn try_sleep_ticks(ticks: u64) -> Result<impl Future<Output = ()>, SleepErro
 /// Panics if the timer table is full. Callers that can do something better than
 /// die should use [`try_sleep_ticks`]; this exists because most cannot, and a
 /// silent non-sleep is worse than a named panic.
-pub fn sleep_ticks(ticks: u64) -> impl Future<Output = ()> {
+pub fn sleep_ticks(ticks: u64) -> Sleep {
     match try_sleep_ticks(ticks) {
         Ok(sleep) => sleep,
         Err(SleepError::Full) => panic!("no free timer slot for a {ticks}-tick sleep"),
@@ -293,6 +311,16 @@ pub fn insert_timer_for_test(deadline: u64) {
 #[cfg(test)]
 pub fn clear_timer_table_for_test() {
     TIMERS.lock()[..].fill(None);
+}
+
+/// Whether the timer slot at `index` is occupied. Test-only.
+///
+/// Distinguishes "a slot is occupied" from "*this* sleeper's slot is occupied",
+/// which a free count cannot -- and the difference is the whole of the
+/// twin-sleep bug: freeing the wrong slot keeps the count right.
+#[cfg(test)]
+pub fn slot_is_occupied_for_test(index: usize) -> bool {
+    TIMERS.lock()[index].is_some()
 }
 
 #[cfg(test)]
@@ -521,6 +549,97 @@ mod tests {
             free_timer_slots_for_test(),
             free_before,
             "a completed sleep left its slot occupied"
+        );
+    }
+
+    #[test_case]
+    fn two_sleeps_with_one_deadline_release_their_own_slots() {
+        // The module docs advertise two futures awaited inside one thread, and
+        // that is the case that breaks identifying a timer slot by its
+        // contents: `join(sleep_ticks(5), sleep_ticks(5))` registers two
+        // entries whose `(thread, deadline)` pairs are identical.
+        //
+        // A `drop` that searched for a matching pair freed whichever it reached
+        // first, so the *survivor* could lose its registration -- leaving it
+        // Pending with nothing scheduled to wake it -- while the dropped one's
+        // slot stayed occupied forever. Both directions are asserted below,
+        // because freeing one slot too many and freeing one too few look
+        // identical in a count taken at the end.
+        let free_before = free_timer_slots_for_test();
+        let first = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        let second = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before - 2,
+            "two sleeps did not take two slots"
+        );
+
+        // The *later*-registered one is dropped first, and the order is the
+        // whole point. A drop that searches for a matching `(thread, deadline)`
+        // scans from the start of the table, so dropping the earlier sleep
+        // first finds its own slot by luck and the bug hides completely.
+        // Dropping the later one makes the scan land on its twin's slot
+        // instead. Rust's own drop order for locals is reverse declaration,
+        // so this is also the ordinary case rather than a contrived one.
+        let survivor = first.slot.expect("the surviving sleep was never registered");
+        drop(second);
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before - 1,
+            "dropping one of two identical sleeps released the wrong number of slots"
+        );
+        // The survivor must still hold *its own* slot. A drop that freed the
+        // other future's slot leaves this one Pending with no timer behind it,
+        // and the count above cannot tell the two cases apart -- one slot is
+        // free either way.
+        assert!(
+            slot_is_occupied_for_test(survivor),
+            "the surviving sleep lost its own slot when its twin was dropped; it is now Pending \
+             with no timer registered to wake it"
+        );
+
+        drop(first);
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "the second of two identical sleeps leaked its slot"
+        );
+    }
+
+    #[test_case]
+    fn a_thread_may_exit_while_another_is_sleeping() {
+        // Before threads could block, "nothing runnable" meant "nothing left",
+        // and `exit_current` panicked on it. A parked thread is deliberately in
+        // no run queue, so a processor whose only company is a sleeper now
+        // reaches that same state in the ordinary course of being idle --
+        // and panicking there kills the machine because one thread exited while
+        // another was waiting for a timer.
+        //
+        // Both threads are spawned before either runs, so the exiting one can
+        // genuinely find the sleeper parked and nothing runnable.
+        static SLEPT: AtomicBool = AtomicBool::new(false);
+        static EXITED: AtomicBool = AtomicBool::new(false);
+        SLEPT.store(false, Ordering::Release);
+        EXITED.store(false, Ordering::Release);
+
+        extern "C" fn sleeper(_: u64) -> ! {
+            block_on(sleep_ticks(4));
+            SLEPT.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+        extern "C" fn quitter(_: u64) -> ! {
+            EXITED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        let a = crate::sched::spawn_kernel(sleeper, 0, qunix_sched::Priority::Normal);
+        let b = crate::sched::spawn_kernel(quitter, 0, qunix_sched::Priority::Normal);
+        assert!(
+            crate::tests::wait_until(
+                || SLEPT.load(Ordering::Acquire) && EXITED.load(Ordering::Acquire),
+                crate::tests::WAIT_BUDGET
+            ),
+            "{a:?} or {b:?} never finished; a thread exiting beside a sleeper must not panic"
         );
     }
 

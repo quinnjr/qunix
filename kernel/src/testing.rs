@@ -155,8 +155,19 @@ fn assert_no_parked_thread_is_queued(name: &str) {
             // rather than waited for -- this runs after every test, so a real
             // violation will not be missed by all of them.
             let Some(queue) = queue.try_lock() else { continue };
+            if !queue.contains(id) {
+                continue;
+            }
+            // Re-checked before failing. The parked set and the queue scan are
+            // two separate instants, and `unpark` legitimately clears `parked`
+            // *and* pushes the thread between them -- so finding a queued id
+            // from the earlier snapshot proves nothing on its own. Asserting
+            // there would be a harness that fails honest runs, which is worse
+            // than one that misses a violation: CLAUDE.md's ratchet section is
+            // about exactly this, and the answer there was to fix the test
+            // rather than widen the tolerance.
             assert!(
-                !queue.contains(id),
+                !crate::sched::is_parked(id),
                 "after {name}: parked {id:?} is queued on cpu {cpu}; it can be dispatched, and \
                  would resume at a suspension point it has not returned from"
             );
