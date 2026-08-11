@@ -40,6 +40,14 @@ const CFG_NOTIFY: u8 = 2;
 const CFG_ISR: u8 = 3;
 const CFG_DEVICE: u8 = 4;
 
+/// The largest device window this driver will map.
+///
+/// Every structure it needs is far smaller -- the common configuration is 56
+/// bytes, the ISR one -- and `map_window` allocates a page table per page, so
+/// an unbounded length is a boot-time denial of service from a device that
+/// merely lies about a `u32`.
+const MAX_WINDOW_BYTES: u32 = 64 * 1024;
+
 /// A virtio PCI capability is 16 bytes, and `cap_len` must say so.
 const VIRTIO_CAP_BYTES: usize = 16;
 
@@ -85,9 +93,24 @@ pub enum ProbeError {
     MissingStructure(u8),
     /// A capability names a BAR that does not exist, is I/O rather than memory,
     /// or is too small for the window the capability claims.
+    ///
+    /// The size half of that sentence was a lie until the BAR probe was added:
+    /// `read_bar` returned a base and nothing measured the extent, so the
+    /// comment described a check that had never been written. It is the check
+    /// now -- `read_bar` probes the size and `probe` refuses a window that runs
+    /// past it.
     BadBar(u8),
     /// The device does not offer `VIRTIO_F_VERSION_1`.
     NoVersion1,
+    /// `queue_notify_off * notify_off_multiplier` lands outside the notify
+    /// window. Both factors are device-supplied, so this is the device naming
+    /// an address rather than an offset.
+    BadNotifyOffset(u16),
+    /// A capability's window runs past the BAR that holds it, or the BAR is
+    /// larger than this driver will map.
+    WindowTooLarge(u32),
+    /// A device window could not be mapped.
+    MapFailed(u64),
     /// The device's queue is smaller than the driver's ring.
     QueueTooSmall(u16),
     /// The device cleared `FEATURES_OK`, refusing the feature set.
@@ -105,17 +128,40 @@ struct Window {
 }
 
 impl Window {
+    /// Refuses an access that would leave the window.
+    ///
+    /// A real assertion, not `debug_assert!`. These bounds were debug-only, and
+    /// the release profile does not re-enable debug assertions -- while CI boots
+    /// release -- so in the build that actually ships there was *no* bound at
+    /// all. That mattered because `notify`'s offset is computed from two
+    /// device-supplied values: an unbounded offset from a HHDM base is an
+    /// arbitrary physical address, and the write is two zero bytes into it.
+    ///
+    /// `checked_add` because the sum itself wraps in release, where overflow
+    /// checks are off -- a wrapped sum compares small and passes any bound.
+    ///
+    /// The messages are static strings, which is not a style preference: a
+    /// formatted message here (`"...at {offset:#x}..."`) triple-faults the
+    /// machine. These are generic over `T` and called from every register
+    /// access, so a formatting panic is instantiated at each one, and the
+    /// resulting panic path is more than this call site can carry. A
+    /// triple-fault reports nothing at all, so a message that cannot be printed
+    /// is worse than no message.
+    fn in_bounds(&self, offset: u64, size: usize) -> bool {
+        offset.checked_add(size as u64).is_some_and(|end| end <= self.len as u64)
+    }
+
     /// # Safety
-    /// `offset` must be inside the window and correctly aligned for `T`.
+    /// `offset` must be correctly aligned for `T`. The bound is checked.
     unsafe fn read<T>(&self, offset: u64) -> T {
-        debug_assert!(offset + core::mem::size_of::<T>() as u64 <= self.len as u64);
+        assert!(self.in_bounds(offset, core::mem::size_of::<T>()), "device window read out of bounds");
         unsafe { core::ptr::read_volatile((self.base + offset) as *const T) }
     }
 
     /// # Safety
     /// As [`Self::read`], and the write reaches a device register.
     unsafe fn write<T>(&self, offset: u64, value: T) {
-        debug_assert!(offset + core::mem::size_of::<T>() as u64 <= self.len as u64);
+        assert!(self.in_bounds(offset, core::mem::size_of::<T>()), "device window write out of bounds");
         unsafe { core::ptr::write_volatile((self.base + offset) as *mut T, value) }
     }
 }
@@ -251,7 +297,22 @@ impl Transport {
             self.common.write::<u64>(common::QUEUE_DESC, ring_phys + layout.desc as u64);
             self.common.write::<u64>(common::QUEUE_DRIVER, ring_phys + layout.avail as u64);
             self.common.write::<u64>(common::QUEUE_DEVICE, ring_phys + layout.used as u64);
-            self.queue_notify_off = self.common.read::<u16>(common::QUEUE_NOTIFY_OFF);
+            let notify_off = self.common.read::<u16>(common::QUEUE_NOTIFY_OFF);
+            // Validated here rather than trusted at every `notify`. The offset
+            // is `queue_notify_off * notify_off_multiplier`, and *both* come
+            // from the device -- so without this the device chooses an offset
+            // from a HHDM base, which is an arbitrary physical address. The
+            // window's own bound catches it too, but as a panic on the I/O path
+            // rather than a refusal at bring-up, and refusing a malformed device
+            // is the outcome a caller can act on.
+            let offset = (notify_off as u64).checked_mul(self.notify_multiplier as u64);
+            let fits = offset
+                .and_then(|o| o.checked_add(2))
+                .is_some_and(|end| end <= self.notify.len as u64);
+            if !fits {
+                return Err(ProbeError::BadNotifyOffset(notify_off));
+            }
+            self.queue_notify_off = notify_off;
             self.common.write::<u16>(common::QUEUE_ENABLE, 1);
         }
         Ok(())
@@ -270,7 +331,7 @@ impl Transport {
     ///
     /// # Safety
     /// Port I/O from ring 0.
-    pub unsafe fn bar_base(&self, index: u8) -> Option<u64> {
+    pub unsafe fn bar_base(&self, index: u8) -> Option<(u64, u64)> {
         // SAFETY: the caller's obligation, forwarded.
         unsafe { read_bar(self.bdf, index) }
     }
@@ -303,13 +364,19 @@ impl Transport {
 ///
 /// # Safety
 /// Port I/O.
-unsafe fn read_bar(bdf: Bdf, index: u8) -> Option<u64> {
-    if index > 5 {
-        return None;
-    }
-    let offset = 0x10 + index * 4;
-    // SAFETY: the caller's obligation, forwarded.
-    let low = unsafe { pci::config_read32(bdf, offset) };
+/// Where BAR 0 lives in the standard PCI header.
+const PCI_BAR0: u8 = 0x10;
+/// Bits 3:0 of a memory BAR are type flags, not address.
+const PCI_BAR_ADDR_MASK: u32 = 0xffff_fff0;
+
+/// Decodes a BAR pair into a physical base.
+///
+/// Separated from the port I/O for the reason `pci::walk_capabilities` gives
+/// for taking a snapshot: the branches here -- refusing an I/O BAR, assembling
+/// a 64-bit base from two slots -- are the only interesting part, and inline
+/// port I/O would put every one of them out of reach of a host test. The first
+/// run of this driver died on exactly one of them.
+pub const fn decode_bar(low: u32, high: u32, index: u8) -> Option<u64> {
     // Bit 0 set means an I/O BAR. Virtio's modern structures live in memory
     // BARs; treating an I/O BAR's value as a physical address would map a port
     // number as memory.
@@ -317,18 +384,64 @@ unsafe fn read_bar(bdf: Bdf, index: u8) -> Option<u64> {
         return None;
     }
     let kind = (low >> 1) & 0b11;
-    let base = (low & 0xffff_fff0) as u64;
+    let base = (low & PCI_BAR_ADDR_MASK) as u64;
     match kind {
         0b00 => Some(base),
         // A 64-bit BAR's upper half lives in the next slot, which must
         // therefore exist.
-        0b10 if index < 5 => {
-            // SAFETY: as above.
-            let high = unsafe { pci::config_read32(bdf, offset + 4) };
-            Some(base | ((high as u64) << 32))
-        }
+        0b10 if index < 5 => Some(base | ((high as u64) << 32)),
         _ => None,
     }
+}
+
+/// Decodes a BAR's size from its probe read-back.
+///
+/// The standard dance: write all-ones, read back, and the lowest set bit is the
+/// size. Without it nothing ties a capability's `offset + length` to anything
+/// real -- and `ProbeError::BadBar`'s own documentation claimed that check
+/// existed when it did not, which is the most expensive kind of comment.
+pub const fn decode_bar_size(probe_low: u32) -> u64 {
+    let masked = probe_low & PCI_BAR_ADDR_MASK;
+    if masked == 0 {
+        return 0;
+    }
+    (!masked as u64 + 1) & 0xffff_ffff
+}
+
+/// Reads a BAR's base and size.
+///
+/// # Safety
+/// Port I/O, and the BAR is written and restored: the caller must ensure the
+/// device is not decoding through it concurrently. `probe` does this before
+/// enabling memory decoding for any window it maps.
+unsafe fn read_bar(bdf: Bdf, index: u8) -> Option<(u64, u64)> {
+    if index > 5 {
+        return None;
+    }
+    let offset = PCI_BAR0 + index * 4;
+    // SAFETY: the caller's obligation, forwarded.
+    let low = unsafe { pci::config_read32(bdf, offset) };
+    let high = if index < 5 {
+        // SAFETY: as above.
+        unsafe { pci::config_read32(bdf, offset + 4) }
+    } else {
+        0
+    };
+    let base = decode_bar(low, high, index)?;
+    // Size probe: write all-ones, read back, restore. Restoring matters --
+    // leaving all-ones in a BAR relocates the device's window on top of
+    // whatever else decodes there.
+    // SAFETY: as above.
+    let size = unsafe {
+        pci::config_write32(bdf, offset, u32::MAX);
+        let probed = pci::config_read32(bdf, offset);
+        pci::config_write32(bdf, offset, low);
+        decode_bar_size(probed)
+    };
+    if size == 0 {
+        return None;
+    }
+    Some((base, size))
 }
 
 /// Maps a device window uncacheable through the HHDM.
@@ -336,11 +449,19 @@ unsafe fn read_bar(bdf: Bdf, index: u8) -> Option<u64> {
 /// Uncacheable is not optional: these are device registers, and a write-back
 /// mapping lets a status write sit in a cache line while the driver waits for
 /// the device to react to it.
-pub fn map_device_window(phys: u64, len: u32) -> u64 {
-    map_window(phys, len).base
+pub fn map_device_window(phys: u64, len: u32) -> Option<u64> {
+    map_window(phys, len).map(|w| w.base)
 }
 
-fn map_window(phys: u64, len: u32) -> Window {
+fn map_window(phys: u64, len: u32) -> Option<Window> {
+    // Refused here rather than by every caller. `phys + len - 1` underflows for
+    // a zero length, and the loop below then maps every page in the address
+    // space until the frame allocator is empty -- a hang with no message, which
+    // is the failure this kernel is worst at reporting. The guard used to live
+    // in `probe` only, which left it out of reach of the arithmetic it protects.
+    if len == 0 {
+        return None;
+    }
     use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
     let hhdm = crate::boot::hhdm_offset();
     // SAFETY: reads the live CR3 and wraps it; nothing is dereferenced.
@@ -366,22 +487,28 @@ fn map_window(phys: u64, len: u32) -> Window {
         }
         // SAFETY: `page` is a device physical address from a BAR, not RAM, so
         // no allocator owns it and no alias is created.
-        unsafe {
-            space
-                .map(
-                    va,
-                    page,
-                    PageFlags::PRESENT
-                        | PageFlags::WRITABLE
-                        | PageFlags::NO_CACHE
-                        | PageFlags::NO_EXECUTE,
-                    &mut || crate::frames::alloc(0),
-                )
-                .expect("failed to map a virtio BAR");
+        let mapped = unsafe {
+            space.map(
+                va,
+                page,
+                PageFlags::PRESENT
+                    | PageFlags::WRITABLE
+                    | PageFlags::NO_CACHE
+                    | PageFlags::NO_EXECUTE,
+                &mut || crate::frames::alloc(0),
+            )
+        };
+        // Reported, not asserted. The failure this actually has is frame
+        // exhaustion -- a resource condition, on a path whose every other
+        // failure is a `ProbeError` the caller can act on -- so panicking here
+        // would turn "no block device" into "the kernel halts" for a machine
+        // that is merely short of memory at boot.
+        if mapped.is_err() {
+            return None;
         }
         page += 4096;
     }
-    Window { base: hhdm + phys, len }
+    Some(Window { base: hhdm + phys, len })
 }
 
 /// One virtio capability, as read from configuration space.
@@ -483,7 +610,7 @@ pub unsafe fn probe(device_id: u16) -> Result<Transport, ProbeError> {
             continue;
         }
         // SAFETY: port I/O, as above.
-        let Some(bar_base) = (unsafe { read_bar(bdf, v.bar) }) else {
+        let Some((bar_base, bar_size)) = (unsafe { read_bar(bdf, v.bar) }) else {
             return Err(ProbeError::BadBar(v.bar));
         };
         // A capability describing a window that starts past its own BAR, or
@@ -493,10 +620,26 @@ pub unsafe fn probe(device_id: u16) -> Result<Transport, ProbeError> {
         let Some(end) = v.offset.checked_add(v.length) else {
             return Err(ProbeError::BadBar(v.bar));
         };
-        if v.length == 0 || end < v.offset {
+        if v.length == 0 {
             return Err(ProbeError::BadBar(v.bar));
         }
-        let window = map_window(bar_base + v.offset as u64, v.length);
+        // The window must lie inside the BAR that holds it. Without this the
+        // device names any physical address it likes: `map_window` would remap
+        // live kernel RAM as uncacheable and the driver would then write ring
+        // addresses and status bytes into it. This is the check `BadBar`'s
+        // documentation claimed to be, and was not.
+        if end as u64 > bar_size {
+            return Err(ProbeError::BadBar(v.bar));
+        }
+        // And a window larger than anything this driver needs is refused rather
+        // than mapped: `map_window` allocates a page table per 4 KiB, so a
+        // device declaring a 4 GiB structure exhausts the frame allocator at
+        // boot and panics ring 0.
+        if v.length > MAX_WINDOW_BYTES {
+            return Err(ProbeError::WindowTooLarge(v.length));
+        }
+        let window = map_window(bar_base + v.offset as u64, v.length)
+            .ok_or(ProbeError::MapFailed(bar_base + v.offset as u64))?;
         match v.cfg_type {
             CFG_COMMON => common = Some(window),
             CFG_NOTIFY => {

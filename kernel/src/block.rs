@@ -59,6 +59,8 @@ pub enum BlockError {
     QueueFull,
     /// No virtio-blk device was found or it could not be brought up.
     NoDevice,
+    /// The device's MSI-X table would fall outside the BAR that holds it.
+    MsixOutsideBar,
     /// The device reported a failure for this request.
     Device(BlkStatus),
 }
@@ -182,12 +184,18 @@ unsafe fn install_msix(transport: &mut Transport) -> Result<(), BlockError> {
     let msix = pci::parse_msix(&cfg, *cap).ok_or(BlockError::NoDevice)?;
 
     // SAFETY: port I/O.
-    let bar = unsafe { transport.bar_base(msix.bar) }.ok_or(BlockError::NoDevice)?;
+    let (bar, bar_size) = unsafe { transport.bar_base(msix.bar) }.ok_or(BlockError::NoDevice)?;
+    let table_bytes = (msix.entries as u32).saturating_mul(pci::MSIX_ENTRY_BYTES as u32);
+    // The table must lie inside its BAR. `msix.offset` and `msix.entries` are
+    // both device-supplied, and `MsixTable::program` writes four dwords per
+    // entry -- so without this the device chooses where those writes land.
+    let end = (msix.offset as u64).saturating_add(table_bytes as u64);
+    if end > bar_size {
+        return Err(BlockError::MsixOutsideBar);
+    }
     let table_phys = bar + msix.offset as u64;
-    let table_virt = crate::virtio::map_device_window(
-        table_phys,
-        msix.entries as u32 * pci::MSIX_ENTRY_BYTES as u32,
-    );
+    let table_virt = crate::virtio::map_device_window(table_phys, table_bytes)
+        .ok_or(BlockError::NoDevice)?;
 
     let table = pci::MsixTable { base: table_virt, entries: msix.entries };
     let address = pci::msix_message_address(
