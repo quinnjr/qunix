@@ -108,7 +108,7 @@ fn select_ovmf(override_path: Option<&str>, exists: &dyn Fn(&str) -> bool) -> Re
 /// `-no-shutdown` and it can never be observed, and reduce `-smp` to 1 and the
 /// SMP tests assert things about a machine that has no APs while still passing.
 /// See the tests below for what each argument is guarding.
-fn qemu_args(ovmf: &str, esp: &Path, headless: bool, kvm: bool) -> Vec<String> {
+fn qemu_args(ovmf: &str, esp: &Path, disk: &Path, headless: bool, kvm: bool) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     // A macro rather than a closure: a closure capturing `args` mutably blocks
     // the `format!` pushes below from borrowing it.
@@ -145,6 +145,20 @@ fn qemu_args(ovmf: &str, esp: &Path, headless: bool, kvm: bool) -> Vec<String> {
     args.push(format!("format=raw,file=fat:rw:{}", esp.display()));
     // `-no-shutdown` is deliberately absent: it would keep QEMU alive after
     // isa-debug-exit fires, so the harness could never observe an exit code.
+    // The block device the driver talks to. Two halves of one thing: a drive
+    // with no device is invisible to the guest, and a device naming no drive
+    // makes QEMU refuse to start -- so they are joined by id.
+    //
+    // `disable-legacy=on` is not decoration. It makes QEMU refuse to present
+    // the legacy interface at all, so a driver bug that falls back to it fails
+    // here rather than working under QEMU and breaking on hardware, where the
+    // legacy interface may simply be absent.
+    push!("-drive");
+    args.push(format!("format=raw,if=none,id=qunixdisk,file={}", disk.display()));
+    push!("-device");
+    args.push(String::from(
+        "virtio-blk-pci,drive=qunixdisk,disable-legacy=on,disable-modern=off",
+    ));
     push!("-serial", "stdio", "-no-reboot");
     push!("-device", "isa-debug-exit,iobase=0xf4,iosize=0x04");
     if headless {
@@ -161,11 +175,11 @@ fn qemu_args(ovmf: &str, esp: &Path, headless: bool, kvm: bool) -> Vec<String> {
 
 /// Boots the ESP directory under QEMU via OVMF, killing it if it outlives the
 /// timeout. Returns how the process terminated.
-pub fn run_esp(esp: &Path, headless: bool) -> Result<Exit> {
+pub fn run_esp(esp: &Path, disk: &Path, headless: bool) -> Result<Exit> {
     let ovmf = find_ovmf()?;
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(qemu_args(&ovmf, esp, headless, kvm_usable()));
+    cmd.args(qemu_args(&ovmf, esp, disk, headless, kvm_usable()));
 
     let budget = timeout()?;
     // `Instant + Duration` panics on overflow, so an absurd but well-formed
@@ -206,7 +220,34 @@ mod tests {
     use super::*;
 
     fn args(headless: bool, kvm: bool) -> Vec<String> {
-        qemu_args("/fw/OVMF.fd", Path::new("/t/esp"), headless, kvm)
+        qemu_args("/fw/OVMF.fd", Path::new("/t/esp"), Path::new("/t/disk.img"), headless, kvm)
+    }
+
+    #[test]
+    fn the_test_disk_reaches_the_guest_as_a_virtio_block_device() {
+        let a = args(true, false);
+        // The drive and the device are two halves of one thing, and either
+        // alone looks like success in an argument list: a drive with no device
+        // is invisible to the guest, and a device with no drive makes QEMU
+        // refuse to start.
+        assert!(a.iter().any(|x| x.contains("file=/t/disk.img")), "no drive: {a:?}");
+        assert!(
+            a.windows(2).any(|w| w[0] == "-device" && w[1].starts_with("virtio-blk-pci")),
+            "no device: {a:?}"
+        );
+        // And they must be joined by id, or the device is attached to nothing.
+        let drive = a.iter().find(|x| x.contains("id=qunixdisk")).expect("the drive has no id");
+        assert!(drive.contains("if=none"), "the drive is also attached implicitly: {drive}");
+        assert!(
+            a.iter().any(|x| x.contains("drive=qunixdisk")),
+            "the device does not name the drive: {a:?}"
+        );
+        // Legacy refused, so a driver that falls back to it fails here rather
+        // than working under QEMU and breaking on hardware.
+        assert!(
+            a.iter().any(|x| x.contains("disable-legacy=on")),
+            "the legacy interface is still offered: {a:?}"
+        );
     }
 
     /// The value following `flag`, if the flag is present at all.

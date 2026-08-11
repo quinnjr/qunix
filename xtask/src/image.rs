@@ -143,6 +143,47 @@ fn copy_if_changed(src: &Path, dst: &Path, stamps: &Path) -> Result<()> {
 /// The tree is not torn down between runs; instead every file it should contain
 /// is refreshed only when stale, and anything else present is removed. That
 /// keeps VVFAT from serving leftovers while avoiding a full re-copy each run.
+/// Sectors in the test disk. 2048 × 512 B = 1 MiB, which is more than any test
+/// reads and small enough to regenerate in a blink.
+const TEST_DISK_SECTORS: u64 = 2048;
+
+/// Creates the guest's block device, if it is not already there.
+///
+/// **Every sector begins with its own LBA**, little-endian, and the rest is
+/// filled with a byte derived from it. That is the whole point: a read of the
+/// wrong sector is then *detectable* rather than plausible. A disk of zeros, or
+/// of one repeated pattern, would let an off-by-one in the descriptor chain
+/// return data that looks exactly like success.
+///
+/// Written only when absent. Regenerating it every run would erase whatever a
+/// write test had just put there, so a read-after-write test could never fail
+/// for the right reason -- and it would also make the two boots of
+/// `cargo xtask test` disagree about the disk's contents.
+pub fn build_test_disk(target_dir: &Path) -> Result<PathBuf> {
+    let disk = target_dir.join("qunix-test-disk.img");
+    if disk.exists() {
+        return Ok(disk);
+    }
+    std::fs::create_dir_all(target_dir)?;
+    let mut image = alloc_image();
+    for lba in 0..TEST_DISK_SECTORS {
+        let base = lba as usize * 512;
+        image[base..base + 8].copy_from_slice(&lba.to_le_bytes());
+        // A filler that also depends on the LBA, so a read that returns the
+        // right first eight bytes and the wrong tail is caught too.
+        for (i, byte) in image[base + 8..base + 512].iter_mut().enumerate() {
+            *byte = (lba as u8).wrapping_add(i as u8);
+        }
+    }
+    std::fs::write(&disk, &image)
+        .with_context(|| format!("failed to write the test disk at {}", disk.display()))?;
+    Ok(disk)
+}
+
+fn alloc_image() -> Vec<u8> {
+    vec![0u8; TEST_DISK_SECTORS as usize * 512]
+}
+
 pub fn build_esp(root: &Path, target_dir: &Path, kernel: &Path) -> Result<PathBuf> {
     let limine = ensure_limine(root)?;
     let esp = target_dir.join("esp");

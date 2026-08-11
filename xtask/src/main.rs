@@ -179,7 +179,8 @@ fn main() -> Result<()> {
         Some("run") => {
             let elf = build_kernel(release)?;
             let esp = image::build_esp(&root, &target_dir(), &elf)?;
-            match qemu::run_esp(&esp, false)? {
+            let disk = image::build_test_disk(&target_dir())?;
+            match qemu::run_esp(&esp, &disk, false)? {
                 // A passing kernel exits QEMU with 33, which a shell would read
                 // as failure; translate the harness statuses back into the
                 // conventions a caller of `xtask run` actually expects.
@@ -201,7 +202,8 @@ fn main() -> Result<()> {
             // Invoked by cargo as the custom-target runner, with the test ELF path.
             let elf = PathBuf::from(args.get(1).context("runner requires an ELF path")?);
             let esp = image::build_esp(&root, &target_dir(), &elf)?;
-            match qemu::run_esp(&esp, true)? {
+            let disk = image::build_test_disk(&target_dir())?;
+            match qemu::run_esp(&esp, &disk, true)? {
                 qemu::Exit::Code(HOST_STATUS_SUCCESS) => Ok(()),
                 qemu::Exit::Code(HOST_STATUS_FAILURE) => bail!("kernel tests failed"),
                 qemu::Exit::Code(other) => bail!("qemu exited with unexpected status {other}"),
