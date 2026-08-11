@@ -1331,6 +1331,28 @@ mod tests {
         wait_until(|| !crate::sched::thread_id_is_live(id), WAIT_BUDGET)
     }
 
+    /// Waits until the frame allocator is back to `target` bytes free.
+    ///
+    /// Distinct from [`wait_until_reaped`], and the two are not
+    /// interchangeable: `sched::reap` removes a thread from the table *inside*
+    /// the scheduler's critical section and drops it — returning its frames —
+    /// only after that lock is released, because freeing an address space
+    /// enters the frame allocator and holding the scheduler lock across that
+    /// orders two locks in a way nothing else in the kernel does. So "gone
+    /// from the table" is satisfied strictly earlier than "its frames are
+    /// back", and a measurement taken in that window reports a leak that is
+    /// really a few instructions of lag.
+    ///
+    /// That window is what failed CI while passing locally: the reaping
+    /// processor was descheduled between the two, and the test sampled 12
+    /// frames short. Waiting on the measurement itself rather than on a proxy
+    /// for it is the fix, and it does not weaken the assertion — a genuine
+    /// leak never satisfies this, so the budget expires and the caller's
+    /// assertion reports the shortfall exactly as before.
+    fn wait_until_frames_return(target: u64) -> bool {
+        wait_until(|| crate::frames::free_bytes() == target, WAIT_BUDGET)
+    }
+
     /// Waits for the scheduler to settle, and returns the resulting thread
     /// count.
     ///
@@ -1379,11 +1401,16 @@ mod tests {
         // space nobody owns is never dropped, and the kernel goes on working
         // perfectly while losing a PML4, three page tables and every user page
         // per process. Nothing else in the kernel observes that.
+        //
+        // Waited for rather than sampled: leaving the thread table and
+        // returning the frames are two steps with a lock release between them.
+        // See `wait_until_frames_return`.
+        let recovered = wait_until_frames_return(before);
         let after = crate::frames::free_bytes();
-        assert_eq!(
-            after, before,
-            "a cleanly-exited process leaked {} bytes of address space",
-            before - after
+        assert!(
+            recovered,
+            "a cleanly-exited process left {} bytes unreclaimed ({after} free, {before} before)",
+            before.saturating_sub(after)
         );
     }
 
@@ -1418,11 +1445,17 @@ mod tests {
         );
         assert!(wait_until_reaped(id), "{id:?} survived its fault, or was never reaped");
 
+        // Waited for, not sampled — see `wait_until_frames_return`. This is
+        // the test that caught the difference: green locally, and 12 frames
+        // short on a CI runner that descheduled the reaping processor between
+        // the table removal and the drop.
+        let recovered = wait_until_frames_return(before);
         let after = crate::frames::free_bytes();
-        assert_eq!(
-            after, before,
-            "a process killed by a ring-3 fault leaked {} bytes of address space",
-            before - after
+        assert!(
+            recovered,
+            "a process killed by a ring-3 fault left {} bytes unreclaimed \
+             ({after} free, {before} before)",
+            before.saturating_sub(after)
         );
     }
 
