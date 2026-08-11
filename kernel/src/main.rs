@@ -15,6 +15,7 @@ mod process;
 mod sched;
 mod smp;
 mod syscall;
+mod block;
 mod task;
 mod virtio;
 mod thread;
@@ -129,6 +130,22 @@ extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
     qunix_hal_x86_64::apic::eoi();
 }
 
+/// A virtio-blk completion. Drains the used ring and unparks whoever waited.
+///
+/// EOI before the work, for the reason the timer handler documents: signalling
+/// after would leave the LAPIC waiting for an acknowledgement that only arrives
+/// once this handler returns, and `unpark` can take locks another processor
+/// holds.
+extern "x86-interrupt" fn block_handler(_frame: InterruptStackFrame) {
+    // Before anything reads `gs:`. This can land while ring 3 is running, and
+    // ring 3 can zero the hidden GS base with `mov gs, ax`; `unpark` reaches
+    // per-CPU state through it.
+    // SAFETY: this CPU's per-CPU block was installed during boot.
+    unsafe { qunix_hal_x86_64::percpu::restore_gs_base() };
+    qunix_hal_x86_64::apic::eoi();
+    crate::block::handle_completion();
+}
+
 /// Registers the interrupt vectors that are this CPU's own.
 ///
 /// Both are per-CPU because the IDT is: `idt::set_handler` writes the table of
@@ -141,6 +158,7 @@ pub fn install_local_vectors() {
     unsafe {
         qunix_hal_x86_64::idt::set_handler(qunix_hal_x86_64::apic::TIMER_VECTOR, timer_handler);
         qunix_hal_x86_64::idt::set_handler(WAKE_VECTOR, wake_handler);
+        qunix_hal_x86_64::idt::set_handler(crate::block::COMPLETION_VECTOR, block_handler);
     };
 }
 
@@ -2026,11 +2044,29 @@ mod tests {
         // another processor would move the baseline under this measurement.
         quiesce();
         let before = crate::frames::free_bytes();
+        // Measured on a process that is *not* running, then spawned.
+        //
+        // Asserting "the spawn consumed frames" by reading the counter after
+        // `spawn_elf` is a race with the process itself: on a busy machine it
+        // can load, run and exit between the two reads, and the counter is then
+        // back where it started -- a true observation of a finished process,
+        // reported as "loading consumed nothing". That is what a virtio device
+        // and four more test threads made routine. Building the address space
+        // here consumes frames with nothing able to free them until this scope
+        // ends, which is deterministic.
+        let consumed = {
+            let probe = crate::process::Process::from_elf(image).expect("init failed to load");
+            let with_probe = crate::frames::free_bytes();
+            drop(probe);
+            assert_eq!(
+                crate::frames::free_bytes(),
+                before,
+                "dropping a loaded process did not return its frames"
+            );
+            with_probe < before
+        };
         let id = crate::process::spawn_elf(image).expect("init failed to load");
-        assert!(
-            crate::frames::free_bytes() < before,
-            "loading a process consumed no frames; the measurement below proves nothing"
-        );
+        assert!(consumed, "loading a process consumed no frames; the measurement below proves nothing");
         assert!(wait_until_reaped(id), "{id:?} never exited and was never reaped");
 
         // The negative direction, and the whole of Deviation D7: an address
@@ -2074,11 +2110,22 @@ mod tests {
 
         quiesce();
         let before = crate::frames::free_bytes();
+        // Deterministic, for the reason the clean-exit test above explains: a
+        // spawned process can finish between two reads of the counter.
+        let consumed = {
+            let probe =
+                crate::process::Process::from_elf(&image).expect("the faulting image failed");
+            let with_probe = crate::frames::free_bytes();
+            drop(probe);
+            assert_eq!(
+                crate::frames::free_bytes(),
+                before,
+                "dropping a loaded process did not return its frames"
+            );
+            with_probe < before
+        };
         let id = crate::process::spawn_elf(&image).expect("the faulting image failed to load");
-        assert!(
-            crate::frames::free_bytes() < before,
-            "loading a process consumed no frames; the measurement below proves nothing"
-        );
+        assert!(consumed, "loading a process consumed no frames; the measurement below proves nothing");
         assert!(wait_until_reaped(id), "{id:?} survived its fault, or was never reaped");
 
         // Waited for, not sampled — see `wait_until_frames_return`. This is

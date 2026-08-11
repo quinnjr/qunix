@@ -230,9 +230,206 @@ pub fn capability_body(
     Ok(&cfg[cap.offset as usize..end])
 }
 
+/// The PCI capability id for MSI-X.
+pub const CAP_ID_MSIX: u8 = 0x11;
+
+/// Why an MSI-X table entry could not be programmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsixError {
+    /// The entry is past the table the device declared.
+    NoSuchEntry(u16),
+}
+
+/// The address an MSI writes to, for a message delivered to one processor.
+///
+/// An MSI is a *memory write*, not a pin: the address selects the local APIC
+/// and the destination within it. That is the whole reason this kernel can use
+/// MSI-X without an ACPI parser — the alternative, INTx, arrives at an I/O APIC
+/// redirection entry, and finding the I/O APIC means the ACPI MADT.
+///
+/// Bits 19:12 carry the destination APIC id. Getting that shift wrong sends
+/// every message to processor 0, which *works* on a one-processor guest and
+/// silently stops working the moment the waiting thread is elsewhere.
+pub const fn msix_message_address(lapic_base: u64, apic_id: u8) -> u64 {
+    lapic_base | ((apic_id as u64) << 12)
+}
+
+/// The data word an MSI writes, carrying the vector.
+///
+/// Delivery mode Fixed (000) and edge-triggered. A level-triggered message
+/// needs an end-of-interrupt protocol this kernel does not implement for
+/// devices, and the device would stop delivering after the first completion —
+/// a hang after exactly one successful request, which is a memorable way to
+/// spend an afternoon.
+pub const fn msix_message_data(vector: u8) -> u32 {
+    vector as u32
+}
+
+/// A device's MSI-X table, mapped.
+#[derive(Debug, Clone, Copy)]
+pub struct MsixTable {
+    /// Virtual address of entry 0.
+    pub base: u64,
+    /// Entries the device declared.
+    pub entries: u16,
+}
+
+/// Bytes per MSI-X table entry: address low, address high, data, vector control.
+pub const MSIX_ENTRY_BYTES: u64 = 16;
+
+impl MsixTable {
+    /// Programs one entry and unmasks it.
+    ///
+    /// The mask bit is cleared *last*. An entry unmasked while its address is
+    /// half-written would deliver a message to whatever the two halves happen
+    /// to spell — which, with no IOMMU, is a write to an address the kernel
+    /// never chose.
+    ///
+    /// # Safety
+    /// `base` must be a mapped, uncacheable MSI-X table with at least
+    /// `entries` entries.
+    pub unsafe fn program(&self, entry: u16, address: u64, data: u32) -> Result<(), MsixError> {
+        // The entry count comes from the device's own capability. Trusting it
+        // past its stated size writes into whatever follows the table in the
+        // BAR, which is more device registers.
+        if entry >= self.entries {
+            return Err(MsixError::NoSuchEntry(entry));
+        }
+        let at = self.base + entry as u64 * MSIX_ENTRY_BYTES;
+        // SAFETY: the caller guarantees the table is mapped and this entry is
+        // inside it.
+        unsafe {
+            // Masked first, so a half-written address is never live.
+            core::ptr::write_volatile((at + 12) as *mut u32, 1);
+            core::ptr::write_volatile(at as *mut u32, address as u32);
+            core::ptr::write_volatile((at + 4) as *mut u32, (address >> 32) as u32);
+            core::ptr::write_volatile((at + 8) as *mut u32, data);
+            core::ptr::write_volatile((at + 12) as *mut u32, 0);
+        }
+        Ok(())
+    }
+}
+
+/// The MSI-X capability's fields, as read from configuration space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsixCapability {
+    /// Entries in the table.
+    pub entries: u16,
+    /// Which BAR holds the table.
+    pub bar: u8,
+    /// Byte offset of the table within that BAR.
+    pub offset: u32,
+    /// Where the message-control register lives, for enabling the capability.
+    pub control_offset: u8,
+}
+
+/// Parses the MSI-X capability from a configuration-space snapshot.
+pub fn parse_msix(cfg: &[u8; 256], cap: Capability) -> Option<MsixCapability> {
+    // Header, message control, table offset/BIR, PBA offset/BIR.
+    let body = capability_body(cfg, cap, 12).ok()?;
+    let control = u16::from_le_bytes([body[2], body[3]]);
+    // The table size is stored as N-1, so a device with one entry reports zero.
+    // Reading it as the count directly gives a table one short, and the last
+    // entry -- the only one a single-vector device has -- is then refused.
+    let entries = (control & 0x7ff) + 1;
+    let table = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    Some(MsixCapability {
+        bar: (table & 0b111) as u8,
+        offset: table & !0b111,
+        entries,
+        control_offset: cap.offset + 2,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_address_targets_one_processor_and_stays_in_the_lapic_window() {
+        // An MSI is a memory write to the local APIC's address, with the
+        // destination processor in bits 19:12. Getting the shift wrong sends
+        // every completion to processor 0 -- which works on a one-processor
+        // guest and silently stops working the moment the waiting thread is
+        // elsewhere.
+        let addr = msix_message_address(0xfee0_0000, 3);
+        assert_eq!(addr & 0xfff0_0000, 0xfee0_0000, "the message left the LAPIC window");
+        assert_eq!((addr >> 12) & 0xff, 3, "the destination processor is wrong");
+        assert_ne!(
+            msix_message_address(0xfee0_0000, 0),
+            addr,
+            "every processor got the same message address"
+        );
+    }
+
+    #[test]
+    fn a_message_data_word_carries_the_vector_and_nothing_else() {
+        // Delivery mode must be Fixed (000) and the trigger edge: a
+        // level-triggered MSI needs an end-of-interrupt protocol this kernel
+        // does not implement for devices, and the device would stop delivering
+        // after the first completion.
+        let data = msix_message_data(35);
+        assert_eq!(data & 0xff, 35, "the vector is not in the low byte");
+        assert_eq!((data >> 8) & 0b111, 0, "delivery mode is not Fixed");
+        assert_eq!((data >> 15) & 1, 0, "the message is level-triggered");
+    }
+
+    #[test]
+    fn a_msix_table_size_of_one_is_read_as_one_entry() {
+        // The register stores N-1, so a single-vector device reports zero.
+        // Reading it as the count gives a table one short, and the only entry
+        // such a device has is then refused -- which presents as "this device
+        // has no MSI-X" for a device that does.
+        let mut cfg = [0u8; 256];
+        cfg[CAP_POINTER] = 0x60;
+        cfg[0x60] = CAP_ID_MSIX;
+        cfg[0x61] = 0;
+        cfg[0x62] = 0; // message control: table size - 1 == 0
+        cfg[0x63] = 0;
+        cfg[0x64] = 0x04; // table in BAR 4, offset 0
+        let cap = Capability { id: CAP_ID_MSIX, offset: 0x60 };
+        let msix = parse_msix(&cfg, cap).expect("the capability was not parsed");
+        assert_eq!(msix.entries, 1, "a one-entry table was read as {}", msix.entries);
+        assert_eq!(msix.bar, 4, "the table BAR index is wrong");
+        assert_eq!(msix.offset, 0, "the table offset is wrong");
+    }
+
+    #[test]
+    fn the_msix_table_offset_excludes_the_bar_index_bits() {
+        // The low three bits of the register are the BAR index, not part of the
+        // offset. Leaving them in shifts the whole table by up to seven bytes,
+        // so every entry straddles two entries' worth of registers.
+        let mut cfg = [0u8; 256];
+        cfg[CAP_POINTER] = 0x60;
+        cfg[0x60] = CAP_ID_MSIX;
+        cfg[0x62] = 3; // four entries
+        cfg[0x64..0x68].copy_from_slice(&0x0000_3002u32.to_le_bytes());
+        let msix = parse_msix(&cfg, Capability { id: CAP_ID_MSIX, offset: 0x60 })
+            .expect("the capability was not parsed");
+        assert_eq!(msix.bar, 2, "the BAR index is wrong");
+        assert_eq!(msix.offset, 0x3000, "the BAR index bits leaked into the offset");
+        assert_eq!(msix.entries, 4);
+    }
+
+    #[test]
+    fn programming_an_entry_past_the_table_is_refused() {
+        // The entry count comes from the device's own capability. Trusting it
+        // past its stated size writes into whatever follows the table in the
+        // BAR -- which is more device registers.
+        let mut backing = [0u32; 8];
+        let table = MsixTable { base: backing.as_mut_ptr() as u64, entries: 2 };
+        // SAFETY: `backing` is two entries of four dwords, which is exactly
+        // what `entries: 2` claims.
+        unsafe {
+            assert_eq!(table.program(2, 0, 0), Err(MsixError::NoSuchEntry(2)));
+            assert_eq!(table.program(1, 0xfee0_1000, 35), Ok(()));
+        }
+        // The second entry's four dwords, and the mask cleared last.
+        assert_eq!(backing[4], 0xfee0_1000, "the address low half was not written");
+        assert_eq!(backing[5], 0, "the address high half was not written");
+        assert_eq!(backing[6], 35, "the data word was not written");
+        assert_eq!(backing[7], 0, "the entry was left masked");
+    }
 
     #[test]
     fn a_config_address_sets_the_enable_bit_and_aligns_the_offset() {

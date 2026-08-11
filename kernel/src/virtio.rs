@@ -64,6 +64,7 @@ mod common {
     pub const DEVICE_STATUS: u64 = 20;
     pub const QUEUE_SELECT: u64 = 22;
     pub const QUEUE_SIZE: u64 = 24;
+    pub const QUEUE_MSIX_VECTOR: u64 = 26;
     pub const QUEUE_ENABLE: u64 = 28;
     pub const QUEUE_NOTIFY_OFF: u64 = 30;
     pub const QUEUE_DESC: u64 = 32;
@@ -256,6 +257,24 @@ impl Transport {
         Ok(())
     }
 
+    /// Binds queue 0's completions to an MSI-X table entry.
+    pub fn set_queue_msix_vector(&mut self, entry: u16) {
+        // SAFETY: both offsets are inside the common window.
+        unsafe {
+            self.common.write::<u16>(common::QUEUE_SELECT, 0);
+            self.common.write::<u16>(common::QUEUE_MSIX_VECTOR, entry);
+        }
+    }
+
+    /// The physical base of one of this device's BARs.
+    ///
+    /// # Safety
+    /// Port I/O from ring 0.
+    pub unsafe fn bar_base(&self, index: u8) -> Option<u64> {
+        // SAFETY: the caller's obligation, forwarded.
+        unsafe { read_bar(self.bdf, index) }
+    }
+
     /// Tells the device that queue 0 has new work.
     pub fn notify(&self) {
         let offset = self.queue_notify_off as u64 * self.notify_multiplier as u64;
@@ -317,6 +336,10 @@ unsafe fn read_bar(bdf: Bdf, index: u8) -> Option<u64> {
 /// Uncacheable is not optional: these are device registers, and a write-back
 /// mapping lets a status write sit in a cache line while the driver waits for
 /// the device to react to it.
+pub fn map_device_window(phys: u64, len: u32) -> u64 {
+    map_window(phys, len).base
+}
+
 fn map_window(phys: u64, len: u32) -> Window {
     use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
     let hhdm = crate::boot::hhdm_offset();
@@ -417,10 +440,17 @@ pub unsafe fn probe(device_id: u16) -> Result<Transport, ProbeError> {
     // ignored, the device never reads a descriptor, and the symptom is a
     // request that is accepted and never completes.
     //
-    // Nothing in this file's tests can tell: no DMA happens until a request is
-    // submitted, so clearing the bus-master bit changes nothing observable
-    // here and the suite stays green. The first `read_at` is what makes it
-    // falsifiable, and that test belongs to the task that adds one.
+    // Not falsifiable under QEMU, and this is a correction to what an earlier
+    // commit here predicted. The guess was that the first real `read_at` would
+    // make it fail; it does not. QEMU does not enforce the bus-master bit, so
+    // the device happily DMAs without it and every block test stays green with
+    // the bit cleared.
+    //
+    // It stays because real hardware does enforce it, and the symptom there is
+    // the worst kind: every request accepted, no descriptor ever fetched, and
+    // a thread parked forever on a completion that cannot arrive. A guard that
+    // only matters off the emulator is exactly the kind this project has to
+    // write down rather than test.
     // SAFETY: the caller's obligation, forwarded.
     unsafe {
         let command = pci::config_read32(bdf, 0x04);
