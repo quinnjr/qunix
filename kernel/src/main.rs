@@ -536,26 +536,36 @@ mod tests {
         SPIN_STOP.store(false, Ordering::SeqCst);
         let before = quiesce();
 
-        // One more spinner than there are processors *able to run them*. This
-        // thread masks interrupts for the duration, so the bootstrap processor
-        // provably dispatches none of them: only the application processors do.
-        // None of the spinners ever yields, so with preemption off each AP
-        // would take one and hold it forever and the extra spinner would never
-        // start at all.
+        // One spinner per application processor. This thread masks interrupts
+        // for the duration, so the bootstrap processor provably dispatches none
+        // of them.
         //
-        // This used to be a single spinner plus "control came back here, and
-        // `TICKS` moved". That stopped meaning anything once threads could run
-        // on another processor: the spinner would be stolen, this thread's
-        // `yield_now` would find its own queue empty and return without having
-        // given anything up, and the test was asserting a coincidence.
+        // It used to spawn one *more* spinner than there are processors able to
+        // run them, and assert that all of them started -- on the reasoning
+        // that the extra one could only run if a tick preempted a resident
+        // spinner. That reasoning was wrong twice over, and the test passed
+        // anyway:
         //
-        // Masking is also what keeps this thread alive to report. It adopted
-        // the boot context, so it is an *idle*-band thread, and a Normal-band
-        // spinner that never exits would starve it out of existence the moment
-        // a tick let the scheduler prefer one.
+        // - The extra spinner is queued on the bootstrap processor, which is
+        //   masked and never schedules. Reaching it requires *migration*, and
+        //   an application processor steals only when its own run queue is
+        //   empty at the moment it schedules. Once it holds a spinner and its
+        //   own idle thread, it never looks elsewhere again, so the extra
+        //   spinner starves regardless of how often anything is preempted. The
+        //   assertion was about work stealing, not preemption, and it was false
+        //   even about that.
+        // - It passed because the old code re-enabled interrupts *before*
+        //   asserting, so the bootstrap processor dispatched the extra spinner
+        //   itself -- exactly the coincidence the comment above claimed to have
+        //   excluded.
+        //
+        // What proves preemption is asked of the processor it happens on: an
+        // application processor running a thread that never yields reaches its
+        // idle loop again only by being preempted, because nothing else gives
+        // the idle thread back its CPU. `sched::idle_rounds` counts that.
         let cpus = crate::smp::cpu_count() as u64;
         assert!(cpus >= 2, "qemu must be launched with -smp; only {cpus} cpu(s) reported");
-        let spinners = cpus;
+        let spinners = cpus - 1;
         assert!(spinners <= 64, "the spinner bitmap is a u64");
 
         let was = crate::sched::set_preemption(true);
@@ -572,19 +582,70 @@ mod tests {
             core::hint::spin_loop();
             budget -= 1;
         }
-        if was_enabled {
-            x86_64::instructions::interrupts::enable();
+
+        // Sampled only once every spinner is resident, so growth from before
+        // they started cannot be mistaken for growth caused by preempting one.
+        let idle_before: [u64; 64] = core::array::from_fn(|cpu| {
+            if (cpu as u64) < cpus { crate::sched::idle_rounds(cpu as u32) } else { 0 }
+        });
+        // Bounded in ticks rather than in spin iterations. The budget above is
+        // a count of instructions, which is a different amount of wall-clock on
+        // every host and under TCG is not close to the same -- and what is
+        // being waited for is a timer, measured in ticks. Ticks still advance
+        // here with interrupts masked on this processor: the application
+        // processors have timers of their own.
+        let deadline = ticks_before + 20;
+        let mut preempted = 0u64;
+        while crate::TICKS.load(Ordering::SeqCst) < deadline {
+            preempted = (1..cpus)
+                .filter(|cpu| crate::sched::idle_rounds(*cpu as u32) > idle_before[*cpu as usize])
+                .count() as u64;
+            if preempted > 0 {
+                break;
+            }
+            core::hint::spin_loop();
         }
+        // Interrupts stay masked through every assertion below and through the
+        // store that stops the spinners. Re-enabling here instead left a window
+        // this thread could not survive: it adopted the boot context, so it is
+        // an *idle*-band thread, and there are now `cpus` Normal-band spinners
+        // that never yield. A tick landing anywhere in that window preempts
+        // this thread in favour of one of them, and nothing can ever dispatch
+        // it again -- the only thing that stops the spinners is the
+        // `SPIN_STOP` store it never reaches. The suite then hangs until the
+        // harness timeout, which reports no test name and no reason.
+        //
+        // It survived locally because the window is a few hundred instructions
+        // and a tick is ~10 ms. Under TCG on a CI runner the same window is
+        // long enough in wall-clock for a tick to land in it. This is the
+        // hazard CLAUDE.md states in full: a test that spins rather than yields
+        // must mask interrupts *for the duration*, and the duration does not
+        // end at the spin -- it ends when the threads that could starve this
+        // one have been told to stop.
+        //
+        // Nothing below needs interrupts. Every assertion reads an atomic or
+        // takes an `IrqSpinLock`, both of which are correct while masked, and a
+        // failing assertion panics, which halts the machine and does not need
+        // to be scheduled.
 
         assert_eq!(
             SPIN_STARTED.load(Ordering::SeqCst),
             all,
-            "only {} of {spinners} spinners started on {} application processors; with nothing \
-             yielding, the rest can only run if a tick preempts one",
+            "only {} of {spinners} spinners started on {} application processors",
             SPIN_STARTED.load(Ordering::SeqCst).count_ones(),
             cpus - 1
         );
         assert!(SPIN_RAN.load(Ordering::SeqCst) > 0, "no spinner made progress");
+        // The assertion the test is named for. Every application processor is
+        // running a thread that never yields, so reaching the idle loop again
+        // has exactly one cause. Nothing here is a proxy: not `TICKS`, which
+        // moves whether or not a tick switches anything, and not "control came
+        // back to this thread", which says only that this processor is idle.
+        assert!(
+            preempted > 0,
+            "no application processor returned to its idle loop in 20 ticks; a thread that \
+             never yields kept its processor, so the timer is not preempting"
+        );
         assert!(
             crate::TICKS.load(Ordering::SeqCst) > ticks_before,
             "no timer tick was taken; preemption cannot be what shared the processors"
@@ -596,7 +657,15 @@ mod tests {
         );
 
         // Wind them down, or every later test inherits threads that never end.
+        // Still masked, so this store cannot be preempted away from.
         SPIN_STOP.store(true, Ordering::SeqCst);
+
+        // Only now. From here the spinners are all on their way out, so being
+        // preempted costs this thread a delay rather than its existence: the
+        // run queues drain and an idle-band thread is dispatchable again.
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
         wait_until(|| crate::sched::thread_count() == before, WAIT_BUDGET);
         crate::sched::set_preemption(was);
         assert_eq!(

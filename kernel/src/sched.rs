@@ -115,6 +115,20 @@ pub fn steal_count() -> u64 {
     STEALS.load(Ordering::Acquire)
 }
 
+/// Times each CPU has gone round [`idle_loop`].
+///
+/// Per-CPU rather than a total, because the question a caller asks of this is
+/// always about one processor: did *this* CPU, which is running a thread that
+/// never yields, get back to its idle thread. A sum would answer yes whenever
+/// any other CPU was idle, which is the opposite of the question.
+static IDLE_ROUNDS: [AtomicU64; MAX_CPUS as usize] =
+    [const { AtomicU64::new(0) }; MAX_CPUS as usize];
+
+/// How many times `cpu` has gone round the idle loop.
+pub fn idle_rounds(cpu: u32) -> u64 {
+    IDLE_ROUNDS[cpu as usize].load(Ordering::Relaxed)
+}
+
 /// Whether a timer tick may switch threads.
 ///
 /// Off until something explicitly turns it on. Early boot, and any window that
@@ -581,6 +595,16 @@ fn is_current_anywhere(id: ThreadId) -> bool {
 /// that has nothing queued.
 pub fn idle_loop() -> ! {
     loop {
+        // Counted before the decision, so a CPU that halts still records the
+        // round it took to get there.
+        //
+        // This is the only witness the kernel has that a thread which never
+        // yields lost its processor. A CPU running such a thread reaches this
+        // loop again only by being preempted -- there is no other path back to
+        // the idle thread -- so a count that moves while a spinner is resident
+        // is proof of preemption, taken on the processor it happened on rather
+        // than inferred from a global tick counter.
+        IDLE_ROUNDS[percpu::cpu_id() as usize].fetch_add(1, Ordering::Relaxed);
         // Masked across the decision. Work queued between the check and the
         // halt would otherwise be missed forever: the wakeup IPI would arrive
         // while this CPU was still deciding, be dropped, and leave the CPU
