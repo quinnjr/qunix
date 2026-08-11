@@ -16,6 +16,9 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 
+pub mod park;
+pub use park::{ParkOutcome, ParkState, WakeOutcome};
+
 /// Opaque handle to something schedulable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId(pub u64);
