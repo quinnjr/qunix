@@ -35,6 +35,7 @@ blocks on hardware:
   thread.
 - **No process reaping.** `PROCESSES` grows without bound. Harmless while
   nothing creates processes in a loop; not harmless once a shell does.
+  *(Withdrawn 2026-08-11 — see below. There is no `PROCESSES`.)*
 
 ### The carried-limitations list has been reconciled
 
@@ -71,6 +72,19 @@ to make in the first place:
   acknowledge.
 - The APs schedule, each with its own run queue and `current`, stealing from
   each other (T2).
+- **There is no process reaping to do, because there is no process table.**
+  Checked against the source on 2026-08-11, while planning T3. `PROCESSES`
+  exists only in M1's *plan*; the kernel that shipped boxes a `Process` at
+  spawn, consumes that box in `user_thread_entry`, and moves the address space
+  into the `Thread`, which `sched::reap` already drops. Nothing accumulates.
+
+  This is the fourth stale entry found in the same list, and the first that was
+  never true rather than merely out of date — it was copied from the plan's
+  proposed design instead of from the code that replaced it. The table returns
+  in T6, where a per-process fd table gives a process state that outlives its
+  entry thread; reaping is designed *there*, against a table that exists,
+  rather than carried forward as a debt against one that does not. Struck at
+  the source in `docs/superpowers/plans/2026-08-04-m1-processes.md` as well.
 - **The address-space leak was fixed rather than deferred**, and listing it as
   out of scope was the mistake. It is not an independent tidy-up: T2 is what
   makes a process's frames reclaimable at all — a `VmSpace` freed while another
@@ -200,10 +214,10 @@ that moving the run queue per-CPU exists to remove.
 ## Task sequence
 
 1. **T1 — TLB shootdown.** *Done.* IPI-based, sender waits for acknowledgement.
-2. **T2 — Per-CPU scheduling.** *Done*, except for process reaping. Run queue
-   and `current` in `PerCpu`, work stealing via the existing
-   `RunQueue::steal`. `PROCESSES` still grows without bound; thread reaping
-   (stacks and address spaces) is complete.
+2. **T2 — Per-CPU scheduling.** *Done.* Run queue and `current` in `PerCpu`,
+   work stealing via the existing `RunQueue::steal`, thread reaping including
+   stacks and address spaces. Process reaping was listed here as outstanding
+   and is not: there is no process table to reap. See the reconciliation above.
 3. **T3 — Async runtime.** Per-CPU executor, park/unpark, ISR-safe wakers.
 4. **T4 — virtio-blk.** PCI enumeration, virtqueues, MSI-X, completion futures.
 5. **T5 — Buffer cache.** Page-granular, dirty tracking, writeback.

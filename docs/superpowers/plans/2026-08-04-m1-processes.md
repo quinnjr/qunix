@@ -2984,13 +2984,21 @@ struck from this list because it is a claim about the code, and a claim about
 the code decays the moment the code moves — which is the lesson immediately
 above, applied to itself.
 
-1. **No process reaping.** Exited *threads* are reaped, and their stacks and
-   address spaces with them, but `PROCESSES` grows without bound.
-2. **No FPU/SSE state is context-switched.** The kernel target is soft-float so
+A fifth entry — "no process reaping: `PROCESSES` grows without bound" — is
+struck for a different and worse reason: **it was never true of the shipped
+code.** `PROCESSES` appears in this plan (Task 9) and nowhere in the kernel. As
+built, `spawn` boxes a `Process`, `user_thread_entry` consumes that box, and the
+address space moves into the `Thread`, which `sched::reap` drops. There is no
+process table, so there is nothing to grow and nothing to reap. The limitation
+was copied out of the plan's own proposed design rather than read off the code
+that replaced it — which makes it the most dangerous entry a handoff list can
+carry, because it survives a check against the plan and fails only against the
+source.
+
+1. **No FPU/SSE state is context-switched.** The kernel target is soft-float so
    the kernel never writes those registers, which means a process's `xmm`
    contents survive verbatim into the next process to run. Now that threads
    move between processors, "the next process to run" can be on any of them.
 
-Item 1 is in scope for M2; see
-`docs/superpowers/specs/2026-08-05-m2-filesystems-design.md`. Item 2 is
-explicitly out of scope there.
+That entry is explicitly out of scope for M2; see
+`docs/superpowers/specs/2026-08-05-m2-filesystems-design.md`.
