@@ -95,6 +95,31 @@ Moving `current` (and then the run queue) into it is what makes APs
 schedulable. Until then, parking is the honest behaviour: an AP that took work
 would corrupt the CPU that queued it.
 
+**Resolved in M2 task T2 (2026-08-05).** `current` and the run queue are in
+`percpu::PerCpu`, one of each per CPU; the thread table and the reapable list
+stay shared behind one lock, and a run queue is a leaf lock so two CPUs can
+steal from each other without deadlocking. `smp::ap_entry` now enters
+`sched::idle_loop` instead of parking, and the bootstrap processor ends `kmain`
+the same way rather than halting.
+
+Two things the plan for it did not anticipate, both found by the code rather
+than by the design:
+
+- **The outgoing thread cannot be requeued before the switch.** Between the
+  push and `context::switch` storing its stack pointer, another CPU is free to
+  pop it and resume a context that has not been saved — the same "two threads
+  on one stack" this deviation was about, arrived at from the other side. It is
+  handed to whatever runs on the CPU next, through `sched::HANDOFF_ID`.
+- **Idle threads must never be stolen.** An idle thread adopted the stack its
+  own CPU booted on. `RunQueue::runnable_len` already excluded the idle band,
+  which is what the steal path checks before calling `steal`.
+
+A third surfaced only in the tests: the boot thread is an *idle*-band thread,
+so a test that spins rather than yields while Normal-band threads exist is
+starved out of existence. `the_timer_preempts_a_thread_that_never_yields` masks
+interrupts for its spin, which also makes "the bootstrap processor dispatched
+none of these" a fact rather than a hope.
+
 Also changed: `xtask` now launches QEMU with `-smp 4`. On a single-CPU guest
 every AP assertion is vacuously true — it would assert that zero processors
 came online, which is equally true of a kernel that cannot start any.
@@ -2917,17 +2942,63 @@ Fixing it needs an owner that outlives `enter_user` — the process table entry
 the scheduler can reach from `exit_current` — which is a process-lifetime change
 belonging to M2's reaping work, not something the ring-3 entry path can do.
 
+**Resolved in M2 (2026-08-05).** The owner is the `Thread` in the scheduler's
+table, which already outlives `enter_user` and is already reclaimed by a
+different thread. `user_thread_entry` calls `sched::adopt_address_space` where
+it called `core::mem::forget`, and `sched::reap` drops the whole `Thread` after
+releasing the scheduler lock — freeing an address space runs the frame
+allocator, and holding the scheduler lock across that orders two locks in a way
+nothing else does.
+
+The ordering the fix depends on: both exit paths already ran
+`vmspace::activate_kernel_root` before the thread stopped, and `reap` already
+refused to reclaim a thread that is still current. With more than one CPU that
+last test had to become "current on *any* CPU" rather than "current here", and
+every dispatch now reprograms CR3, so a CPU that ran the process and later ran
+something else is not still holding its root.
+
+Asserted by frame accounting across both exit paths, which is the only place
+the leak is observable. Falsified by restoring the `forget`: 57344 bytes on a
+clean exit, 49152 on a ring-3 fault.
+
 ## Known Limitations Carried Into M2
 
-- **Application processors are online but idle.** They install per-CPU state
-  and park. Making them schedule requires moving `sched::Scheduler::current`
-  and the run queue into `percpu::PerCpu`; see Execution Deviation D3.
+Reconciled against the merged branch (PR #4) on 2026-08-05. Three entries that
+appeared here when M1 was written are no longer true and have been removed
+rather than left to be believed: `sys_write` now takes a real user buffer,
+user pointers are checked for mapping and not merely for range, and
+`VmSpace::drop` returns every frame the address space allocated rather than
+only the PML4.
 
+The lesson is the one M1 itself paid for. This plan's Execution Deviation D1
+exists because M0's *planned* interfaces had drifted from its shipped ones by
+the time M1 consumed them, and five assumptions had to be reconciled
+mid-milestone. A handoff list is a claim about code, and it decays the moment
+the code moves. Check it before planning against it.
 
-1. **Application processors idle.** `smp::start_all` brings APs online but leaves them halted; they have no run queues. Per-CPU scheduling and work stealing use the `RunQueue::steal` already implemented here.
-2. **No TLB shootdown.** Unmapping still flushes only the local CPU. Now that there is more than one CPU, this is a live correctness bug rather than a theoretical one — it must be fixed before any address space is modified while shared.
-3. **Address spaces leak intermediate page tables.** `VmSpace::drop` reclaims only the PML4 frame.
-4. **No process reaping.** Exited threads are removed from the scheduler, but `PROCESSES` grows without bound.
-5. **`sys_write` takes a value, not a buffer.** There are no file descriptors until the M2 VFS exists; the syscall is a placeholder that proves the ABI path works.
-6. **No user-pointer validation beyond a range check.** Copying to and from userspace needs fault-tolerant accessors before any syscall accepts a real buffer.
-7. **Single global run queue behind one lock.** Correct but not scalable; replaced by per-CPU queues in M2.
+Four entries have since been fixed in M2 and are recorded at their deviations
+rather than repeated here: application processors are online and *idle*
+(Deviation D3), there is no TLB shootdown, there is a single global run queue
+(both D3), and a process's address space leaks on exit (Deviation D7). They are
+struck from this list because it is a claim about the code, and a claim about
+the code decays the moment the code moves — which is the lesson immediately
+above, applied to itself.
+
+A fifth entry — "no process reaping: `PROCESSES` grows without bound" — is
+struck for a different and worse reason: **it was never true of the shipped
+code.** `PROCESSES` appears in this plan (Task 9) and nowhere in the kernel. As
+built, `spawn` boxes a `Process`, `user_thread_entry` consumes that box, and the
+address space moves into the `Thread`, which `sched::reap` drops. There is no
+process table, so there is nothing to grow and nothing to reap. The limitation
+was copied out of the plan's own proposed design rather than read off the code
+that replaced it — which makes it the most dangerous entry a handoff list can
+carry, because it survives a check against the plan and fails only against the
+source.
+
+1. **No FPU/SSE state is context-switched.** The kernel target is soft-float so
+   the kernel never writes those registers, which means a process's `xmm`
+   contents survive verbatim into the next process to run. Now that threads
+   move between processors, "the next process to run" can be on any of them.
+
+That entry is explicitly out of scope for M2; see
+`docs/superpowers/specs/2026-08-05-m2-filesystems-design.md`.

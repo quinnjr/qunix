@@ -6,6 +6,7 @@
 //! unrecognised number is an error return rather than a panic. A panic here
 //! would let any process halt the machine.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use qunix_abi::{Errno, Sys};
 
 // One definition, shared with the mapper. A second copy here drifted from the
@@ -40,7 +41,28 @@ pub unsafe fn init() {
 /// userspace null dereference panicked the kernel — an unprivileged program
 /// could halt the machine by dereferencing zero, which is the whole reason
 /// ring 3 exists.
+/// Processes killed by a fault since boot.
+///
+/// Counted because the kill is otherwise invisible to anything but a human
+/// reading the console. Two things need it. A test that asserts a faulting
+/// process died can then assert it died *once*, rather than that the thread
+/// count happened to fall -- which is also true of an unrelated thread being
+/// reaped. And the test harness can assert that no *other* test killed
+/// anything: a fault taken in ring 0 must panic, so if the ring check ever
+/// answered "user" unconditionally, kernel threads would start disappearing
+/// silently and every existing assertion would still hold.
+static PROCESS_KILLS: AtomicU64 = AtomicU64::new(0);
+
+/// Processes killed by a ring-3 fault since boot.
+pub fn process_kills() -> u64 {
+    PROCESS_KILLS.load(Ordering::Acquire)
+}
+
 extern "C" fn user_fault(rip: u64, what: qunix_hal_x86_64::idt::UserFault) -> ! {
+    // Before the print and before anything that can fail: `exit_current` never
+    // returns, so a bump placed later would be skipped on any path that stops
+    // short, and the harness would read the miss as "no kill happened".
+    PROCESS_KILLS.fetch_add(1, Ordering::AcqRel);
     qunix_hal_x86_64::println!("qunix: process killed by {} at {rip:#x}", what.as_str());
     // Off the faulting process's page tables first, for the same reason `exit`
     // does it: the thread is about to stop and its tables must not be what the

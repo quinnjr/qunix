@@ -172,6 +172,53 @@ fn payload_before(json: &str) -> Option<&str> {
     None
 }
 
+/// Whether a commit body carries a non-empty attestation trailer.
+///
+/// Lifted out of `check` because the test module held a *copy* of it. A copy
+/// pins nothing: `check`'s own predicate could be inverted, or lose the
+/// non-empty test, and every test would still pass against the copy. The tests
+/// below now call this function, so they fail when the enforced rule changes.
+fn attested(body: &str) -> bool {
+    body.lines()
+        .map(str::trim)
+        .any(|line| line.starts_with(TRAILER) && !line[TRAILER.len()..].trim().is_empty())
+}
+
+/// Whether the protected-branch rule fires for this event and branch.
+///
+/// The two halves were evaluated inline and only the halves were tested, so
+/// nothing asserted the *conjunction*: dropping either one leaves both of the
+/// existing predicate tests green while the gate either stops firing on a real
+/// push or starts failing pull requests from a fork whose branch is named
+/// `main` — the latter with an instruction that destroys the branch under
+/// review. Both are one-line edits.
+fn protected_fires(event: Option<&str>, branch: &str) -> bool {
+    protected_applies(event) && PROTECTED.contains(&branch)
+}
+
+/// The range a reported previous head implies, given a way to ask whether this
+/// checkout contains a commit.
+///
+/// The git call is a parameter so the fail-*closed* direction is testable at
+/// all. It is the direction that matters: an unreachable `before` means a
+/// force-push, a rebase, or a shallow clone, and a force-push is precisely how
+/// someone circumvents this rule. It used to land in the `None` arm, whose
+/// caller then fell back to a ref-based range that is empty by construction on
+/// a protected branch — so the gate reported success on the one event it exists
+/// to catch.
+fn range_for_before(before: Option<&str>, contains: &dyn Fn(&str) -> bool) -> Result<Option<String>> {
+    let Some(before) = before.and_then(usable_before) else { return Ok(None) };
+    if !contains(before) {
+        bail!(
+            "the push event names `{before}` as the branch's previous head, but this \
+             checkout does not contain it, so what the push added cannot be determined. \
+             That is a force-push, a rebase, or a shallow clone -- use `fetch-depth: 0`. \
+             Refusing rather than passing: a force-push is how this rule gets circumvented."
+        );
+    }
+    Ok(Some(format!("{before}..HEAD")))
+}
+
 /// What a push actually added to a protected branch, when the event says so.
 ///
 /// The previous head is the only reliable way to see commits pushed *straight
@@ -187,16 +234,9 @@ fn protected_range(root: &Path) -> Result<Option<String>> {
     let Ok(path) = std::env::var("GITHUB_EVENT_PATH") else { return Ok(None) };
     let payload = std::fs::read_to_string(&path)
         .with_context(|| format!("reading the event payload at {path}"))?;
-    let Some(before) = payload_before(&payload).and_then(usable_before) else { return Ok(None) };
-    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{before}^{{commit}}")]).is_err() {
-        bail!(
-            "the push event names `{before}` as the branch's previous head, but this \
-             checkout does not contain it, so what the push added cannot be determined. \
-             That is a force-push, a rebase, or a shallow clone -- use `fetch-depth: 0`. \
-             Refusing rather than passing: a force-push is how this rule gets circumvented."
-        );
-    }
-    Ok(Some(format!("{before}..HEAD")))
+    range_for_before(payload_before(&payload), &|before| {
+        git(root, &["rev-parse", "--verify", "--quiet", &format!("{before}^{{commit}}")]).is_ok()
+    })
 }
 
 /// Whether this is running in automation.
@@ -277,7 +317,7 @@ pub fn check(root: &Path, range: Option<&str>) -> Result<()> {
     // commit on *this* repository's `main`.
     let event = std::env::var("GITHUB_EVENT_NAME").ok();
     let protected = protected_candidate(&named);
-    if protected_applies(event.as_deref()) && PROTECTED.contains(&protected.as_str()) {
+    if protected_fires(event.as_deref(), &protected) {
         let pushed = protected_range(root)?
             .map(|r| git(root, &["rev-list", "--no-merges", &r]))
             .transpose()?
@@ -304,11 +344,7 @@ pub fn check(root: &Path, range: Option<&str>) -> Result<()> {
     let mut missing = Vec::new();
     for hash in &hashes {
         let body = git(root, &["show", "-s", "--format=%B", hash])?;
-        let attested = body
-            .lines()
-            .map(str::trim)
-            .any(|line| line.starts_with(TRAILER) && !line[TRAILER.len()..].trim().is_empty());
-        if !attested {
+        if !attested(&body) {
             let subject = git(root, &["show", "-s", "--format=%s", hash])?;
             missing.push(format!("  {} {}", &hash[..8.min(hash.len())], subject));
         }
@@ -332,15 +368,10 @@ pub fn check(root: &Path, range: Option<&str>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    const TRAILER: &str = super::TRAILER;
-
-    /// Mirrors the predicate in `check`, so the parsing rule is pinned even
-    /// though the surrounding function needs a real repository.
-    fn attested(body: &str) -> bool {
-        body.lines()
-            .map(str::trim)
-            .any(|line| line.starts_with(TRAILER) && !line[TRAILER.len()..].trim().is_empty())
-    }
+    // The real predicate `check` calls, not a copy of it. A copy pinned
+    // nothing: `check`'s own version could lose the non-empty test and every
+    // test here would still pass.
+    use super::attested;
 
     #[test]
     fn a_named_tool_attests() {
@@ -504,6 +535,86 @@ mod tests {
                  so the protected-branch gate checks nothing"
             );
         }
+    }
+
+    #[test]
+    fn a_push_to_a_protected_branch_fires_the_rule() {
+        // The conjunction, not the two halves separately. Deleting either one
+        // leaves `protected_applies` and `resolve_branch`'s own tests green
+        // while the gate stops doing its job -- which is how it came to report
+        // success for a direct push to `develop`.
+        for branch in super::PROTECTED {
+            assert!(super::protected_fires(Some("push"), branch), "a push to {branch} passed");
+            // A local run is the case a developer most wants told about.
+            assert!(super::protected_fires(None, branch), "a local commit on {branch} passed");
+        }
+    }
+
+    #[test]
+    fn a_fork_pull_request_from_a_branch_named_main_does_not_fire_the_rule() {
+        // A fork's own `main` is not this repository's `main`. Firing here told
+        // the contributor to `git reset --hard origin/main`, which destroys the
+        // branch under review. `protected_candidate` never reads
+        // `GITHUB_HEAD_REF`, so the name reaching the rule on a pull request is
+        // `<n>/merge` -- but the event test has to hold even if it did.
+        assert!(!super::protected_fires(Some("pull_request"), "main"));
+        assert!(!super::protected_fires(Some("pull_request_target"), "develop"));
+        assert_eq!(super::resolve_branch("HEAD", None, Some("7/merge")), "7/merge");
+        assert!(!super::protected_fires(Some("pull_request"), "7/merge"));
+    }
+
+    #[test]
+    fn a_feature_branch_never_fires_the_rule() {
+        // The other direction, or the tests above are satisfied by a gate that
+        // fires on everything and blocks all work.
+        for branch in ["feature/m2-filesystems", "HEAD", "mainline", "develop-2"] {
+            assert!(!super::protected_fires(Some("push"), branch), "{branch} was treated as protected");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_previous_head_fails_closed() {
+        // A force-push is the most likely way this rule gets circumvented, and
+        // it used to land in the "nothing to compare" arm -- whose caller then
+        // read a ref-based range that is empty by construction on a protected
+        // branch, and reported success.
+        let err = super::range_for_before(Some("abc1234"), &|_| false).unwrap_err();
+        assert!(err.to_string().contains("abc1234"), "the sha is not named: {err}");
+        assert!(err.to_string().contains("force-push"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_reachable_previous_head_bounds_the_range_at_it() {
+        // Not `origin/<branch>..HEAD`: by the time CI runs, the remote ref
+        // already contains the pushed commits and every ref-based range is
+        // empty. The previous head is the only thing that still sees them.
+        assert_eq!(
+            super::range_for_before(Some("abc1234"), &|sha| sha == "abc1234").unwrap(),
+            Some("abc1234..HEAD".to_string())
+        );
+    }
+
+    #[test]
+    fn a_branch_creation_yields_no_range_without_consulting_git() {
+        // The all-zero sentinel names no commit, so asking git about it would
+        // turn creating a branch into a red build. Nothing may be asked of git
+        // here -- the closure fails the test if it is.
+        let never = |_: &str| panic!("git was consulted about a sha that names no commit");
+        assert_eq!(super::range_for_before(None, &never).unwrap(), None);
+        assert_eq!(
+            super::range_for_before(Some("0000000000000000000000000000000000000000"), &never).unwrap(),
+            None
+        );
+        assert_eq!(super::range_for_before(Some(""), &never).unwrap(), None);
+    }
+
+    #[test]
+    fn a_trailer_that_is_only_a_prefix_of_another_does_not_attest() {
+        // `starts_with` is the whole test, so a trailer whose key merely begins
+        // with `Assisted-by` would satisfy it while saying something else.
+        assert!(!attested("feat: thing\n\nCo-Assisted-by: Claude\n"));
+        // And the value must be the trailer's, not a continuation line's.
+        assert!(!attested("feat: thing\n\nAssisted-by:\n  Claude Opus 5\n"));
     }
 
     #[test]

@@ -1,8 +1,25 @@
-//! Kernel-side scheduler: the run queue, the thread table, and `schedule()`.
+//! Kernel-side scheduler: per-CPU run queues, the thread table, and `schedule()`.
 //!
 //! The *policy* — which thread runs next — lives in `qunix-sched` and is
 //! host-tested. This module is everything that policy deliberately knows
 //! nothing about: real stacks, the context switch, and the locking.
+//!
+//! # What is per-CPU and what is shared
+//!
+//! `current` and the run queue are per-CPU, in `percpu::PerCpu`. They have to
+//! be: a single `current` field is one "what am I running" slot shared between
+//! CPUs, and the first switch would have one CPU save its stack pointer into
+//! the other's context — two threads on one stack, which is the failure class
+//! this project has already shipped twice in the allocator.
+//!
+//! The thread *table* and the reapable list are shared, because a thread can be
+//! created on one CPU and reaped on another, and they are behind [`SCHED`].
+//! That lock is only taken to look a thread up; the scheduling decision itself
+//! touches per-CPU state.
+//!
+//! Lock order: `SCHED` may be taken while no run-queue lock is held, and a run
+//! queue is a leaf. Nothing acquires `SCHED` while holding a run queue, which
+//! is what lets two CPUs steal from each other without deadlocking.
 //!
 //! # The lock is never held across a switch
 //!
@@ -14,46 +31,38 @@
 //! switch must therefore end its borrow first, which is why the switch happens
 //! on raw pointers copied out of the guard rather than through it.
 //!
-//! # One CPU for now
+//! # A thread is never runnable and running at once
 //!
-//! There is a single global run queue and one lock, because only the bootstrap
-//! processor schedules. Application processors come online and park: `current`
-//! below is one field shared by every CPU, so two CPUs scheduling through it
-//! would have one save its stack pointer into the other's context. Moving
-//! `current` into `percpu::PerCpu` is what makes them schedulable; see
-//! Execution Deviation D3 in the M1 plan.
+//! Dispatch *removes* a thread from a run queue — `pop` locally, `steal`
+//! remotely — and that removal is the only thing preventing two CPUs from
+//! resuming one context. The other half of the same invariant is that the
+//! outgoing thread is **not** requeued before the switch: see [`HANDOFF_ID`].
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, Ordering};
-use qunix_sync::IrqControl;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use qunix_hal_x86_64::context::{self, Context};
-use qunix_sched::{Priority, RunQueue, ThreadId};
-use qunix_sync::IrqSpinLock;
+use qunix_hal_x86_64::percpu::{self, MAX_CPUS, NO_THREAD};
+use qunix_sched::{Priority, ThreadId};
+use qunix_sync::{IrqControl, IrqSpinLock};
 
 use crate::thread::{Thread, ThreadState};
 
-/// Everything the scheduler mutates, under one lock.
+/// The thread table and everything that is genuinely shared, under one lock.
 struct Scheduler {
-    queue: RunQueue,
     threads: BTreeMap<ThreadId, Thread>,
-    current: ThreadId,
     next_id: u64,
-    /// Threads that have exited and whose stacks are waiting to be freed.
+    /// Threads that have exited and whose stacks and address spaces are waiting
+    /// to be freed.
     ///
-    /// A thread cannot free its own stack: it is standing on it. So `exit`
-    /// records the id here and the next thread to run does the freeing.
+    /// A thread can free neither: it is standing on the stack, and the CPU may
+    /// still hold the address space in CR3. So `exit` records the id here and
+    /// the next thread to run does the freeing.
     reapable: alloc::vec::Vec<ThreadId>,
 }
 
 impl Scheduler {
     const fn new() -> Self {
-        Self {
-            queue: RunQueue::new(),
-            threads: BTreeMap::new(),
-            current: ThreadId(0),
-            next_id: 1,
-            reapable: alloc::vec::Vec::new(),
-        }
+        Self { threads: BTreeMap::new(), next_id: 0, reapable: alloc::vec::Vec::new() }
     }
 
     fn allocate_id(&mut self) -> ThreadId {
@@ -68,7 +77,57 @@ impl Scheduler {
 /// spin forever against itself.
 static SCHED: IrqSpinLock<Scheduler, qunix_hal_x86_64::Irq> = IrqSpinLock::new(Scheduler::new());
 
-static INITIALISED: AtomicBool = AtomicBool::new(false);
+/// CPUs that have adopted their running context as a thread, one bit per
+/// `cpu_id`.
+///
+/// Per-CPU rather than a single flag, because every CPU needs an entry of its
+/// own before it can schedule — `schedule` saves the outgoing context into a
+/// table entry, and a CPU without one would have to borrow another's.
+static IDLE_INSTALLED: AtomicU64 = AtomicU64::new(0);
+
+/// The thread that has just given up a CPU, per CPU, waiting to be made
+/// runnable again.
+///
+/// It cannot be requeued before the switch. Between a push and
+/// `context::switch` storing the thread's stack pointer there is a window in
+/// which another CPU is free to pop that thread and resume it — through a
+/// context that has not been saved yet, which puts two CPUs on one stack. So
+/// the outgoing thread is handed to whatever runs on this CPU *next*, which by
+/// construction runs after the save has completed, and that publishes it.
+///
+/// Written and read only by the owning CPU, with interrupts masked, so
+/// `Relaxed` is enough: the ordering that matters is program order on one CPU.
+static HANDOFF_ID: [AtomicU64; MAX_CPUS as usize] =
+    [const { AtomicU64::new(NO_THREAD) }; MAX_CPUS as usize];
+static HANDOFF_PRIORITY: [AtomicU8; MAX_CPUS as usize] =
+    [const { AtomicU8::new(0) }; MAX_CPUS as usize];
+
+/// Threads taken from another CPU's run queue.
+///
+/// Counted because a work-stealing path that is merely *uncovered* is
+/// indistinguishable from one that does not work: on a machine where the owning
+/// CPU always got there first, every assertion about the threads having run
+/// would still hold. A test can require this to move.
+static STEALS: AtomicU64 = AtomicU64::new(0);
+
+/// Total threads taken from another CPU's run queue since boot.
+pub fn steal_count() -> u64 {
+    STEALS.load(Ordering::Acquire)
+}
+
+/// Times each CPU has gone round [`idle_loop`].
+///
+/// Per-CPU rather than a total, because the question a caller asks of this is
+/// always about one processor: did *this* CPU, which is running a thread that
+/// never yields, get back to its idle thread. A sum would answer yes whenever
+/// any other CPU was idle, which is the opposite of the question.
+static IDLE_ROUNDS: [AtomicU64; MAX_CPUS as usize] =
+    [const { AtomicU64::new(0) }; MAX_CPUS as usize];
+
+/// How many times `cpu` has gone round the idle loop.
+pub fn idle_rounds(cpu: u32) -> u64 {
+    IDLE_ROUNDS[cpu as usize].load(Ordering::Relaxed)
+}
 
 /// Whether a timer tick may switch threads.
 ///
@@ -90,35 +149,50 @@ pub fn preemption_enabled() -> bool {
 /// Timer-tick entry point.
 ///
 /// Separate from [`yield_now`] because the constraints differ: this runs in
-/// interrupt context, must do nothing at all when the scheduler is not ready,
-/// and must never panic -- a panic here fires on every subsequent tick.
+/// interrupt context, must do nothing at all when this CPU is not ready, and
+/// must never panic -- a panic here fires on every subsequent tick.
+///
+/// The readiness check is per-CPU rather than global: every CPU starts its
+/// LAPIC timer as part of its own bring-up, and a tick that arrived before that
+/// CPU adopted an idle thread would have `schedule` save its context into
+/// whatever `NO_THREAD` names.
 ///
 /// The caller must have signalled EOI already. Switching first would leave the
 /// LAPIC waiting for an EOI that only arrives when this thread is scheduled
 /// again, so the CPU would take no further timer interrupts in the meantime.
 pub fn preempt() {
-    if !PREEMPT.load(Ordering::Acquire) || !INITIALISED.load(Ordering::Acquire) {
+    if !PREEMPT.load(Ordering::Acquire) || percpu::current_thread() == NO_THREAD {
         return;
     }
     schedule(ThreadState::Ready);
 }
 
-/// Adopts the currently-executing context as thread 0.
+/// Adopts the currently-executing context as this CPU's idle thread.
 ///
-/// The boot path is already a thread in everything but name: it has a stack and
-/// a register state. Rather than construct a fake one, it is adopted, so the
-/// first `schedule` has somewhere to save its context to.
+/// The boot path of every CPU is already a thread in everything but name: it
+/// has a stack and a register state. Rather than construct a fake one, it is
+/// adopted, so the first `schedule` on that CPU has somewhere to save its
+/// context to.
+///
+/// Idempotent per CPU. The in-QEMU harness runs several tests in one boot;
+/// re-adopting would orphan every thread the previous test spawned while
+/// leaving their stacks allocated.
 pub fn init() {
-    let mut sched = SCHED.lock();
-    if INITIALISED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        // The in-QEMU harness runs several tests in one boot; re-initialising
-        // would orphan every thread the previous test spawned while leaving
-        // their stacks allocated.
+    let cpu = percpu::cpu_id();
+    let bit = 1u64 << cpu;
+    if IDLE_INSTALLED.load(Ordering::Acquire) & bit != 0 {
         return;
     }
-    let boot = ThreadId(0);
-    sched.threads.insert(boot, Thread::adopt_current());
-    sched.current = boot;
+    let id = {
+        let mut sched = SCHED.lock();
+        let id = sched.allocate_id();
+        sched.threads.insert(id, Thread::adopt_current());
+        id
+    };
+    // SAFETY: this is the CPU being initialised, and nothing else can be
+    // scheduling on it — it has no idle thread until this line.
+    unsafe { percpu::set_current_thread(id.0) };
+    IDLE_INSTALLED.fetch_or(bit, Ordering::AcqRel);
 }
 
 /// What a new thread should run, handed to [`thread_entry`] through the single
@@ -136,40 +210,116 @@ struct ThreadStart {
 /// no timer, and a `yield_now` that can never be interrupted. Enabling them
 /// here is what makes a fresh thread indistinguishable from a resumed one.
 extern "C" fn thread_entry(raw: u64) -> ! {
+    // Before anything else, and for the same reason `schedule` does it after
+    // its own switch: the thread that gave this CPU up is still in nobody's run
+    // queue, and this is the first code to run after its context was saved.
+    publish_handoff();
     let start = unsafe { alloc::boxed::Box::from_raw(raw as *mut ThreadStart) };
     let ThreadStart { entry, arg } = *start;
     x86_64::instructions::interrupts::enable();
     entry(arg)
 }
 
-/// Creates a runnable kernel thread.
+/// Creates a runnable kernel thread on the calling CPU.
+///
+/// Queued locally rather than spread round-robin: the thread has no cache
+/// footprint anywhere yet, and an idle CPU will take it by stealing, which is
+/// the mechanism that already has to be right. Spreading here would make
+/// stealing the rarely-exercised path instead.
 pub fn spawn_kernel(entry: extern "C" fn(u64) -> !, arg: u64, prio: Priority) -> ThreadId {
     let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(ThreadStart { entry, arg }));
-    let mut sched = SCHED.lock();
-    let id = sched.allocate_id();
-    let thread = Thread::new_kernel(thread_entry, start as u64, prio);
-    sched.threads.insert(id, thread);
-    sched.queue.push(id, prio);
+    let id = {
+        let mut sched = SCHED.lock();
+        let id = sched.allocate_id();
+        sched.threads.insert(id, Thread::new_kernel(thread_entry, start as u64, prio));
+        id
+    };
+    // The table lock is released first: a run queue is a leaf lock and taking
+    // it under `SCHED` would give this path a lock order nothing else has.
+    percpu::run_queue().lock().push(id, prio);
+    // Idle CPUs are halted, and nothing else will wake them. Sent after the
+    // push, so a CPU woken by it is guaranteed to see the work.
+    qunix_hal_x86_64::apic::send_ipi_all_excluding_self(crate::WAKE_VECTOR);
     id
 }
 
+/// The thread this CPU is running.
 pub fn current_id() -> ThreadId {
-    SCHED.lock().current
+    ThreadId(percpu::current_thread())
 }
 
-/// Live threads, including the running one and any awaiting reaping.
+/// Live threads, including running ones and any awaiting reaping.
 pub fn thread_count() -> usize {
     SCHED.lock().threads.len()
 }
 
+/// Whether `id` is still in the thread table.
+///
+/// A count is not enough for a caller waiting on one specific thread: the
+/// harness shares one scheduler across every test, so an unrelated thread
+/// starting or finishing moves the count without saying anything about the
+/// thread the caller cares about.
+pub fn thread_id_is_live(id: ThreadId) -> bool {
+    SCHED.lock().threads.contains_key(&id)
+}
+
+/// Gives the running thread ownership of the address space it has activated.
+///
+/// Called by `process::user_thread_entry` immediately before it enters ring 3
+/// and stops being able to own anything: `enter_user` never returns, so the
+/// only owner that can outlive it is the thread table entry, which `reap`
+/// already reclaims from a different thread.
+///
+/// The space is *not* dropped here under any circumstance — that is the whole
+/// point. Dropping it would free the page tables the caller is about to
+/// execute on.
+pub fn adopt_address_space(space: crate::vmspace::VmSpace) {
+    let current = current_id();
+    let mut sched = SCHED.lock();
+    let thread =
+        sched.threads.get_mut(&current).expect("the running thread is not in the table");
+    // Asserted rather than replaced. A `replace` would drop the previous space
+    // right here — with the scheduler lock held, so the frame allocator would
+    // be entered underneath it, and on a CPU that may still be running on the
+    // tables being freed. A thread enters ring 3 exactly once, so a second call
+    // is a bug rather than a case to handle.
+    assert!(
+        thread.address_space.is_none(),
+        "{current:?} adopted a second address space; the first would be leaked"
+    );
+    thread.address_space = Some(space);
+}
+
+/// Runnable threads across every CPU, excluding idle threads.
+///
+/// The idle band is excluded because "is there work to do" is what callers
+/// mean: a CPU's idle thread is queued while that CPU runs something else, and
+/// counting it would report work where there is none.
+/// Every CPU that has a run queue at all, whether or not it is scheduling yet.
+///
+/// Used for counting and for the reap guard, both of which must not miss a CPU:
+/// a CPU is installed before it is marked online, and during that window it
+/// already has a current thread and can already hold queued work.
 pub fn runnable_count() -> usize {
-    SCHED.lock().queue.len()
+    (0..MAX_CPUS)
+        .filter_map(percpu::run_queue_of)
+        .map(|queue| queue.lock().runnable_len())
+        .sum()
+}
+
+/// Every CPU that is actually scheduling, by id.
+///
+/// Narrower than "has a block" on purpose: stealing from a CPU that has not
+/// entered the scheduler would move work somewhere nothing is going to run it.
+fn each_online_cpu() -> impl Iterator<Item = u32> {
+    let online = percpu::online_mask();
+    (0..MAX_CPUS).filter(move |cpu| online & (1u64 << cpu) != 0)
 }
 
 /// Yields the CPU to the next runnable thread, if there is one.
 ///
 /// Returns without switching when nothing else is runnable — that is the
-/// common case for the boot thread and is not an error.
+/// common case for an idle CPU and is not an error.
 pub fn yield_now() {
     schedule(ThreadState::Ready);
 }
@@ -177,7 +327,7 @@ pub fn yield_now() {
 /// Terminates the calling thread. Never returns.
 ///
 /// The stack is *not* freed here: this code is running on it. The thread is
-/// marked `Exited` and its id queued for the next thread to reap.
+/// marked `Exited` and its id queued for another thread to reap.
 pub fn exit_current() -> ! {
     schedule(ThreadState::Exited);
     // `schedule` only returns when it did not switch away, which for an exiting
@@ -187,14 +337,82 @@ pub fn exit_current() -> ! {
     panic!("the last thread exited with nothing else to run");
 }
 
+/// What this CPU should run next, taken *out* of whichever queue held it.
+///
+/// Removal before dispatch is what stops two CPUs running one thread, and it is
+/// why both halves of this are `pop`/`steal` rather than a peek.
+fn take_next(cpu: u32) -> Option<ThreadId> {
+    // Locally first: a thread that last ran here has its stack, and possibly
+    // its address space, warm in this CPU's caches.
+    if let Some(id) = percpu::run_queue().lock().pop() {
+        return Some(id);
+    }
+    for other in each_online_cpu() {
+        if other == cpu {
+            continue;
+        }
+        let Some(remote) = percpu::run_queue_of(other) else {
+            continue;
+        };
+        // `try_lock`: the owner may be mid-dispatch, and a thief that blocks on
+        // it turns a missed steal into a stalled CPU. Only one queue is ever
+        // held at a time on this path, so two CPUs stealing from each other
+        // cannot deadlock however the try_locks land.
+        let Some(mut queue) = remote.try_lock() else {
+            continue;
+        };
+        // Idle threads must never be stolen: an idle thread adopted the stack
+        // its own CPU booted on, so running it here would put this CPU on
+        // another CPU's stack. `runnable_len` excludes the idle band, and
+        // `steal` serves the highest non-empty band, so a non-zero count here
+        // guarantees the thread it returns is not an idle one.
+        if queue.runnable_len() == 0 {
+            continue;
+        }
+        if let Some(id) = queue.steal() {
+            STEALS.fetch_add(1, Ordering::AcqRel);
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Makes the thread that gave up this CPU runnable again.
+///
+/// Runs on whatever this CPU turned to next, which is the earliest point at
+/// which the outgoing thread's context is safely stored. See [`HANDOFF_ID`].
+fn publish_handoff() {
+    let cpu = percpu::cpu_id();
+    let raw = HANDOFF_ID[cpu as usize].swap(NO_THREAD, Ordering::Relaxed);
+    if raw == NO_THREAD {
+        return;
+    }
+    let prio = priority_from_raw(HANDOFF_PRIORITY[cpu as usize].load(Ordering::Relaxed));
+    percpu::run_queue().lock().push(ThreadId(raw), prio);
+}
+
+/// Rebuilds a [`Priority`] from the byte the handoff slot carries.
+///
+/// Split out so the round trip can be asserted. Decoding wrong is silent and
+/// specifically dangerous in one direction: an idle thread promoted out of the
+/// idle band becomes stealable, and an idle thread adopted the stack its own
+/// CPU booted on.
+fn priority_from_raw(raw: u8) -> Priority {
+    match raw {
+        0 => Priority::Idle,
+        2 => Priority::High,
+        _ => Priority::Normal,
+    }
+}
+
 /// The core switch. `outgoing_state` is what the *calling* thread becomes.
 fn schedule(outgoing_state: ThreadState) {
-    // Interrupts off across the *whole* decision, not just while the lock is
-    // held. The lock must be dropped before the switch (see the module docs),
-    // and that window is not safe to be preempted in: by then `sched.current`
-    // already names the incoming thread, which is not yet running, so a tick
-    // landing here would save the outgoing thread's stack pointer into the
-    // incoming thread's context and hand two threads the same stack.
+    // Interrupts off across the *whole* decision, not just while a lock is
+    // held. The locks must be dropped before the switch (see the module docs),
+    // and that window is not safe to be preempted in: by then this CPU's
+    // `current` already names the incoming thread, which is not yet running, so
+    // a tick landing here would save the outgoing thread's stack pointer into
+    // the incoming thread's context and hand two threads the same stack.
     //
     // Restored after the switch returns -- which is when *this* thread is
     // scheduled again, using the flag state this thread saved. A thread
@@ -202,51 +420,50 @@ fn schedule(outgoing_state: ThreadState) {
     // `thread_entry` enables interrupts itself.
     let irq = qunix_hal_x86_64::Irq::disable_and_save();
 
+    let cpu = percpu::cpu_id();
+    let current = ThreadId(percpu::current_thread());
+
+    let Some(next) = take_next(cpu) else {
+        // Nothing else to run. An exiting thread has no way forward, so it is
+        // left to `exit_current` to panic; a yielding one simply carries on,
+        // which is the right answer for an idle CPU.
+        if outgoing_state != ThreadState::Exited {
+            reap();
+        }
+        qunix_hal_x86_64::Irq::restore(irq);
+        return;
+    };
+
     // Raw pointers are copied out under the lock and used after it is dropped;
     // see the module docs on why the lock cannot span the switch.
     let (from_slot, to_ctx): (*mut *mut Context, *mut Context);
     let incoming_stack_top: u64;
+    let incoming_root: Option<u64>;
 
     {
         let mut sched = SCHED.lock();
-        let current = sched.current;
 
-        let Some(next) = sched.queue.pop() else {
-            // Nothing else to run. An exiting thread has no way forward, so it
-            // is left to `exit_current` to panic; a yielding one simply carries
-            // on, which is the right answer for the boot thread.
-            // The guard is dropped *before* the flag is restored, on both
-            // paths. Restoring first re-enables interrupts while `SCHED` is
-            // still held on this CPU, and the guard's own restore cannot undo
-            // it -- `IrqSpinLock::lock` captured `was_enabled = false`, because
-            // `schedule` had already masked. A tick landing in that window
-            // re-enters `preempt` -> `schedule` -> `SCHED.lock()` and spins
-            // against a lock this CPU owns, which is exactly the self-deadlock
-            // the `IrqSpinLock` choice is documented to prevent.
-            drop(sched);
-            if outgoing_state != ThreadState::Exited {
-                reap();
-            }
-            qunix_hal_x86_64::Irq::restore(irq);
-            return;
-        };
-
-        // Requeue the outgoing thread *before* the switch, so it is visible to
-        // whoever schedules next. An exiting thread is deliberately not
-        // requeued -- that is the whole difference between the two states.
         match outgoing_state {
             ThreadState::Exited => {
                 if let Some(t) = sched.threads.get_mut(&current) {
                     t.state = ThreadState::Exited;
                 }
                 sched.reapable.push(current);
+                // An exiting thread is deliberately not handed on: there is
+                // nothing to make runnable again.
+                HANDOFF_ID[cpu as usize].store(NO_THREAD, Ordering::Relaxed);
             }
             _ => {
                 let prio = sched.threads.get(&current).map_or(Priority::Normal, |t| t.priority);
                 if let Some(t) = sched.threads.get_mut(&current) {
                     t.state = ThreadState::Ready;
                 }
-                sched.queue.push(current, prio);
+                // Not pushed to the run queue here. See `HANDOFF_ID`: between
+                // the push and the switch storing this thread's stack pointer,
+                // another CPU could pop it and resume a context that does not
+                // exist yet.
+                HANDOFF_PRIORITY[cpu as usize].store(prio as u8, Ordering::Relaxed);
+                HANDOFF_ID[cpu as usize].store(current.0, Ordering::Relaxed);
             }
         }
 
@@ -258,10 +475,18 @@ fn schedule(outgoing_state: ThreadState) {
         };
         next_thread.state = ThreadState::Running;
         incoming_stack_top = next_thread.kernel_stack_top;
+        incoming_root = next_thread.address_space.as_ref().map(|s| s.root_frame());
         to_ctx = next_thread.context;
+        // A running thread's context slot is null, and a thread is removed from
+        // its run queue before dispatch, so a null here means two CPUs reached
+        // the same thread -- the invariant this whole module is arranged
+        // around, checked rather than assumed.
         assert!(!to_ctx.is_null(), "{next:?} has no saved context to resume");
 
-        sched.current = next;
+        // SAFETY: this is the CPU doing the scheduling, interrupts are masked,
+        // and the incoming thread was removed from every run queue above.
+        unsafe { percpu::set_current_thread(next.0) };
+
         // The address of the outgoing thread's context slot. Taken as a raw
         // pointer so the borrow of the map ends with the guard.
         let outgoing = sched
@@ -272,10 +497,13 @@ fn schedule(outgoing_state: ThreadState) {
     }
 
     // The incoming thread's kernel stack is programmed *before* the switch, so
-    // it is in place the moment that thread runs. A thread that adopted the
-    // boot stack reports 0 and is skipped: it never enters ring 3, so nothing
-    // traps back onto a stack it would have to name, and writing 0 into
-    // `TSS.rsp0` would point the next ring-3 trap at the null page.
+    // it is in place the moment that thread runs. This writes `TSS.rsp0` and
+    // the syscall stub's slot in *this* CPU's block, reached through `GS`, so
+    // it is already per-CPU-correct with more than one CPU scheduling. A thread
+    // that adopted a boot stack reports 0 and is skipped: it never enters
+    // ring 3, so nothing traps back onto a stack it would have to name, and
+    // writing 0 into `TSS.rsp0` would point the next ring-3 trap at the null
+    // page.
     if incoming_stack_top != 0 {
         // SAFETY: the value came from the incoming thread's own stack
         // allocation, which the scheduler's table keeps alive for as long as
@@ -283,42 +511,146 @@ fn schedule(outgoing_state: ThreadState) {
         unsafe { qunix_hal_x86_64::percpu::set_kernel_stack(incoming_stack_top) };
     }
 
-    // Lock released. From here the outgoing thread stops running and does not
+    // The page tables the incoming thread expects. A CPU that ran a user thread
+    // and then switched to a kernel one kept that process's root in CR3 -- the
+    // kernel half is identical, so nothing notices, right up to the point the
+    // process is reaped and its tables are freed underneath this CPU. Now that
+    // a thread can move between CPUs, "the CPU it ran on will switch away" is
+    // no longer something the exit path alone can guarantee, so every dispatch
+    // states which root it wants.
+    // SAFETY: the kernel half maps this code and this stack in every root the
+    // kernel builds, which is what makes a CR3 write here survivable.
+    unsafe { crate::vmspace::activate_root(incoming_root) };
+
+    // Locks released. From here the outgoing thread stops running and does not
     // resume until something switches back to it.
     unsafe { context::switch(from_slot, to_ctx) };
 
-    // Reached only when this thread is scheduled again.
+    // Reached only when this thread is scheduled again, on whichever CPU
+    // resumed it. Publishing that CPU's handoff is the first thing, because
+    // until it happens the thread that gave the CPU up is in no run queue and
+    // cannot be found by anyone.
+    publish_handoff();
     qunix_hal_x86_64::Irq::restore(irq);
     // Whatever ran in between may have exited, so this is the natural place to
     // collect it.
     reap();
 }
 
-/// Frees the stacks of threads that have exited.
+/// Frees the stacks and address spaces of threads that have exited.
 ///
 /// Runs on a thread other than the one being freed, which is the entire reason
-/// it is deferred rather than done in `exit_current`.
+/// it is deferred rather than done in `exit_current`. That rule is what makes
+/// dropping the address space safe as well as the stack: by the time another
+/// thread reaps it, no CPU holds the dying tables in CR3 — the exiting thread
+/// ran `vmspace::activate_kernel_root`, and every other CPU that ever ran that
+/// thread reprogrammed CR3 when it dispatched something else.
 fn reap() {
-    // The stacks are dropped *after* the lock is released: freeing runs the
-    // heap allocator, which takes its own lock, and holding the scheduler lock
-    // across that orders two locks in a way nothing else does.
-    let mut corpses = alloc::vec::Vec::new();
+    // The whole `Thread` is dropped *after* the lock is released: freeing the
+    // stack runs the heap allocator and freeing the address space runs the
+    // frame allocator, each of which takes its own lock. Holding the scheduler
+    // lock across either orders two locks in a way nothing else does.
+    let mut corpses: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
+    let mut orphans: alloc::vec::Vec<ThreadId> = alloc::vec::Vec::new();
     {
         let mut sched = SCHED.lock();
-        let current = sched.current;
         let ids = core::mem::take(&mut sched.reapable);
         for id in ids {
-            if id == current {
-                // Cannot free the stack we are standing on. Put it back for
-                // whoever runs next.
-                sched.reapable.push(id);
+            // Cannot free the stack a CPU is standing on, and cannot free an
+            // address space a CPU may still be running on. With more than one
+            // CPU that is not only *this* CPU's current thread: an exiting
+            // thread queues itself here and then switches away, so it is
+            // briefly still current somewhere.
+            if is_current_anywhere(id) {
+                orphans.push(id);
                 continue;
             }
-            if let Some(mut thread) = sched.threads.remove(&id) {
-                sched.queue.remove(id);
-                corpses.push(thread.stack.take());
+            if let Some(thread) = sched.threads.remove(&id) {
+                corpses.push(thread);
             }
         }
+        sched.reapable.append(&mut orphans);
     }
     drop(corpses);
+}
+
+/// Whether any CPU still names `id` as its running thread.
+///
+/// The single-CPU version of this was `id == sched.current`. With per-CPU
+/// `current` slots that test would let one CPU free the stack another is
+/// executing on, which is the exact failure the deferral exists to prevent.
+fn is_current_anywhere(id: ThreadId) -> bool {
+    // Every installed CPU, not only the online ones. A CPU is running its idle
+    // thread from the moment `init` adopts it, which is before it is marked
+    // online, and freeing a stack out from under it in that window is the same
+    // corruption as doing it later.
+    (0..MAX_CPUS).filter_map(percpu::current_thread_of).any(|running| running == id.0)
+}
+
+/// Runs the scheduler on this CPU for the rest of its life. Never returns.
+///
+/// Every CPU ends up here, the bootstrap processor included. A CPU with nothing
+/// to run halts rather than spinning, and is woken by the IPI `spawn_kernel`
+/// sends — there is no other source of new work, and no timer on a halted CPU
+/// that has nothing queued.
+pub fn idle_loop() -> ! {
+    loop {
+        // Counted before the decision, so a CPU that halts still records the
+        // round it took to get there.
+        //
+        // This is the only witness the kernel has that a thread which never
+        // yields lost its processor. A CPU running such a thread reaches this
+        // loop again only by being preempted -- there is no other path back to
+        // the idle thread -- so a count that moves while a spinner is resident
+        // is proof of preemption, taken on the processor it happened on rather
+        // than inferred from a global tick counter.
+        IDLE_ROUNDS[percpu::cpu_id() as usize].fetch_add(1, Ordering::Relaxed);
+        // Masked across the decision. Work queued between the check and the
+        // halt would otherwise be missed forever: the wakeup IPI would arrive
+        // while this CPU was still deciding, be dropped, and leave the CPU
+        // halted with a full run queue.
+        let _ = qunix_hal_x86_64::Irq::disable_and_save();
+        if runnable_count() > 0 {
+            x86_64::instructions::interrupts::enable();
+            yield_now();
+        } else {
+            // `sti; hlt` has to be one instruction pair with nothing between.
+            // `sti` does not take effect until after the *next* instruction, so
+            // an interrupt that arrived while masked is delivered only once
+            // `hlt` has been entered -- which is what wakes it. Splitting them
+            // reopens the window this whole block exists to close.
+            // SAFETY: no memory is touched and no stack slot is used.
+            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+        }
+    }
+}
+
+/// Room for one run queue per CPU is asserted, not assumed: a `cpu_id` past the
+/// end would index out of bounds in `publish_handoff` on the first switch.
+const _: () = assert!(HANDOFF_ID.len() == MAX_CPUS as usize);
+const _: () = assert!(HANDOFF_PRIORITY.len() == MAX_CPUS as usize);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn the_handoff_priority_encoding_round_trips_every_band() {
+        // The handoff slot carries a priority as a byte, and `publish_handoff`
+        // rebuilds it. Getting that wrong is silent, and wrong in one direction
+        // is dangerous rather than merely unfair: an idle thread decoded into
+        // the Normal band becomes stealable, and an idle thread adopted the
+        // stack its own CPU booted on.
+        for band in [Priority::Idle, Priority::Normal, Priority::High] {
+            assert_eq!(
+                priority_from_raw(band as u8),
+                band,
+                "{band:?} did not survive the handoff encoding"
+            );
+        }
+        // The negative direction: the fallback arm must not quietly turn an
+        // unknown byte into the idle band, which is the one band that must
+        // never be produced by accident.
+        assert_ne!(priority_from_raw(9), Priority::Idle, "an unknown band decoded as Idle");
+    }
 }

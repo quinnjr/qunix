@@ -105,11 +105,35 @@ pub fn map_lapic() {
     LAPIC_MAPPED.store(true, Ordering::Release);
 }
 
-/// Registers the APIC timer handler. Separate from apic::init so tests can
-/// install the handler before enabling interrupts.
-pub fn install_timer() {
+/// Vector an idle CPU is woken on when work appears.
+///
+/// A halted CPU with an empty run queue has no timer of its own to wake it and
+/// no way to notice a push, so `sched::spawn_kernel` sends this after queueing.
+pub const WAKE_VECTOR: u8 = 34;
+
+/// Does nothing but acknowledge. Leaving `hlt` is the entire effect: the idle
+/// loop re-reads the run queues the instant it resumes.
+///
+/// Deliberately touches no `gs:`-relative state. This can land while ring 3 is
+/// running, and ring 3 is free to have zeroed the hidden GS base with
+/// `mov gs, ax`; a handler that reads nothing through `GS` needs no repair, and
+/// not needing one is cheaper and harder to get wrong than doing one.
+extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
+    qunix_hal_x86_64::apic::eoi();
+}
+
+/// Registers the interrupt vectors that are this CPU's own.
+///
+/// Both are per-CPU because the IDT is: `idt::set_handler` writes the table of
+/// the CPU it is called on, so every CPU must run this or it triple-faults on
+/// the first timer tick or wakeup IPI it is sent.
+///
+/// Separate from `apic::init` so tests can install the handlers before enabling
+/// interrupts.
+pub fn install_local_vectors() {
     unsafe {
-        qunix_hal_x86_64::idt::set_handler(qunix_hal_x86_64::apic::TIMER_VECTOR, timer_handler)
+        qunix_hal_x86_64::idt::set_handler(qunix_hal_x86_64::apic::TIMER_VECTOR, timer_handler);
+        qunix_hal_x86_64::idt::set_handler(WAKE_VECTOR, wake_handler);
     };
 }
 
@@ -168,13 +192,24 @@ pub extern "C" fn kmain() -> ! {
         sched::runnable_count()
     );
 
-    install_timer();
+    install_local_vectors();
     map_lapic();
     // SAFETY: map_lapic() has just mapped the LAPIC page uncacheable at this
     // exact HHDM offset.
     unsafe { qunix_hal_x86_64::apic::init(boot::hhdm_offset()) };
+    // The `SYSCALL` MSRs are per-CPU, so this is bring-up rather than something
+    // the first user thread can do for itself: a thread that started on the BSP
+    // and was later stolen by a processor which never ran this would raise #UD
+    // on its next syscall.
+    // SAFETY: this CPU's per-CPU block and GDT are installed.
+    unsafe { crate::syscall::init() };
     qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
     x86_64::instructions::interrupts::enable();
+    // The BSP can service an IPI from here on: IDT loaded, LAPIC enabled,
+    // interrupts unmasked. Before this point a shootdown initiated by any other
+    // CPU would wait on an acknowledgement the BSP could not send — which is
+    // why the mask is set here and not in `install_bsp`.
+    qunix_hal_x86_64::percpu::mark_online();
     // Only now: preemption before this point would let a tick switch threads
     // while the scheduler still had no thread table, and before the APIC timer
     // exists there is nothing to drive it anyway.
@@ -190,7 +225,7 @@ pub extern "C" fn kmain() -> ! {
         // module is a boot configuration problem rather than a kernel fault.
         None => println!("qunix: no init module; continuing without userspace"),
     }
-    // Hand the CPU over so init actually runs before the boot thread parks.
+    // Hand the CPU over so init actually runs before this thread moves on.
     sched::yield_now();
 
     let started = smp::start_all();
@@ -208,19 +243,15 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(test)]
     test_main();
 
-    halt_forever();
+    // The bootstrap processor becomes an ordinary scheduling CPU like the rest,
+    // rather than halting with a run queue it would never look at again.
+    sched::idle_loop();
 }
 
 /// The first thread the kernel ever schedules.
 extern "C" fn greet(_: u64) -> ! {
     println!("qunix: hello from {:?} on its own stack", sched::current_id());
     sched::exit_current();
-}
-
-fn halt_forever() -> ! {
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
-    }
 }
 
 #[cfg(test)]
@@ -362,10 +393,10 @@ mod tests {
         for i in 0..3u64 {
             crate::sched::spawn_kernel(sched_worker, i, Priority::Normal);
         }
-        // Each yield runs one worker to completion and comes back here.
-        for _ in 0..8 {
-            crate::sched::yield_now();
-        }
+        // A wait rather than a fixed number of yields: a worker may be stolen
+        // and run on another CPU, in which case this thread's yields return
+        // immediately without having run anything.
+        wait_until(|| SPAWN_LOG.load(Ordering::SeqCst) == 0b111, WAIT_BUDGET);
 
         assert_eq!(
             SPAWN_LOG.load(Ordering::SeqCst),
@@ -385,9 +416,7 @@ mod tests {
         SPAWN_LOG.store(0, Ordering::SeqCst);
 
         crate::sched::spawn_kernel(sched_yielder, 0, Priority::Normal);
-        for _ in 0..8 {
-            crate::sched::yield_now();
-        }
+        wait_until(|| SPAWN_LOG.load(Ordering::SeqCst) & (1 << 8) != 0, WAIT_BUDGET);
 
         // Bit 0 is "started", bit 8 is "resumed after yielding". A scheduler
         // that dropped the thread on yield would set only the first.
@@ -403,27 +432,38 @@ mod tests {
     fn exited_threads_are_reaped_so_their_stacks_are_freed() {
         use qunix_sched::Priority;
 
+        use core::sync::atomic::Ordering;
+
         crate::frames::init();
         crate::heap::init();
         crate::sched::init();
+        SPAWN_LOG.store(0, Ordering::SeqCst);
 
-        let before = crate::sched::thread_count();
-        for i in 0..4u64 {
-            crate::sched::spawn_kernel(sched_worker, i, Priority::Normal);
+        let before = quiesce();
+        let mut ids = [qunix_sched::ThreadId(0); 4];
+        for (i, slot) in ids.iter_mut().enumerate() {
+            *slot = crate::sched::spawn_kernel(sched_worker, i as u64, Priority::Normal);
         }
-        assert_eq!(crate::sched::thread_count(), before + 4);
+        // "The count grew by four" is no longer a fact the spawner can observe:
+        // an application processor may have stolen, run and reaped one before
+        // this line. That each thread really existed is established by its bit
+        // in the log instead.
+        wait_until(|| SPAWN_LOG.load(Ordering::SeqCst) == 0b1111, WAIT_BUDGET);
+        assert_eq!(SPAWN_LOG.load(Ordering::SeqCst), 0b1111, "not every thread ran");
 
-        for _ in 0..12 {
-            crate::sched::yield_now();
+        // The negative direction, per thread rather than in aggregate: an
+        // exited thread must actually leave the table. A scheduler that only
+        // marked them would grow without bound and leak a 16 KiB stack each.
+        for id in ids {
+            assert!(
+                wait_until_reaped(id),
+                "{id:?} exited but was never reaped; its stack is still allocated"
+            );
         }
-
-        // The negative direction: exited threads must actually leave the table.
-        // A scheduler that only marked them would grow without bound and leak a
-        // 16 KiB stack per thread.
         assert_eq!(
-            crate::sched::thread_count(),
+            quiesce(),
             before,
-            "exited threads were not reaped; their stacks are still allocated"
+            "the thread table did not return to its size before the spawns"
         );
     }
 
@@ -437,12 +477,7 @@ mod tests {
         // established rather than assumed. Without this the test passes even
         // when `yield_now` switched away and came back, which is the case the
         // name says is absent.
-        for _ in 0..16 {
-            if crate::sched::runnable_count() == 0 {
-                break;
-            }
-            crate::sched::yield_now();
-        }
+        wait_until(|| crate::sched::runnable_count() == 0, WAIT_BUDGET);
         assert_eq!(crate::sched::runnable_count(), 0, "could not reach an empty run queue");
 
         // Preemption off, so a switch can only come from `yield_now` itself.
@@ -463,18 +498,20 @@ mod tests {
     }
 
     static SPIN_RAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static SPIN_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static SPIN_STOP: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
-    /// Never calls `yield_now`, so the only thing that can take the CPU from it
-    /// is a timer tick.
+    /// Never calls `yield_now`, so nothing but a timer tick can take the CPU
+    /// from it.
     ///
     /// It does watch a stop flag, which is not a weakening of the test: the
     /// in-QEMU harness runs every test against one kernel and one scheduler, so
     /// a thread that truly never terminates is inherited by every later test.
     /// An earlier version of this omitted the flag and hung the next test.
-    extern "C" fn spinner(_: u64) -> ! {
+    extern "C" fn spinner(arg: u64) -> ! {
         use core::sync::atomic::Ordering;
+        SPIN_STARTED.fetch_or(1u64 << arg, Ordering::SeqCst);
         while !SPIN_STOP.load(Ordering::SeqCst) {
             SPIN_RAN.fetch_add(1, Ordering::SeqCst);
             core::hint::spin_loop();
@@ -490,45 +527,335 @@ mod tests {
         crate::frames::init();
         crate::heap::init();
         crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
         SPIN_RAN.store(0, Ordering::SeqCst);
+        SPIN_STARTED.store(0, Ordering::SeqCst);
         SPIN_STOP.store(false, Ordering::SeqCst);
-        let before = crate::sched::thread_count();
+        let before = quiesce();
+
+        // One spinner per application processor. This thread masks interrupts
+        // for the duration, so the bootstrap processor provably dispatches none
+        // of them.
+        //
+        // It used to spawn one *more* spinner than there are processors able to
+        // run them, and assert that all of them started -- on the reasoning
+        // that the extra one could only run if a tick preempted a resident
+        // spinner. That reasoning was wrong twice over, and the test passed
+        // anyway:
+        //
+        // - The extra spinner is queued on the bootstrap processor, which is
+        //   masked and never schedules. Reaching it requires *migration*, and
+        //   an application processor steals only when its own run queue is
+        //   empty at the moment it schedules. Once it holds a spinner and its
+        //   own idle thread, it never looks elsewhere again, so the extra
+        //   spinner starves regardless of how often anything is preempted. The
+        //   assertion was about work stealing, not preemption, and it was false
+        //   even about that.
+        // - It passed because the old code re-enabled interrupts *before*
+        //   asserting, so the bootstrap processor dispatched the extra spinner
+        //   itself -- exactly the coincidence the comment above claimed to have
+        //   excluded.
+        //
+        // What proves preemption is asked of the processor it happens on: an
+        // application processor running a thread that never yields reaches its
+        // idle loop again only by being preempted, because nothing else gives
+        // the idle thread back its CPU. `sched::idle_rounds` counts that.
+        let cpus = crate::smp::cpu_count() as u64;
+        assert!(cpus >= 2, "qemu must be launched with -smp; only {cpus} cpu(s) reported");
+        let spinners = cpus - 1;
+        assert!(spinners <= 64, "the spinner bitmap is a u64");
 
         let was = crate::sched::set_preemption(true);
-        crate::sched::spawn_kernel(spinner, 0, Priority::Normal);
-
-        // Hand the CPU over once. From here the spinner never yields, so only
-        // a timer tick can bring control back to this thread.
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
         let ticks_before = crate::TICKS.load(Ordering::SeqCst);
-        crate::sched::yield_now();
+        for i in 0..spinners {
+            crate::sched::spawn_kernel(spinner, i, Priority::Normal);
+        }
 
+        x86_64::instructions::interrupts::disable();
+        let all = u64::MAX >> (64 - spinners);
+        let mut budget = 200_000_000u64;
+        while SPIN_STARTED.load(Ordering::SeqCst) != all && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+
+        // Sampled only once every spinner is resident, so growth from before
+        // they started cannot be mistaken for growth caused by preempting one.
+        let idle_before: [u64; 64] = core::array::from_fn(|cpu| {
+            if (cpu as u64) < cpus { crate::sched::idle_rounds(cpu as u32) } else { 0 }
+        });
+        // Bounded in ticks rather than in spin iterations. The budget above is
+        // a count of instructions, which is a different amount of wall-clock on
+        // every host and under TCG is not close to the same -- and what is
+        // being waited for is a timer, measured in ticks. Ticks still advance
+        // here with interrupts masked on this processor: the application
+        // processors have timers of their own.
+        let deadline = ticks_before + 20;
+        let mut preempted = 0u64;
+        while crate::TICKS.load(Ordering::SeqCst) < deadline {
+            preempted = (1..cpus)
+                .filter(|cpu| crate::sched::idle_rounds(*cpu as u32) > idle_before[*cpu as usize])
+                .count() as u64;
+            if preempted > 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        // Interrupts stay masked through every assertion below and through the
+        // store that stops the spinners. Re-enabling here instead left a window
+        // this thread could not survive: it adopted the boot context, so it is
+        // an *idle*-band thread, and there are now `cpus` Normal-band spinners
+        // that never yield. A tick landing anywhere in that window preempts
+        // this thread in favour of one of them, and nothing can ever dispatch
+        // it again -- the only thing that stops the spinners is the
+        // `SPIN_STOP` store it never reaches. The suite then hangs until the
+        // harness timeout, which reports no test name and no reason.
+        //
+        // It survived locally because the window is a few hundred instructions
+        // and a tick is ~10 ms. Under TCG on a CI runner the same window is
+        // long enough in wall-clock for a tick to land in it. This is the
+        // hazard CLAUDE.md states in full: a test that spins rather than yields
+        // must mask interrupts *for the duration*, and the duration does not
+        // end at the spin -- it ends when the threads that could starve this
+        // one have been told to stop.
+        //
+        // Nothing below needs interrupts. Every assertion reads an atomic or
+        // takes an `IrqSpinLock`, both of which are correct while masked, and a
+        // failing assertion panics, which halts the machine and does not need
+        // to be scheduled.
+
+        assert_eq!(
+            SPIN_STARTED.load(Ordering::SeqCst),
+            all,
+            "only {} of {spinners} spinners started on {} application processors",
+            SPIN_STARTED.load(Ordering::SeqCst).count_ones(),
+            cpus - 1
+        );
+        assert!(SPIN_RAN.load(Ordering::SeqCst) > 0, "no spinner made progress");
+        // The assertion the test is named for. Every application processor is
+        // running a thread that never yields, so reaching the idle loop again
+        // has exactly one cause. Nothing here is a proxy: not `TICKS`, which
+        // moves whether or not a tick switches anything, and not "control came
+        // back to this thread", which says only that this processor is idle.
         assert!(
-            SPIN_RAN.load(Ordering::SeqCst) > 0,
-            "the spinner never ran"
+            preempted > 0,
+            "no application processor returned to its idle loop in 20 ticks; a thread that \
+             never yields kept its processor, so the timer is not preempting"
         );
         assert!(
             crate::TICKS.load(Ordering::SeqCst) > ticks_before,
-            "no timer tick was taken; preemption cannot be what returned control"
+            "no timer tick was taken; preemption cannot be what shared the processors"
         );
-        // The spinner is still runnable and must not have been reaped.
+        // The preempted spinners must still be runnable, not reaped.
         assert!(
             crate::sched::thread_count() > before,
-            "the preempted thread disappeared instead of staying runnable"
+            "the preempted threads disappeared instead of staying runnable"
         );
 
-        // Wind it down, or every later test inherits a thread that never ends.
+        // Wind them down, or every later test inherits threads that never end.
+        // Still masked, so this store cannot be preempted away from.
         SPIN_STOP.store(true, Ordering::SeqCst);
-        for _ in 0..16 {
-            if crate::sched::thread_count() == before {
-                break;
-            }
-            crate::sched::yield_now();
+
+        // Only now. From here the spinners are all on their way out, so being
+        // preempted costs this thread a delay rather than its existence: the
+        // run queues drain and an idle-band thread is dispatchable again.
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
         }
+        wait_until(|| crate::sched::thread_count() == before, WAIT_BUDGET);
         crate::sched::set_preemption(was);
         assert_eq!(
             crate::sched::thread_count(),
             before,
-            "the spinner did not exit; later tests would inherit it"
+            "the spinners did not exit; later tests would inherit them"
+        );
+    }
+
+    /// Which CPUs a batch of worker threads observed themselves running on.
+    static RAN_ON: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// One bit per worker, so "all four ran" is distinguishable from "one ran
+    /// four times".
+    static RAN_WORKERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Records where it ran and exits immediately.
+    extern "C" fn cpu_worker(arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        RAN_ON.fetch_or(1u64 << qunix_hal_x86_64::percpu::cpu_id(), Ordering::SeqCst);
+        RAN_WORKERS.fetch_or(1u64 << arg, Ordering::SeqCst);
+        crate::sched::exit_current();
+    }
+
+    /// Records where it ran, then refuses to finish until a *second* CPU has
+    /// recorded itself.
+    ///
+    /// The barrier is what forces the outcome rather than hoping for it. A
+    /// worker that merely exits leaves the spawning CPU free to run the whole
+    /// batch before any other processor has finished waking from `hlt`, and
+    /// "they all ran on one CPU" is then a statement about wake-up latency
+    /// rather than about the scheduler. Holding each worker here keeps the run
+    /// queue non-empty for as long as it takes another CPU to reach it, and one
+    /// CPU alone can never satisfy the condition however it interleaves them.
+    ///
+    /// Bounded, so a kernel where no other CPU ever schedules fails the
+    /// assertion instead of hanging the suite.
+    extern "C" fn spread_worker(arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        RAN_ON.fetch_or(1u64 << qunix_hal_x86_64::percpu::cpu_id(), Ordering::SeqCst);
+        let mut budget = 50_000_000u64;
+        while RAN_ON.load(Ordering::SeqCst).count_ones() < 2 && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        RAN_WORKERS.fetch_or(1u64 << arg, Ordering::SeqCst);
+        crate::sched::exit_current();
+    }
+
+    #[test_case]
+    fn work_queued_on_one_cpu_is_stolen_by_another_when_the_owner_never_dispatches() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        // The contention is forced, not hoped for. `spawn_kernel` queues on the
+        // calling CPU, and with preemption off this thread never yields, so
+        // this CPU provably dispatches none of these threads. Anything that
+        // runs them was stolen. A steal path left to the scheduler's discretion
+        // is covered on a machine where a steal happens to occur and uncovered
+        // on one where it does not, which CLAUDE.md is explicit is not a test.
+        let was = crate::sched::set_preemption(false);
+        RAN_ON.store(0, Ordering::SeqCst);
+        RAN_WORKERS.store(0, Ordering::SeqCst);
+        let steals_before = crate::sched::steal_count();
+        let me = qunix_hal_x86_64::percpu::cpu_id();
+
+        const WORKERS: u64 = 4;
+        for i in 0..WORKERS {
+            crate::sched::spawn_kernel(cpu_worker, i, Priority::Normal);
+        }
+
+        // Spin rather than yield. Yielding would dispatch them here and destroy
+        // the property being tested.
+        let all = u64::MAX >> (64 - WORKERS);
+        let mut budget = 200_000_000u64;
+        while RAN_WORKERS.load(Ordering::SeqCst) != all && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        crate::sched::set_preemption(was);
+
+        assert_eq!(
+            RAN_WORKERS.load(Ordering::SeqCst),
+            all,
+            "{} of {WORKERS} queued threads were never stolen; this cpu ran none of them",
+            RAN_WORKERS.load(Ordering::SeqCst).count_ones()
+        );
+        // The direction the counter exists for: they must have arrived by
+        // stealing, not by some other CPU having been handed them directly.
+        assert!(
+            crate::sched::steal_count() >= steals_before + WORKERS,
+            "threads ran without the steal counter moving"
+        );
+        let cpus = RAN_ON.load(Ordering::SeqCst);
+        assert_eq!(
+            cpus & (1u64 << me),
+            0,
+            "cpu {me} ran a thread it never dispatched; preemption was not actually off"
+        );
+        assert!(cpus != 0, "no cpu was recorded");
+    }
+
+    #[test_case]
+    fn more_threads_than_cpus_all_run_and_on_more_than_one_cpu() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        let cpus = crate::smp::cpu_count() as u64;
+        assert!(cpus >= 2, "qemu must be launched with -smp; only {cpus} cpu(s) reported");
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        RAN_ON.store(0, Ordering::SeqCst);
+        RAN_WORKERS.store(0, Ordering::SeqCst);
+        // Three times the CPU count, so no single CPU can be running them all
+        // concurrently and every CPU has a reason to look for work.
+        let workers = cpus * 3;
+        assert!(workers <= 64, "the worker bitmap is a u64");
+        for i in 0..workers {
+            crate::sched::spawn_kernel(spread_worker, i, Priority::Normal);
+        }
+
+        let all = u64::MAX >> (64 - workers);
+        wait_until(|| RAN_WORKERS.load(Ordering::SeqCst) == all, WAIT_BUDGET);
+
+        assert_eq!(
+            RAN_WORKERS.load(Ordering::SeqCst),
+            all,
+            "not every spawned thread ran, or one ran twice"
+        );
+        // The point of per-CPU scheduling. One CPU here would mean the
+        // application processors are online and idle, which is exactly the
+        // state this replaced -- and every other assertion in this test would
+        // still hold.
+        assert!(
+            RAN_ON.load(Ordering::SeqCst).count_ones() >= 2,
+            "every thread ran on one cpu ({:#b}); the other processors did not schedule",
+            RAN_ON.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test_case]
+    fn every_processor_runs_a_thread_of_its_own() {
+        use qunix_hal_x86_64::percpu;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        // No CPU may claim to be running the thread another CPU is running.
+        // This is the failure D3 named -- one shared `current` slot, two CPUs
+        // saving into one context, two threads on one stack -- checked
+        // directly rather than through its symptoms. Two CPUs reporting the
+        // same id is that state.
+        let mut seen: [u64; 64] = [percpu::NO_THREAD; 64];
+        let mut count = 0usize;
+        for cpu in 0..64u32 {
+            let Some(id) = percpu::current_thread_of(cpu) else {
+                continue;
+            };
+            if id == percpu::NO_THREAD {
+                continue;
+            }
+            for other in &seen[..count] {
+                assert_ne!(*other, id, "two cpus report running the same thread {id}");
+            }
+            seen[count] = id;
+            count += 1;
+        }
+        assert_eq!(
+            count,
+            crate::smp::cpu_count() as usize,
+            "only {count} of {} processors have a thread of their own",
+            crate::smp::cpu_count()
         );
     }
 
@@ -593,6 +920,262 @@ mod tests {
         );
         // The BSP must still be reading its own block, not an AP's.
         assert_eq!(percpu::cpu_id(), 0, "the BSP's GS was repointed by AP bring-up");
+    }
+
+    #[test_case]
+    fn a_shootdown_returns_only_after_every_other_cpu_has_invalidated() {
+        use qunix_hal_x86_64::percpu::{self, MAX_CPUS};
+        use qunix_hal_x86_64::tlb;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::smp::start_all();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        let me = percpu::cpu_id();
+        let remote = percpu::online_mask() & !(1u64 << me);
+        // A vacuous pass is the failure mode here, exactly as it is for the AP
+        // bring-up test: with nothing in the remote set, every assertion below
+        // is equally true of a shootdown that does nothing at all.
+        assert!(
+            remote.count_ones() >= 1,
+            "no remote cpu is in the shootdown mask; nothing below would be tested"
+        );
+
+        let mut before = [0u64; MAX_CPUS as usize];
+        for (cpu, slot) in before.iter_mut().enumerate() {
+            *slot = tlb::serviced(cpu as u32);
+        }
+
+        tlb::shootdown_all();
+
+        // Sampled with nothing at all between it and the return, because this
+        // is the assertion that separates a shootdown from a notification.
+        // Taking the interrupt on another processor, dispatching the vector and
+        // running the handler is hundreds of cycles at best, and more when that
+        // processor is halted and has to be woken; an initiator that sent the
+        // IPI and returned would be caught here with the counters still at
+        // their old values. That is a very strong likelihood rather than a
+        // proof — nothing bounds how fast a remote CPU may respond — which is
+        // why `outstanding` is checked as well.
+        let mut after = [0u64; MAX_CPUS as usize];
+        for (cpu, slot) in after.iter_mut().enumerate() {
+            *slot = tlb::serviced(cpu as u32);
+        }
+        let outstanding = tlb::pending();
+
+        for cpu in 0..MAX_CPUS {
+            if remote & (1u64 << cpu) == 0 {
+                continue;
+            }
+            assert!(
+                after[cpu as usize] > before[cpu as usize],
+                "cpu {cpu} had not invalidated when the shootdown returned"
+            );
+        }
+        assert_eq!(outstanding, 0, "the shootdown returned with acknowledgements outstanding");
+        // The initiator must never be in its own outstanding set. It waits
+        // before it is in any position to service anything, so a mask that
+        // included it would hang rather than merely run slowly, and no test
+        // after this one would ever report.
+        assert_eq!(
+            after[me as usize], before[me as usize],
+            "the initiator serviced its own shootdown; it would have waited on itself"
+        );
+    }
+
+    /// Kernel-half scratch address for the cross-CPU shootdown test.
+    ///
+    /// The kernel half deliberately: entries 256..512 are shared by reference
+    /// into every address space, so a mapping made here is walked by every CPU
+    /// through the same tables. A lower-half address would be private to
+    /// whichever address space made it and no other CPU would resolve it at
+    /// all, which would make the test pass for the wrong reason.
+    const REMOTE_VA: u64 = 0xffff_9b00_0000_0000;
+    const REMOTE_OLD: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    const REMOTE_NEW: u64 = 0x5555_5555_5555_5555;
+    /// Neither of the two frame contents, so "not yet read" is distinguishable.
+    const NOT_READ: u64 = u64::MAX;
+
+    static REMOTE_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static REMOTE_FIRST: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(NOT_READ);
+    static REMOTE_SECOND: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(NOT_READ);
+    static REMOTE_REMAPPED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Caches a translation, waits for it to be shot down, then reads again.
+    extern "C" fn stale_reader(_: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        REMOTE_CPU.store(qunix_hal_x86_64::percpu::cpu_id() as u64, Ordering::SeqCst);
+        // Everything this test proves rests on this read. It is what puts the
+        // translation in *this* CPU's TLB; without it the second read below is
+        // a fresh page-table walk, which finds the new frame whether or not
+        // anything was ever invalidated.
+        // SAFETY: the initiating CPU mapped this page before spawning us and
+        // does not unmap it until after the second read is published.
+        let first = unsafe { (REMOTE_VA as *const u64).read_volatile() };
+        REMOTE_FIRST.store(first, Ordering::SeqCst);
+
+        // Spins rather than yields: yielding could put this thread back on the
+        // initiating CPU, and the whole point is that the second read happens
+        // on a different one. Bounded, so a remap that never comes fails the
+        // assertions rather than hanging the suite.
+        let mut budget = 200_000_000u64;
+        while !REMOTE_REMAPPED.load(Ordering::SeqCst) && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        // SAFETY: as above; the page is mapped again by now.
+        let second = unsafe { (REMOTE_VA as *const u64).read_volatile() };
+        REMOTE_SECOND.store(second, Ordering::SeqCst);
+        crate::sched::exit_current();
+    }
+
+    #[test_case]
+    fn a_remote_cpu_reads_the_new_frame_after_a_shootdown_not_the_old_one() {
+        use core::sync::atomic::Ordering;
+        use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        // The failure a shootdown exists to prevent, constructed rather than
+        // inferred: a CPU that still resolves an address through the frame the
+        // initiator has already moved on from. Expressed as a *remap* rather
+        // than an unmap because a stale read is observable and a stale fault is
+        // not -- a #PF taken in ring 0 panics the kernel, so a test built on
+        // one could never report its own result.
+        let hhdm = crate::boot::hhdm_offset();
+        let mut space = unsafe { AddressSpace::active(hhdm) };
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+        let old = crate::frames::alloc(0).expect("frame allocation failed");
+        let new = crate::frames::alloc(0).expect("frame allocation failed");
+        assert_ne!(old, new, "the allocator handed out one frame twice");
+        unsafe {
+            ((hhdm + old) as *mut u64).write_volatile(REMOTE_OLD);
+            ((hhdm + new) as *mut u64).write_volatile(REMOTE_NEW);
+            space.map(REMOTE_VA, old, flags, &mut || crate::frames::alloc(0)).expect("map failed");
+        }
+
+        REMOTE_CPU.store(0, Ordering::SeqCst);
+        REMOTE_FIRST.store(NOT_READ, Ordering::SeqCst);
+        REMOTE_SECOND.store(NOT_READ, Ordering::SeqCst);
+        REMOTE_REMAPPED.store(false, Ordering::SeqCst);
+
+        // Preemption off and no yielding below, so this CPU provably never
+        // dispatches the reader. Whatever runs it is another processor, which
+        // is the only arrangement in which "remote" means anything.
+        let was = crate::sched::set_preemption(false);
+        let me = qunix_hal_x86_64::percpu::cpu_id() as u64;
+        crate::sched::spawn_kernel(stale_reader, 0, Priority::Normal);
+
+        let mut budget = 200_000_000u64;
+        while REMOTE_FIRST.load(Ordering::SeqCst) == NOT_READ && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        assert_ne!(
+            REMOTE_FIRST.load(Ordering::SeqCst),
+            NOT_READ,
+            "no other processor ran the reader; there is nothing remote to test"
+        );
+        assert_ne!(REMOTE_CPU.load(Ordering::SeqCst), me, "the reader ran on the initiating cpu");
+        assert_eq!(
+            REMOTE_FIRST.load(Ordering::SeqCst),
+            REMOTE_OLD,
+            "the reader did not see the original frame, so it cached nothing"
+        );
+
+        // The shootdown is inside `unmap`, and it does not return until the
+        // reader's CPU has invalidated. The remap that follows is therefore
+        // guaranteed to be what that CPU's next walk finds.
+        unsafe {
+            space.unmap(REMOTE_VA).expect("unmap failed");
+            space.map(REMOTE_VA, new, flags, &mut || crate::frames::alloc(0)).expect("remap failed");
+        }
+        REMOTE_REMAPPED.store(true, Ordering::SeqCst);
+
+        let mut budget = 200_000_000u64;
+        while REMOTE_SECOND.load(Ordering::SeqCst) == NOT_READ && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        crate::sched::set_preemption(was);
+
+        let observed = REMOTE_SECOND.load(Ordering::SeqCst);
+        assert_ne!(observed, NOT_READ, "the reader never took its second read");
+        assert_eq!(
+            observed,
+            REMOTE_NEW,
+            "cpu {} resolved the old frame after the shootdown returned",
+            REMOTE_CPU.load(Ordering::SeqCst)
+        );
+
+        wait_until(|| REMOTE_SECOND.load(Ordering::SeqCst) != NOT_READ, WAIT_BUDGET);
+        unsafe {
+            space.unmap(REMOTE_VA).expect("teardown unmap failed");
+            crate::frames::free(old, 0);
+            crate::frames::free(new, 0);
+        }
+    }
+
+    #[test_case]
+    fn a_remapped_page_is_not_read_through_the_old_translation() {
+        use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+
+        crate::frames::init();
+        let hhdm = crate::boot::hhdm_offset();
+        let mut space = unsafe { AddressSpace::active(hhdm) };
+        const VA: u64 = 0xffff_9a00_0000_0000;
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+
+        // The same failure as
+        // `a_remote_cpu_reads_the_new_frame_after_a_shootdown_not_the_old_one`,
+        // on the CPU that performs the remap rather than on another one. Kept
+        // beside it because the two invalidations are separate code — `unmap`
+        // issues a local `invlpg` and then a shootdown, and a change that broke
+        // only the local half would leave the remote test green.
+        let old = crate::frames::alloc(0).expect("frame allocation failed");
+        let new = crate::frames::alloc(0).expect("frame allocation failed");
+        assert_ne!(old, new, "the allocator handed out one frame twice");
+        unsafe {
+            core::ptr::write_bytes((hhdm + old) as *mut u8, 0xA5, 4096);
+            core::ptr::write_bytes((hhdm + new) as *mut u8, 0x5A, 4096);
+            space.map(VA, old, flags, &mut || crate::frames::alloc(0)).expect("map failed");
+        }
+
+        // Read before the remap, so the translation is actually cached in this
+        // CPU's TLB. Without it the assertion below passes on a kernel that
+        // never invalidates anything, because the walk would be fresh either
+        // way -- which is the shape of test this project has already shipped.
+        assert_eq!(unsafe { (VA as *const u8).read_volatile() }, 0xA5, "the old frame was not mapped");
+
+        unsafe {
+            space.unmap(VA).expect("unmap failed");
+            space.map(VA, new, flags, &mut || crate::frames::alloc(0)).expect("remap failed");
+        }
+        assert_eq!(
+            unsafe { (VA as *const u8).read_volatile() },
+            0x5A,
+            "the cpu resolved the old frame through a stale translation"
+        );
+
+        unsafe {
+            space.unmap(VA).expect("teardown unmap failed");
+            crate::frames::free(old, 0);
+            crate::frames::free(new, 0);
+        }
     }
 
     #[test_case]
@@ -750,6 +1333,10 @@ mod tests {
 
     #[test_case]
     fn a_faulting_user_program_dies_without_taking_the_kernel_with_it() {
+        // Declared, not exempted: the harness asserts the kill count moves by
+        // exactly this much, so a test that expects one kill and causes two --
+        // or none -- still fails.
+        crate::testing::expect_process_kills(1);
         use crate::process;
 
         crate::frames::init();
@@ -767,22 +1354,177 @@ mod tests {
         // `enter_user` clears every GPR, so rax is 0 and the first instruction
         // writes to the null page -- a #PF from ring 3, deterministically.
         let image = elf_with_segment(crate::process::USER_TEXT, 1 | 4, 4096);
-        let before = crate::sched::thread_count();
+        let before = quiesce();
         let id = process::spawn_elf(&image).expect("the faulting image failed to load");
 
         // Bounded. If the fault panicked instead of killing the process, this
-        // test never gets to fail -- the machine is already dead -- so the loop
+        // test never gets to fail -- the machine is already dead -- so the wait
         // is here to bound the *success* path, not to catch the failure.
-        for _ in 0..1000 {
-            if crate::sched::thread_count() <= before {
-                break;
-            }
-            crate::sched::yield_now();
-        }
+        wait_until(|| crate::sched::thread_count() <= before, WAIT_BUDGET);
 
         assert!(
             crate::sched::thread_count() <= before,
             "{id:?} is still alive after faulting; it was neither killed nor reaped"
+        );
+    }
+
+    /// Yields and spins until `condition` holds, or the budget runs out.
+    ///
+    /// Both, deliberately. Work runs on application processors now, so a
+    /// condition can be satisfied by a CPU this thread never yields to — and
+    /// with an empty local run queue `yield_now` returns immediately, so a loop
+    /// that only yielded would burn its whole budget without giving any other
+    /// CPU wall-clock time to finish.
+    ///
+    /// Bounded rather than unbounded because a condition that never holds must
+    /// fail the calling test rather than hang the suite.
+    fn wait_until(mut condition: impl FnMut() -> bool, budget: u32) -> bool {
+        for _ in 0..budget {
+            if condition() {
+                return true;
+            }
+            crate::sched::yield_now();
+            for _ in 0..256 {
+                core::hint::spin_loop();
+            }
+        }
+        condition()
+    }
+
+    /// Budget for waiting on other CPUs. Generous: under TCG the guest runs
+    /// orders of magnitude slower than under KVM, and a budget tuned to one is
+    /// a spurious failure on the other.
+    const WAIT_BUDGET: u32 = 20_000;
+
+    fn wait_until_reaped(id: qunix_sched::ThreadId) -> bool {
+        wait_until(|| !crate::sched::thread_id_is_live(id), WAIT_BUDGET)
+    }
+
+    /// Waits until the frame allocator is back to `target` bytes free.
+    ///
+    /// Distinct from [`wait_until_reaped`], and the two are not
+    /// interchangeable: `sched::reap` removes a thread from the table *inside*
+    /// the scheduler's critical section and drops it — returning its frames —
+    /// only after that lock is released, because freeing an address space
+    /// enters the frame allocator and holding the scheduler lock across that
+    /// orders two locks in a way nothing else in the kernel does. So "gone
+    /// from the table" is satisfied strictly earlier than "its frames are
+    /// back", and a measurement taken in that window reports a leak that is
+    /// really a few instructions of lag.
+    ///
+    /// That window is what failed CI while passing locally: the reaping
+    /// processor was descheduled between the two, and the test sampled 12
+    /// frames short. Waiting on the measurement itself rather than on a proxy
+    /// for it is the fix, and it does not weaken the assertion — a genuine
+    /// leak never satisfies this, so the budget expires and the caller's
+    /// assertion reports the shortfall exactly as before.
+    fn wait_until_frames_return(target: u64) -> bool {
+        wait_until(|| crate::frames::free_bytes() == target, WAIT_BUDGET)
+    }
+
+    /// Waits for the scheduler to settle, and returns the resulting thread
+    /// count.
+    ///
+    /// Every test shares one scheduler, and threads now finish and are reaped
+    /// on processors this thread never yields to. A baseline sampled while an
+    /// earlier test's thread is still being reaped is a baseline of something
+    /// else, and the delta built on it fails at random rather than for a
+    /// reason. Settled means nothing runnable anywhere and the count unchanged
+    /// across two separated samples.
+    fn quiesce() -> usize {
+        let mut last = usize::MAX;
+        for _ in 0..64 {
+            wait_until(|| crate::sched::runnable_count() == 0, WAIT_BUDGET / 64);
+            let now = crate::sched::thread_count();
+            if now == last && crate::sched::runnable_count() == 0 {
+                return now;
+            }
+            last = now;
+        }
+        last
+    }
+
+    #[test_case]
+    fn a_process_that_exits_cleanly_gives_back_its_address_space() {
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+
+        // The real init image, so this covers the exit path a process actually
+        // takes: `Sys::Exit`, which switches the CPU back to the kernel root
+        // and stops the thread.
+        let image = crate::boot::module("init").expect("no init module");
+
+        // Settled first: a process from an earlier test still being reaped on
+        // another processor would move the baseline under this measurement.
+        quiesce();
+        let before = crate::frames::free_bytes();
+        let id = crate::process::spawn_elf(image).expect("init failed to load");
+        assert!(
+            crate::frames::free_bytes() < before,
+            "loading a process consumed no frames; the measurement below proves nothing"
+        );
+        assert!(wait_until_reaped(id), "{id:?} never exited and was never reaped");
+
+        // The negative direction, and the whole of Deviation D7: an address
+        // space nobody owns is never dropped, and the kernel goes on working
+        // perfectly while losing a PML4, three page tables and every user page
+        // per process. Nothing else in the kernel observes that.
+        //
+        // Waited for rather than sampled: leaving the thread table and
+        // returning the frames are two steps with a lock release between them.
+        // See `wait_until_frames_return`.
+        let recovered = wait_until_frames_return(before);
+        let after = crate::frames::free_bytes();
+        assert!(
+            recovered,
+            "a cleanly-exited process left {} bytes unreclaimed ({after} free, {before} before)",
+            before.saturating_sub(after)
+        );
+    }
+
+    #[test_case]
+    fn a_process_killed_by_a_ring_three_fault_gives_back_its_address_space() {
+        // Declared, not exempted: the harness asserts the kill count moves by
+        // exactly this much, so a test that expects one kill and causes two --
+        // or none -- still fails.
+        crate::testing::expect_process_kills(1);
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+
+        // The other exit path, and the one no `exit` syscall runs through:
+        // `syscall::user_fault` kills the process from inside an exception
+        // handler. It has to reclaim the same frames as a clean exit, and it
+        // reaches `exit_current` by a different route, so a fix applied to only
+        // one of the two is exactly the shape of hole this kernel keeps
+        // finding.
+        //
+        // Same construction as the fault test above: executable, read-only, and
+        // the entry lands in zero fill, which decodes as `add [rax], al` with
+        // rax cleared by `enter_user` — a deterministic #PF on the null page.
+        let image = elf_with_segment(crate::process::USER_TEXT, 1 | 4, 4096);
+
+        quiesce();
+        let before = crate::frames::free_bytes();
+        let id = crate::process::spawn_elf(&image).expect("the faulting image failed to load");
+        assert!(
+            crate::frames::free_bytes() < before,
+            "loading a process consumed no frames; the measurement below proves nothing"
+        );
+        assert!(wait_until_reaped(id), "{id:?} survived its fault, or was never reaped");
+
+        // Waited for, not sampled — see `wait_until_frames_return`. This is
+        // the test that caught the difference: green locally, and 12 frames
+        // short on a CI runner that descheduled the reaping processor between
+        // the table removal and the drop.
+        let recovered = wait_until_frames_return(before);
+        let after = crate::frames::free_bytes();
+        assert!(
+            recovered,
+            "a process killed by a ring-3 fault left {} bytes unreclaimed \
+             ({after} free, {before} before)",
+            before.saturating_sub(after)
         );
     }
 
@@ -1092,12 +1834,17 @@ mod tests {
         crate::frames::init();
         crate::heap::init();
         unsafe { qunix_hal_x86_64::percpu::install_bsp() };
-        crate::install_timer();
+        crate::install_local_vectors();
         crate::map_lapic();
         // SAFETY: map_lapic() has just mapped the LAPIC page uncacheable.
         unsafe { qunix_hal_x86_64::apic::init(crate::boot::hhdm_offset()) };
         qunix_hal_x86_64::apic::start_timer(0b1011, 10_000_000);
 
+        // Saved and restored rather than left masked. Every test shares one
+        // kernel and one processor state, and this used to end with a bare
+        // `disable()`: every later test on this processor then ran with
+        // interrupts off, which silently turned off preemption for them.
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::enable();
         let start = crate::TICKS.load(Ordering::Relaxed);
         // Spin until the timer proves it is firing, with a bounded budget so a
@@ -1107,7 +1854,9 @@ mod tests {
             core::hint::spin_loop();
             budget -= 1;
         }
-        x86_64::instructions::interrupts::disable();
+        if !was_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
 
         assert!(budget > 0, "apic timer never fired");
         assert!(crate::TICKS.load(Ordering::Relaxed) > start);

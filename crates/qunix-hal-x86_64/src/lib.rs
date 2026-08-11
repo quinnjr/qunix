@@ -12,6 +12,7 @@ pub mod percpu;
 pub mod port;
 pub mod serial;
 pub mod syscall;
+pub mod tlb;
 
 pub struct Irq;
 

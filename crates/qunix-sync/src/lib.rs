@@ -21,6 +21,22 @@ impl<T> SpinLock<T> {
 }
 
 impl<T: ?Sized> SpinLock<T> {
+    /// Blocks until the lock is free.
+    ///
+    /// **Not reentrant, by design.** A context that already holds this lock and
+    /// calls `lock` again spins forever against itself; there is no owner field
+    /// to notice, and adding one would be wrong rather than merely expensive —
+    /// a recursive acquisition would hand out a second `&mut T` while the first
+    /// is still live. The reentrancy that actually occurs here is an interrupt
+    /// handler landing on a lock the interrupted frame holds, and the fix for
+    /// that is [`IrqSpinLock`], which makes the interrupt not arrive.
+    ///
+    /// Code that may already hold the lock must use [`Self::try_lock`] and have
+    /// a fallback, which is what the console's panic path does. The
+    /// non-reentrancy is observable there rather than here: a test that
+    /// demonstrated it by calling `lock` twice would hang instead of failing,
+    /// so `try_lock_fails_while_held` asserts the same fact in the form that
+    /// can be asserted.
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         loop {
@@ -235,32 +251,88 @@ impl IrqControl for NoIrq {
     fn restore(_: bool) {}
 }
 
-/// Compile-time assertions on the guards' auto-traits.
+/// Witnesses whether `T: Send`, without requiring it.
+///
+/// The inherent `IS_SEND` applies only when `T: Send`, and an inherent
+/// associated const outranks a trait one during path resolution, so
+/// `SendWitness::<T>::IS_SEND` resolves to the inherent `true` for a `Send`
+/// type and falls back to the trait's `false` otherwise. That makes the
+/// *absence* of an auto-trait assertable at compile time, which the negative
+/// assertions below depend on: every `!Send`/`!Sync` property in this crate is
+/// carried by a `PhantomData` field or an `unsafe impl` bound, all of which can
+/// be deleted without breaking a single positive assertion.
+struct SendWitness<T: ?Sized>(PhantomData<*const T>);
+trait NotSend {
+    const IS_SEND: bool = false;
+}
+impl<T: ?Sized> NotSend for SendWitness<T> {}
+impl<T: ?Sized + Send> SendWitness<T> {
+    const IS_SEND: bool = true;
+}
+
+/// As [`SendWitness`], for `Sync`.
+struct SyncWitness<T: ?Sized>(PhantomData<*const T>);
+trait NotSync {
+    const IS_SYNC: bool = false;
+}
+impl<T: ?Sized> NotSync for SyncWitness<T> {}
+impl<T: ?Sized + Sync> SyncWitness<T> {
+    const IS_SYNC: bool = true;
+}
+
+/// Compile-time assertions on the locks' and guards' auto-traits.
 ///
 /// These are the properties that make the locks sound, and they are invisible
 /// in ordinary tests: an accidental auto-derive would compile and pass every
 /// runtime test while allowing a data race. Kept outside `#[cfg(test)]` so they
 /// are checked on every build, including the kernel target.
+///
+/// Both directions are asserted, and both matter. The positive ones fail if a
+/// bound is *tightened* into uselessness; the negative ones fail if one is
+/// loosened into unsoundness — and a loosened bound is the one that compiles,
+/// passes, and races.
 const _: () = {
-    const fn assert_sync<T: Sync>() {}
-    const fn assert_send<T: Send>() {}
+    // The locks themselves are shareable and sendable for `T: Send`. That
+    // includes a `Send + !Sync` payload such as `Cell`: serialising access to
+    // it is the entire job.
+    assert!(SendWitness::<SpinLock<u32>>::IS_SEND);
+    assert!(SyncWitness::<SpinLock<u32>>::IS_SYNC);
+    assert!(SyncWitness::<SpinLock<core::cell::Cell<u32>>>::IS_SYNC);
+    // ...but only for `T: Send`. Without that bound on the two `unsafe impl`s,
+    // a `SpinLock<Rc<_>>` in a static would let two CPUs clone one `Rc` and
+    // race its non-atomic count. `*const ()` stands in for any `!Send` payload
+    // and needs no allocator, so this holds on the kernel target too.
+    assert!(!SendWitness::<SpinLock<*const ()>>::IS_SEND);
+    assert!(!SyncWitness::<SpinLock<*const ()>>::IS_SYNC);
 
-    // The locks themselves are shareable and sendable for `T: Send`.
-    let _ = assert_sync::<SpinLock<u32>>;
-    let _ = assert_send::<SpinLock<u32>>;
-    // The same two properties, restated for the IRQ pair: they are separate
-    // types with separate `PhantomData`, so an omission in one is not caught by
-    // the other. The guard's `!Send` -- sharper here, since dropping it on
-    // another CPU would restore a flag captured elsewhere -- is still enforced
-    // only by `PhantomData<*const ()>`, for the reason given below.
-    let _ = assert_sync::<IrqSpinLock<u32, NoIrq>>;
-    let _ = assert_send::<IrqSpinLock<u32, NoIrq>>;
-    let _ = assert_sync::<IrqSpinLockGuard<'static, u32, NoIrq>>;
+    // The same four properties, restated for the IRQ pair: they are separate
+    // types with separate `PhantomData` and separate `unsafe impl`s, so an
+    // omission in one is not caught by the other.
+    assert!(SendWitness::<IrqSpinLock<u32, NoIrq>>::IS_SEND);
+    assert!(SyncWitness::<IrqSpinLock<u32, NoIrq>>::IS_SYNC);
+    assert!(SyncWitness::<IrqSpinLock<core::cell::Cell<u32>, NoIrq>>::IS_SYNC);
+    assert!(!SendWitness::<IrqSpinLock<*const (), NoIrq>>::IS_SEND);
+    assert!(!SyncWitness::<IrqSpinLock<*const (), NoIrq>>::IS_SYNC);
+
     // A guard over a `Sync` payload is shareable...
-    let _ = assert_sync::<SpinLockGuard<'static, u32>>;
-    // ...but no guard is ever `Send`. There is no positive way to assert the
-    // absence of a trait on stable, so the `PhantomData<*const ()>` fields are
-    // the mechanism and this comment is the record of intent.
+    assert!(SyncWitness::<SpinLockGuard<'static, u32>>::IS_SYNC);
+    assert!(SyncWitness::<IrqSpinLockGuard<'static, u32, NoIrq>>::IS_SYNC);
+    // ...but only at `T: Sync`, not `T: Send`. Two threads holding `&guard` can
+    // both `deref()` into `&T` at once, so a `Sync` guard over a `Cell` would
+    // hand out concurrent `&Cell` — the bound on the `unsafe impl` is the only
+    // thing preventing it, and relaxing it to `T: Send` breaks nothing that
+    // does not check this.
+    assert!(!SyncWitness::<SpinLockGuard<'static, core::cell::Cell<u32>>>::IS_SYNC);
+    assert!(!SyncWitness::<IrqSpinLockGuard<'static, core::cell::Cell<u32>, NoIrq>>::IS_SYNC);
+
+    // No guard is ever `Send`, whatever the payload. Releasing a lock from a
+    // context that never took it is the plain guard's problem; the IRQ guard's
+    // is sharper still, since its `Drop` would run `I::restore` on the wrong
+    // CPU with a flag captured on another, leaving the originating CPU masked
+    // forever. Both rest entirely on a zero-sized `PhantomData<*const ()>`
+    // field, which is a deletion away from being lost silently.
+    assert!(!SendWitness::<SpinLockGuard<'static, u32>>::IS_SEND);
+    assert!(!SendWitness::<IrqSpinLockGuard<'static, u32, NoIrq>>::IS_SEND);
 };
 
 #[cfg(test)]
@@ -286,6 +358,46 @@ mod tests {
         let lock = SpinLock::new(0);
         drop(lock.lock());
         assert!(lock.try_lock().is_some());
+    }
+
+    #[test]
+    fn a_failed_try_lock_does_not_release_the_lock() {
+        // The negative half of `try_lock_fails_while_held`: returning `None` is
+        // right, but a failure arm that also stored `false` -- the shape of an
+        // unconditional cleanup path -- would release a lock this context does
+        // not hold, and every later attempt would succeed against a live guard.
+        let lock = SpinLock::new(0u32);
+        let held = lock.lock();
+        for _ in 0..4 {
+            assert!(lock.try_lock().is_none(), "a repeated failed attempt eventually succeeded");
+        }
+        drop(held);
+        assert!(lock.try_lock().is_some(), "the failed attempts left the lock held");
+    }
+
+    #[test]
+    fn force_unlock_reclaims_a_plain_lock_whose_guard_will_never_drop() {
+        // Only the `IrqSpinLock` wrapper was covered. The plain lock is what the
+        // serial console's panic path actually reclaims, and its `force_unlock`
+        // and `data_ptr` are separate functions from the wrapper's -- the
+        // wrapper's tests would stay green if either of these were emptied out.
+        let lock = SpinLock::new(99u32);
+
+        // Stands in for the frame that was interrupted mid-critical-section and
+        // will never resume: its guard is never dropped.
+        core::mem::forget(lock.lock());
+        assert!(lock.try_lock().is_none(), "the forgotten guard did not leave the lock held");
+
+        unsafe { lock.force_unlock() };
+        let guard = lock.try_lock().expect("force_unlock did not release the lock");
+        assert_eq!(*guard, 99);
+        drop(guard);
+
+        // The panic path writes through `data_ptr` after reclaiming the lock
+        // this way, so the pointer must address the guarded value itself and
+        // not a copy.
+        unsafe { *lock.data_ptr() = 7 };
+        assert_eq!(*lock.lock(), 7, "data_ptr did not address the guarded value");
     }
 
     #[test]
@@ -485,6 +597,135 @@ mod tests {
 
         drop(guard);
         assert_eq!(TRY_LOCK_DEPTH.load(Ordering::SeqCst), 0);
+    }
+
+    // The guard's `Drop` releases the spinlock *before* restoring the interrupt
+    // flag, so an interrupt handler that takes the same lock cannot arrive
+    // while it is still held. The order is one line either way and swapping it
+    // leaves every other test in this file green -- the flag still ends up
+    // restored and the lock still ends up released, just in an order that
+    // reintroduces the self-deadlock the type exists to prevent. This
+    // `IrqControl` catches it by looking at the lock from inside `restore`.
+    thread_local! {
+        static RELEASE_ORDER_LOCK: core::cell::Cell<*const SpinLock<u32>> =
+            const { core::cell::Cell::new(core::ptr::null()) };
+        static LOCK_WAS_FREE_AT_RESTORE: core::cell::Cell<Option<bool>> =
+            const { core::cell::Cell::new(None) };
+    }
+
+    struct ReleaseOrderIrq;
+    impl IrqControl for ReleaseOrderIrq {
+        fn disable_and_save() -> bool {
+            true
+        }
+        fn restore(_: bool) {
+            let inner = RELEASE_ORDER_LOCK.with(|c| c.get());
+            if inner.is_null() {
+                return;
+            }
+            // Stands in for the interrupt that becomes deliverable the instant
+            // the flag is restored: the first thing its handler does is ask for
+            // the lock. `try_lock` on the inner `SpinLock` rather than on the
+            // wrapper, which would recurse back into this function.
+            let taken = unsafe { (*inner).try_lock() };
+            LOCK_WAS_FREE_AT_RESTORE.with(|c| c.set(Some(taken.is_some())));
+        }
+    }
+
+    #[test]
+    fn the_guard_releases_the_lock_before_it_restores_interrupts() {
+        let lock: IrqSpinLock<u32, ReleaseOrderIrq> = IrqSpinLock::new(1);
+        // The pointer names a lock owned by this frame, which outlives the drop
+        // below; it is cleared before returning so no later `restore` on this
+        // thread can follow it.
+        RELEASE_ORDER_LOCK.with(|c| c.set(&raw const lock.inner));
+        LOCK_WAS_FREE_AT_RESTORE.with(|c| c.set(None));
+
+        drop(lock.lock());
+
+        let observed = LOCK_WAS_FREE_AT_RESTORE.with(|c| c.get());
+        RELEASE_ORDER_LOCK.with(|c| c.set(core::ptr::null()));
+        assert_eq!(
+            observed,
+            Some(true),
+            "interrupts were restored while the lock was still held: an interrupt \
+             handler taking this lock would deadlock against the frame releasing it"
+        );
+    }
+
+    // A contended `lock` must mask *before* it starts waiting, not after it
+    // acquires. Masking after would leave a CPU preemptible while it spins, and
+    // an interrupt handler that takes the same lock would then deadlock against
+    // the frame it interrupted -- the whole reason this type exists.
+    //
+    // Signalled from inside `disable_and_save` rather than observed by polling
+    // a counter: a poll loop is only reached if the waiter has already got
+    // there, so its body's coverage would depend on the host's core count.
+    // This ordering is forced. If `lock` acquired before masking, the waiter's
+    // `disable_and_save` would not run until the holder released, the `recv`
+    // below would time out, and the test fails rather than hanging.
+    std::thread_local! {
+        static MASK_SIGNAL: core::cell::RefCell<Option<std::sync::mpsc::Sender<usize>>> =
+            const { core::cell::RefCell::new(None) };
+    }
+    static MASK_FIRST_DEPTH: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct MaskFirstIrq;
+    impl IrqControl for MaskFirstIrq {
+        fn disable_and_save() -> bool {
+            let depth = MASK_FIRST_DEPTH.fetch_add(1, Ordering::SeqCst) + 1;
+            MASK_SIGNAL.with(|slot| {
+                if let Some(tx) = slot.borrow().as_ref() {
+                    let _ = tx.send(depth);
+                }
+            });
+            true
+        }
+        fn restore(_: bool) {
+            MASK_FIRST_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_contended_irq_lock_masks_before_it_waits_and_leaks_no_mask() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        let lock: Arc<IrqSpinLock<u32, MaskFirstIrq>> = Arc::new(IrqSpinLock::new(0));
+        let (tx, rx) = mpsc::channel();
+        let ready = Arc::new(Barrier::new(2));
+
+        // Held for the whole of the waiter's attempt, so the waiter provably
+        // cannot acquire and anything it reports comes from the waiting path.
+        let held = lock.lock();
+        assert_eq!(MASK_FIRST_DEPTH.load(Ordering::SeqCst), 1);
+
+        let waiter_lock = Arc::clone(&lock);
+        let waiter_ready = Arc::clone(&ready);
+        let waiter = std::thread::spawn(move || {
+            // Only this thread reports, so the holder's own masking above is
+            // not mistaken for the waiter's.
+            MASK_SIGNAL.with(|slot| *slot.borrow_mut() = Some(tx));
+            waiter_ready.wait();
+            *waiter_lock.lock() = 7;
+        });
+
+        ready.wait();
+        let depth = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a blocked lock() never masked interrupts; it waits while preemptible");
+        assert_eq!(depth, 2, "the waiter did not hold its own mask while it waited");
+        assert_eq!(*held, 0, "the waiter acquired the lock while it was held");
+
+        drop(held);
+        waiter.join().unwrap();
+        assert_eq!(
+            MASK_FIRST_DEPTH.load(Ordering::SeqCst),
+            0,
+            "a contended acquire/release left a mask outstanding"
+        );
+        assert_eq!(*lock.lock(), 7, "the waiter's write through the guard was lost");
     }
 
     fake_irq!(ForceUnlockIrq, FORCE_UNLOCK_DEPTH);
