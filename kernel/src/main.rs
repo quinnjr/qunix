@@ -148,9 +148,9 @@ extern "x86-interrupt" fn block_handler(_frame: InterruptStackFrame) {
 
 /// Registers the interrupt vectors that are this CPU's own.
 ///
-/// Both are per-CPU because the IDT is: `idt::set_handler` writes the table of
-/// the CPU it is called on, so every CPU must run this or it triple-faults on
-/// the first timer tick or wakeup IPI it is sent.
+/// All three are per-CPU because the IDT is: `idt::set_handler` writes the table
+/// of the CPU it is called on, so every CPU must run this or it triple-faults on
+/// the first timer tick, wakeup IPI, or block completion it is sent.
 ///
 /// Separate from `apic::init` so tests can install the handlers before enabling
 /// interrupts.

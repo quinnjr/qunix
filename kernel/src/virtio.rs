@@ -40,6 +40,13 @@ const CFG_NOTIFY: u8 = 2;
 const CFG_ISR: u8 = 3;
 const CFG_DEVICE: u8 = 4;
 
+/// Spins allowed for a device to complete a reset.
+///
+/// A count of iterations, not a duration -- there is no clock at this point in
+/// bring-up. Generous enough that no real device reaches it, and finite because
+/// an unbounded wait on a device register is a hang with no message.
+const RESET_SPIN_LIMIT: u32 = 1_000_000;
+
 /// The largest device window this driver will map.
 ///
 /// Every structure it needs is far smaller -- the common configuration is 56
@@ -580,8 +587,12 @@ pub unsafe fn probe(device_id: u16) -> Result<Transport, ProbeError> {
     // write down rather than test.
     // SAFETY: the caller's obligation, forwarded.
     unsafe {
-        let command = pci::config_read32(bdf, 0x04);
-        pci::config_write32(bdf, 0x04, command | (1 << 1) | (1 << 2));
+        let command = pci::config_read32(bdf, pci::COMMAND_REGISTER);
+        pci::config_write32(
+            bdf,
+            pci::COMMAND_REGISTER,
+            command | pci::COMMAND_MEMORY_SPACE | pci::COMMAND_BUS_MASTER,
+        );
     }
 
     // SAFETY: as above.
@@ -675,7 +686,7 @@ pub unsafe fn probe(device_id: u16) -> Result<Transport, ProbeError> {
         // Bounded, because an unbounded wait on a device register is a hang
         // with no message -- the failure mode this kernel is worst at
         // reporting.
-        assert!(spins < 1_000_000, "virtio device did not reset");
+        assert!(spins < RESET_SPIN_LIMIT, "virtio device did not reset");
         core::hint::spin_loop();
     }
     transport.set_status(STATUS_ACKNOWLEDGE);
@@ -782,6 +793,75 @@ mod tests {
             ),
             "the device accepted a ring larger than its own table"
         );
+    }
+
+    #[test_case]
+    fn an_io_bar_is_refused_rather_than_mapped_as_memory() {
+        // The regression for this driver's first run, which died with
+        // `BadBar(0)`. A virtio device carries an I/O BAR for the transitional
+        // layout it is not offering, and treating that value as a physical
+        // address maps a port number as memory.
+        assert_eq!(decode_bar(0x0000_c041, 0, 0), None, "an I/O BAR was accepted");
+        // And a memory BAR at the same slot is not refused, so the check cannot
+        // drift into refusing everything.
+        assert_eq!(decode_bar(0xfebd_0000, 0, 0), Some(0xfebd_0000));
+    }
+
+    #[test_case]
+    fn a_64_bit_bar_takes_its_upper_half_from_the_next_slot() {
+        // Type bits 0b10 mean the address continues in the following slot.
+        // Ignoring the upper half truncates the base to 32 bits, which on a
+        // machine that places BARs high maps the wrong physical page entirely.
+        assert_eq!(decode_bar(0xfe00_0004, 0x1, 4), Some(0x1_fe00_0000));
+        // There is no slot after BAR 5, so a 64-bit BAR declared there is
+        // malformed rather than half-read.
+        assert_eq!(decode_bar(0xfe00_0004, 0x1, 5), None, "a 64-bit BAR in slot 5 was accepted");
+        // The type bits must not leak into the address.
+        assert_eq!(decode_bar(0xfebd_0004, 0, 4), Some(0xfebd_0000));
+    }
+
+    #[test_case]
+    fn a_bar_size_is_the_lowest_set_bit_of_the_probe() {
+        // The standard probe: all-ones in, and the read-back's lowest set
+        // address bit is the size. Getting this wrong is what let a capability
+        // claim a window past the end of its BAR.
+        assert_eq!(decode_bar_size(0xffff_f000), 4096);
+        assert_eq!(decode_bar_size(0xffff_c000), 16 * 1024);
+        // An unimplemented BAR reads back as zero and has no size, which must
+        // not be mistaken for "any window fits".
+        assert_eq!(decode_bar_size(0), 0, "an unimplemented BAR was given a size");
+    }
+
+    #[test_case]
+    fn a_capability_shorter_than_the_structure_is_refused() {
+        // `cap_len` is device-supplied. A capability claiming fewer than 16
+        // bytes describes a different layout, and reading 16 anyway takes the
+        // tail from whatever follows it in configuration space.
+        let mut cfg = [0u8; 256];
+        cfg[0x40] = CAP_ID_VENDOR;
+        cfg[0x42] = 15; // cap_len
+        cfg[0x43] = CFG_COMMON;
+        let cap = pci::Capability { id: CAP_ID_VENDOR, offset: 0x40 };
+        assert!(parse_virtio_cap(&cfg, cap).is_none(), "a short capability was parsed");
+        cfg[0x42] = 16;
+        assert!(parse_virtio_cap(&cfg, cap).is_some(), "a well-formed capability was refused");
+    }
+
+    #[test_case]
+    fn a_notify_capability_too_short_for_its_multiplier_reads_zero_rather_than_garbage() {
+        // The notify capability carries a `u32` the other three do not. A
+        // capability placed where those four bytes fall outside the window must
+        // yield zero rather than whatever the snapshot buffer held -- the
+        // multiplier is one of the two factors in the notify offset, so a torn
+        // read there is an address the device did not choose and the driver did
+        // not derive.
+        let mut cfg = [0u8; 256];
+        cfg[0xf0] = CAP_ID_VENDOR;
+        cfg[0xf2] = 16;
+        cfg[0xf3] = CFG_NOTIFY;
+        let cap = pci::Capability { id: CAP_ID_VENDOR, offset: 0xf0 };
+        let parsed = parse_virtio_cap(&cfg, cap).expect("the capability was refused");
+        assert_eq!(parsed.notify_multiplier, 0, "a multiplier was read past the window");
     }
 
     #[test_case]

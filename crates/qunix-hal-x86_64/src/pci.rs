@@ -11,10 +11,11 @@
 //! The cost is real and bounded: only the first 256 bytes of each device's
 //! configuration space are reachable. Virtio 1.0 keeps its capabilities inside
 //! that window, so nothing this milestone needs is out of reach — but a
-//! capability list running past the end is **refused** rather than truncated,
-//! because a truncated walk looks exactly like a device that has fewer
-//! capabilities than it really does, and the one it would hide is the one
-//! being looked for.
+//! capability *body* read past the end is **refused** rather than truncated,
+//! because a truncated read looks exactly like a device with different
+//! contents, and the structure it would corrupt is the one being looked for.
+//! See [`capability_body`]; the list *walk* cannot overrun, because offsets are
+//! dword-aligned `u8`s and a two-byte header at the largest of them still fits.
 
 extern crate alloc;
 
@@ -165,6 +166,19 @@ pub struct Capability {
     pub id: u8,
     pub offset: u8,
 }
+
+/// The command register in the standard header.
+pub const COMMAND_REGISTER: u8 = 0x04;
+/// Lets the device decode memory accesses to its BARs.
+pub const COMMAND_MEMORY_SPACE: u32 = 1 << 1;
+/// Lets the device issue DMA. Without it a device fetches no descriptors, and
+/// the symptom is every request accepted and none completed.
+pub const COMMAND_BUS_MASTER: u32 = 1 << 2;
+
+/// MSI-X message control: enables the capability.
+pub const MSIX_CONTROL_ENABLE: u16 = 1 << 15;
+/// MSI-X message control: masks every vector while set.
+pub const MSIX_CONTROL_FUNCTION_MASK: u16 = 1 << 14;
 
 /// Where the capability pointer lives in the standard header.
 const CAP_POINTER: usize = 0x34;
