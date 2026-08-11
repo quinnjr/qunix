@@ -15,6 +15,7 @@ mod process;
 mod sched;
 mod smp;
 mod syscall;
+mod task;
 mod thread;
 mod vmspace;
 mod testing;
@@ -41,7 +42,12 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // A bus-locked RMW, deliberately: the ~20-40 cycles it costs once per 10 ms
     // are unmeasurable, and a per-CPU timer on more than one core makes a
     // load/store pair lose counts.
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Before the EOI and before `preempt`. A sleeper whose deadline has passed
+    // must be runnable *when* the scheduler runs, not one tick later: expiring
+    // after `preempt` would let this processor pick its next thread while the
+    // one this tick released was still parked.
+    crate::task::expire_timers(now);
     // EOI before any switch. Switching first would leave the LAPIC waiting for
     // an EOI that only arrives when this thread runs again, so the CPU would
     // take no further timer interrupts until then -- which, if the thread is
@@ -587,7 +593,7 @@ mod tests {
         }
 
         let all = u64::MAX >> (64 - spinners);
-        let started_in_time = wait_by_ticks(|| SPIN_STARTED.load(Ordering::SeqCst) == all, 40);
+        let started_in_time = wait_by_ticks(|| SPIN_STARTED.load(Ordering::SeqCst) == all, MIGRATION_TICKS);
         assert_ne!(
             started_in_time,
             Err(TickWait::TickSourceStalled),
@@ -613,7 +619,7 @@ mod tests {
                     .count() as u64;
                 preempted > 0
             },
-            20,
+            PREEMPTION_TICKS,
         );
         // Interrupts stay masked through every assertion below and through the
         // store that stops the spinners. Re-enabling here instead left a window
@@ -771,7 +777,7 @@ mod tests {
         }
 
         let all = u64::MAX >> (64 - spinners);
-        let waited = wait_by_ticks(|| SPIN_STARTED.load(Ordering::SeqCst) == all, 40);
+        let waited = wait_by_ticks(|| SPIN_STARTED.load(Ordering::SeqCst) == all, MIGRATION_TICKS);
 
         let started = SPIN_STARTED.load(Ordering::SeqCst);
         let stolen = crate::sched::steal_count() - steals_before;
@@ -802,10 +808,12 @@ mod tests {
         // satisfied by a single steal from any earlier test.
         assert!(
             stolen >= spinners,
-            "{} spinners started but only {stolen} of {spinners} were stolen; a thread queued \
-             on a processor that dispatches nothing can only start by migrating, so any \
-             shortfall means this processor ran work it was supposed to be unable to run",
-            started.count_ones()
+            "{} spinners started but only {stolen} of {spinners} were stolen ({} steal \
+             attempt(s) abandoned on a locked queue); a thread queued on a processor that \
+             dispatches nothing can only start by migrating, so any shortfall means this \
+             processor ran work it was supposed to be unable to run",
+            started.count_ones(),
+            crate::sched::steal_contention_count()
         );
 
         wait_until(|| crate::sched::thread_count() == before, WAIT_BUDGET);
@@ -815,6 +823,319 @@ mod tests {
             before,
             "the spinners did not exit; later tests would inherit them"
         );
+    }
+
+    #[test_case]
+    fn a_parked_thread_is_in_no_run_queue() {
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        // The invariant the `Blocked` state exists to create. A parked thread
+        // sitting in a run queue is dispatchable, and dispatching it resumes a
+        // future at a suspension point it has not returned from.
+        //
+        // Checked across *every* CPU rather than the local one: the thread is
+        // parked elsewhere, and nothing stops another CPU's queue holding its
+        // id if a path forgot to skip the requeue.
+        static PARKED: AtomicU64 = AtomicU64::new(u64::MAX);
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn sleeper(_: u64) -> ! {
+            PARKED.store(crate::sched::current_id().0, Ordering::Release);
+            crate::sched::park();
+            RELEASED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        RELEASED.store(false, Ordering::Release);
+        PARKED.store(u64::MAX, Ordering::Release);
+        let id = crate::sched::spawn_kernel(sleeper, 0, qunix_sched::Priority::Normal);
+
+        // Waited for rather than assumed. A check that runs before the thread
+        // has parked passes for the wrong reason.
+        assert!(
+            wait_until(|| crate::sched::is_parked(id), WAIT_BUDGET),
+            "{id:?} never parked"
+        );
+
+        // The same fully-inspecting scan the other two window tests use. This
+        // one used to take each lock blocking while its siblings used
+        // `try_lock`; three scans of one invariant should not disagree about
+        // how they look at it, and the bounded-retry form is the one that
+        // cannot pass without having looked.
+        assert_eq!(
+            queue_holding(id),
+            Ok(None),
+            "parked {id:?} is queued and can be dispatched, or a run queue could not be \
+             inspected"
+        );
+        assert_eq!(PARKED.load(Ordering::Acquire), id.0);
+        assert!(!RELEASED.load(Ordering::Acquire), "the sleeper ran on past its park");
+
+        crate::sched::unpark(id);
+        assert!(
+            wait_until(|| RELEASED.load(Ordering::Acquire), WAIT_BUDGET),
+            "{id:?} was unparked and never resumed"
+        );
+        assert!(wait_until_reaped(id), "the sleeper never exited");
+    }
+
+    #[test_case]
+    fn a_thread_woken_while_it_is_still_running_is_not_queued() {
+        // The guard `unpark` gates its queueing on, with the race genuinely
+        // forced rather than waited for.
+        //
+        // A thread that has marked itself parked but has not yet reached the
+        // context switch is parked *and* still current. A wake arriving in that
+        // window must not push it onto a run queue: it is executing, and a
+        // second processor that popped it would resume a context that is still
+        // in use -- two processors on one kernel stack.
+        //
+        // Two things make this deterministic rather than lucky, and the first
+        // was learned the hard way:
+        //
+        // - **This processor is masked for the whole experiment**, so it
+        //   dispatches nothing and the sleeper can only run by being stolen
+        //   onto another processor. An earlier version polled with
+        //   `wait_until`, which *yields* -- so this processor dispatched the
+        //   sleeper itself, and `park` masks interrupts, so the window was held
+        //   on the very processor that needed to observe it. The test then
+        //   passed or failed according to which processor won, which is a
+        //   statement about scheduling and not about the guard.
+        // - **The sleeper asks the scheduler to hold the window open**
+        //   (`widen_next_park`). The window is a few instructions wide
+        //   otherwise, and CLAUDE.md is explicit that a contention-dependent
+        //   path must have its contention created rather than hoped for.
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+        static WHO: AtomicU64 = AtomicU64::new(u64::MAX);
+
+        extern "C" fn sleeper(_: u64) -> ! {
+            let me = crate::sched::current_id();
+            WHO.store(me.0, Ordering::Release);
+            crate::sched::widen_next_park(me);
+            ARMED.store(true, Ordering::Release);
+            crate::sched::park();
+            FINISHED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+        ARMED.store(false, Ordering::Release);
+        FINISHED.store(false, Ordering::Release);
+        WHO.store(u64::MAX, Ordering::Release);
+
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        // Masked before the spawn, so this processor cannot take the sleeper
+        // even for an instant.
+        x86_64::instructions::interrupts::disable();
+        let id = crate::sched::spawn_kernel(sleeper, 0, qunix_sched::Priority::Normal);
+
+        // Spin-only waits from here: yielding would hand this processor to the
+        // sleeper, which is the thing being prevented. `wait_by_ticks` never
+        // yields, and ticks keep advancing because the other processors have
+        // timers of their own.
+        let widened_before = crate::sched::widened_count();
+        let armed = wait_by_ticks(|| ARMED.load(Ordering::Acquire), RESCUE_TICKS);
+        let in_window = wait_by_ticks(
+            || crate::sched::is_parked(id) && crate::sched::is_running_somewhere(id),
+            RESCUE_TICKS,
+        );
+
+        // The wake under test, delivered while the thread is provably parked
+        // and provably still executing on another processor.
+        let queued_on = if in_window.is_ok() {
+            crate::sched::unpark(id);
+            // Every queue inspected, not merely tried. A queue skipped for
+            // contention is indistinguishable from a clean one, and the
+            // assertion below is a *negative* -- so a skip would let it pass
+            // without having looked.
+            queue_holding(id)
+        } else {
+            Ok(None)
+        };
+
+        // Restored before any assertion, so a failure does not also leave the
+        // suite with a masked processor and a spinner it cannot stop.
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        // Unconditional: if the window never opened, this is what releases the
+        // sleeper so the assertions below can fail cleanly rather than hang.
+        crate::sched::unpark(id);
+
+        assert!(armed.is_ok(), "{id:?} never armed the park window: {armed:?}");
+        assert_eq!(
+            crate::sched::widened_count(),
+            widened_before + 1,
+            "the park window was never actually held open; whatever this test observed, it was \
+             not the forced race it claims to be"
+        );
+        assert!(
+            in_window.is_ok(),
+            "never observed {id:?} parked while still running: {in_window:?}. This processor \
+             dispatches nothing while masked, so the sleeper must have been stolen and held the \
+             window on the processor that stole it"
+        );
+        assert_eq!(
+            queued_on,
+            Ok(None),
+            "{queued_on:?}: {id:?} was queued while it was still running, or a run queue could \
+             not be inspected -- which would let this negative assertion pass without looking. \
+             Another processor could pop it and resume a context that is still in use"
+        );
+
+        // And the wake must not have been *dropped* in exchange. Declining to
+        // queue a running thread is only correct because the thread observes
+        // the cleared park itself; a guard that skipped the queueing and the
+        // recording alike would satisfy every assertion above and hang here.
+        assert!(
+            wait_until(|| FINISHED.load(Ordering::Acquire), WAIT_BUDGET),
+            "{id:?} never resumed; the wake that arrived while it was running was lost"
+        );
+        assert!(wait_until_reaped(id), "{id:?} never exited");
+    }
+
+    #[test_case]
+    fn a_wake_during_the_switch_away_does_not_queue_a_thread_mid_switch() {
+        // The window `is_current_anywhere` cannot see, and the one that makes a
+        // parked thread pass *through* the handoff rather than skip it.
+        //
+        // `schedule` stores the incoming thread as this processor's `current`
+        // while still holding the scheduler lock, and only switches stacks
+        // ~40 lines later. In between, the outgoing parked thread is in no run
+        // queue, is parked, and is current nowhere -- so an `unpark` landing
+        // there sees nothing stopping it. If it queues the thread, another
+        // processor pops it and resumes a context whose stack pointer has not
+        // been stored yet: two processors on one kernel stack, and the
+        // `assert!(!to_ctx.is_null())` in `schedule` cannot catch it, because
+        // nothing ever writes null back into a dispatched thread's slot.
+        //
+        // Forced the same way as the park-window test, and masked for the same
+        // reason: this processor must dispatch nothing, so the sleeper is
+        // stolen and holds its switch window somewhere this thread can watch.
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn sleeper(_: u64) -> ! {
+            let me = crate::sched::current_id();
+            crate::sched::widen_next_switch(me);
+            ARMED.store(true, Ordering::Release);
+            crate::sched::park();
+            FINISHED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(crate::smp::wait_for_all(200_000_000), "application processors did not come online");
+        ARMED.store(false, Ordering::Release);
+        FINISHED.store(false, Ordering::Release);
+
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        let id = crate::sched::spawn_kernel(sleeper, 0, qunix_sched::Priority::Normal);
+
+        let widened_before = crate::sched::widened_count();
+        let armed = wait_by_ticks(|| ARMED.load(Ordering::Acquire), RESCUE_TICKS);
+        // Spin-only: yielding would hand this processor to the sleeper, and the
+        // window would then be held where this thread cannot look.
+        // Parked *and* in the window. Without the park requirement, a timer
+        // tick that preempted the sleeper between arming and `park` consumes
+        // the arming and opens the window for an ordinary `Ready` switch --
+        // `unpark` then returns `Noted`, queues nothing, and every assertion
+        // below passes with `HANDOFF_PARKED` and `claim_parked_handoff`
+        // untouched. Rare, which is worse than common: the test would degrade
+        // silently and intermittently rather than fail.
+        let in_window = wait_by_ticks(
+            || crate::sched::is_parked(id) && crate::sched::thread_in_switch_window() == Some(id),
+            RESCUE_TICKS,
+        );
+
+        let queued_on = if in_window.is_ok() {
+            // The wake under test, delivered while the thread is provably
+            // between the lock release and the stack switch.
+            crate::sched::unpark(id);
+            queue_holding(id)
+        } else {
+            Ok(None)
+        };
+
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        crate::sched::unpark(id);
+
+        assert!(armed.is_ok(), "{id:?} never armed the switch window: {armed:?}");
+        assert_eq!(
+            crate::sched::widened_count(),
+            widened_before + 1,
+            "the switch window was never actually held open; whatever this test observed, it \
+             was not the forced race it claims to be"
+        );
+        assert!(in_window.is_ok(), "never observed {id:?} inside its switch window: {in_window:?}");
+        assert_eq!(
+            queued_on,
+            Ok(None),
+            "{queued_on:?}: {id:?} was queued while its context was still being saved, or a \
+             run queue could not be inspected. Another processor could resume a stack pointer \
+             that has not been stored yet"
+        );
+        // And the wake must still take effect. Declining to queue is only
+        // correct because the handoff queues it once the switch completes; a
+        // guard that dropped the wake instead would satisfy the assertion above
+        // and hang here.
+        assert!(
+            wait_until(|| FINISHED.load(Ordering::Acquire), WAIT_BUDGET),
+            "{id:?} never resumed; the wake delivered during its switch was lost"
+        );
+        assert!(wait_until_reaped(id), "{id:?} never exited");
+    }
+
+    #[test_case]
+    fn unparking_an_id_that_never_existed_is_a_no_op() {
+        // A waker outlives the thread it names -- a device can complete an I/O
+        // for a thread that has already exited. This must not panic and must
+        // not disturb any live thread; the whole no-generation-counter
+        // decision rests on it.
+        let before = crate::sched::thread_count();
+        crate::sched::unpark(qunix_sched::ThreadId(u64::MAX - 1));
+        crate::sched::unpark(qunix_sched::ThreadId(0xdead_beef));
+        assert_eq!(crate::sched::thread_count(), before);
+    }
+
+    #[test_case]
+    fn a_wake_that_arrives_before_the_park_does_not_block_the_thread() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        // The lost wakeup, end to end and on real threads. Task 1 proves the
+        // state machine; this proves the scheduler consults it, which is the
+        // half a unit test cannot reach.
+        static DONE: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn racer(_: u64) -> ! {
+            // Wake ourselves first, then park. The park must decline.
+            crate::sched::unpark(crate::sched::current_id());
+            crate::sched::park();
+            DONE.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        DONE.store(false, Ordering::Release);
+        let id = crate::sched::spawn_kernel(racer, 0, qunix_sched::Priority::Normal);
+        // Bounded: this hangs the whole suite if the wakeup was lost, and a
+        // hang reports nothing. A budget turns it into a failure with a name.
+        assert!(
+            wait_until(|| DONE.load(Ordering::Acquire), WAIT_BUDGET),
+            "{id:?} parked on a wakeup that had already arrived"
+        );
+        assert!(wait_until_reaped(id), "the racer never exited");
     }
 
     /// Which CPUs a batch of worker threads observed themselves running on.
@@ -1520,7 +1841,7 @@ mod tests {
     ///
     /// Bounded rather than unbounded because a condition that never holds must
     /// fail the calling test rather than hang the suite.
-    fn wait_until(mut condition: impl FnMut() -> bool, budget: u32) -> bool {
+    pub(crate) fn wait_until(mut condition: impl FnMut() -> bool, budget: u32) -> bool {
         for _ in 0..budget {
             if condition() {
                 return true;
@@ -1533,10 +1854,26 @@ mod tests {
         condition()
     }
 
+    /// Ticks a test waits for a race window to open, or for a rescuer to act.
+    ///
+    /// One name for what was six copies of `60`. Distinct from [`WAIT_BUDGET`],
+    /// which counts spin iterations rather than ticks.
+    pub(crate) const RESCUE_TICKS: u64 = 60;
+
+    /// Ticks allowed for work stranded on a stalled processor to migrate.
+    ///
+    /// Twice [`PREEMPTION_TICKS`], because migration needs the stranded thread
+    /// found and moved as well as a tick to notice.
+    const MIGRATION_TICKS: u64 = 40;
+
+    /// Ticks allowed for one preemption on any one processor -- a single timer
+    /// interrupt away.
+    const PREEMPTION_TICKS: u64 = 20;
+
     /// Budget for waiting on other CPUs. Generous: under TCG the guest runs
     /// orders of magnitude slower than under KVM, and a budget tuned to one is
     /// a spurious failure on the other.
-    const WAIT_BUDGET: u32 = 20_000;
+    pub(crate) const WAIT_BUDGET: u32 = 20_000;
 
     /// Spins until `condition` holds or `tick_budget` timer ticks have passed.
     ///
@@ -1586,6 +1923,43 @@ mod tests {
         /// The tick counter stopped advancing, so the deadline could never be
         /// reached. Nothing was learned about the condition.
         TickSourceStalled,
+    }
+
+    /// Which processor's run queue holds `id`, having inspected every one.
+    ///
+    /// Returns `Err(uninspected)` if any live queue could not be locked. That
+    /// distinction is the whole point: the callers assert `Ok(None)`, a
+    /// *negative*, and a queue that was skipped rather than examined is
+    /// indistinguishable from a clean one. `take_next`'s steal loop holds these
+    /// locks routinely -- `STEAL_CONTENDED` exists because that path is the
+    /// routine one -- so silently skipping is a real way to miss the finding on
+    /// the single occasion it mattered.
+    pub(crate) fn queue_holding(id: qunix_sched::ThreadId) -> Result<Option<u32>, u32> {
+        use qunix_hal_x86_64::percpu::{MAX_CPUS, run_queue_of};
+        let mut found = None;
+        let mut uninspected = 0;
+        for cpu in 0..MAX_CPUS {
+            let Some(queue) = run_queue_of(cpu) else { continue };
+            let mut inspected = false;
+            // Retried rather than skipped, and bounded rather than blocking: a
+            // processor mid-dispatch holds its queue for a few instructions, so
+            // waiting briefly is right, but waiting forever would turn a
+            // scheduling delay into a hung suite.
+            for _ in 0..10_000 {
+                if let Some(queue) = queue.try_lock() {
+                    if queue.contains(id) {
+                        found = Some(cpu);
+                    }
+                    inspected = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !inspected {
+                uninspected += 1;
+            }
+        }
+        if uninspected > 0 { Err(uninspected) } else { Ok(found) }
     }
 
     fn wait_until_reaped(id: qunix_sched::ThreadId) -> bool {

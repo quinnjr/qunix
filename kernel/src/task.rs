@@ -1,0 +1,1006 @@
+//! The async runtime: one thread, one future, no allocation.
+//!
+//! # Why there is no task table
+//!
+//! The future being awaited is a local in [`block_on`]'s frame, pinned to the
+//! kernel stack the thread already owns, and the thing the scheduler resumes is
+//! the thread. A slab of `Pin<Box<dyn Future>>` tasks would buy the ability to
+//! run more concurrent operations than there are threads, and would cost a heap
+//! allocation per operation in the one subsystem where allocating is a deadlock
+//! hazard: memory pressure triggers writeback, writeback needs I/O, and I/O
+//! would need the allocation that is already waiting.
+//!
+//! The cost is stated rather than hidden: concurrency is bounded by thread
+//! count. Two futures awaited inside one thread work, because one `block_on`
+//! polls both; running them on two processors does not.
+//!
+//! # Why the waker holds a bare id
+//!
+//! A `RawWaker` carries one `*const ()`. The usual occupant is an `Arc<Task>`,
+//! whose `clone` and `drop` are refcount traffic an interrupt handler would
+//! have to perform -- and whose *last* drop frees memory, from interrupt
+//! context, entering the heap allocator underneath whatever lock the
+//! interrupted code was holding. This one carries `ThreadId.0`, so `clone` is
+//! the identity and `drop` does nothing.
+//!
+//! That is sound only because thread ids are never reused; see
+//! `sched::Scheduler::allocate_id`, which says so and is guarded. A waker that
+//! outlives its thread names an id that will never belong to anything else, and
+//! `sched::unpark` ignores it.
+
+use core::future::Future;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use qunix_sched::ThreadId;
+
+/// Identity clone: the data word is a value, not a pointer to a refcount, so
+/// there is nothing to increment and nothing that could later be freed.
+///
+/// # Safety
+/// `data` must be a `ThreadId.0` produced by [`waker_for`].
+unsafe fn clone(data: *const ()) -> RawWaker {
+    RawWaker::new(data, &VTABLE)
+}
+
+/// # Safety
+/// `data` must be a `ThreadId.0` produced by [`waker_for`].
+unsafe fn wake(data: *const ()) {
+    crate::sched::unpark(ThreadId(data as u64));
+}
+
+/// # Safety
+/// `data` must be a `ThreadId.0` produced by [`waker_for`].
+unsafe fn wake_by_ref(data: *const ()) {
+    crate::sched::unpark(ThreadId(data as u64));
+}
+
+/// Nothing is owned, so nothing is released.
+///
+/// Deliberately not `unreachable!`: `Waker`'s drop runs on every temporary an
+/// executor creates, so this is reached on the ordinary path rather than only
+/// in error.
+///
+/// # Safety
+/// `data` must be a `ThreadId.0` produced by [`waker_for`].
+unsafe fn drop_nothing(_data: *const ()) {}
+
+static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_nothing);
+
+/// A `Waker` that unparks `id`.
+///
+/// Safe to hold across a thread's death and safe to call from an interrupt
+/// handler: it allocates nothing, takes no lock of its own, and an id whose
+/// thread has exited is ignored by `unpark`.
+pub fn waker_for(id: ThreadId) -> Waker {
+    // SAFETY: the data word is a `ThreadId.0`, which is exactly what every
+    // function in `VTABLE` requires. `u64 as *const ()` is a provenance-free
+    // integer that is never dereferenced -- only cast back to `u64`.
+    unsafe { Waker::from_raw(RawWaker::new(id.0 as *const (), &VTABLE)) }
+}
+
+/// The thread id a waker built by [`waker_for`] names.
+///
+/// Exists so a test can assert the round trip, and so a future under test can
+/// wake through the waker it was handed rather than through
+/// `sched::current_id`. Getting the cast wrong is otherwise silent: `unpark`
+/// would be handed an id naming nothing, find no thread, return, and every
+/// `await` in the kernel would hang with no message.
+#[cfg(test)]
+pub fn raw_id_of(waker: &Waker) -> u64 {
+    waker.data() as u64
+}
+
+/// Runs `future` to completion on the calling thread, parking between polls.
+///
+/// The future is pinned to this thread's kernel stack and never moves, so no
+/// boxing is involved at any point.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = waker_for(crate::sched::current_id());
+    let mut cx = Context::from_waker(&waker);
+    let mut future = core::pin::pin!(future);
+    loop {
+        // Polled *before* parking, always. Parking first would block a future
+        // that is already ready until something unrelated woke the thread, and
+        // for the `Ready`-on-first-poll case -- which most cached reads will be
+        // -- nothing ever would.
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        // A loop rather than a single park, because `park` may return without
+        // the condition having become true: a spurious wake is always
+        // permitted, and costs one extra poll.
+        crate::sched::park();
+    }
+}
+
+/// The most timer slots ever in use at once, since boot.
+///
+/// A fixed table with a panic at the end of it needs a way to see the pressure
+/// *before* the panic. Exposed alongside `sched::steal_count` and friends.
+static TIMERS_HIGH_WATER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// The most timer slots ever in use at once, since boot.
+pub fn timer_high_water() -> usize {
+    TIMERS_HIGH_WATER.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// How many sleeps can be outstanding at once.
+///
+/// 64 because one sleeper can hold more than one slot -- the module docs
+/// advertise two futures awaited in one thread -- so this is roughly "every
+/// thread the kernel currently runs, twice over", with room to spare. It is a
+/// resource bound, not a correctness one: exceeding it is refused, never
+/// silently ignored, and `timer_high_water` says how close the kernel has been.
+///
+/// A fixed table rather than a list, because the timer interrupt walks it:
+/// allocating in `expire_timers` would put the heap allocator on the interrupt
+/// path, and a linked list would need a node from somewhere.
+const CAPACITY: usize = 64;
+
+#[cfg(test)]
+pub(crate) use crate::tests::RESCUE_TICKS;
+
+/// One outstanding sleep.
+///
+/// `deadline` is an absolute tick count, not a remaining count. A remaining
+/// count would have to be decremented by the handler for every entry on every
+/// tick, and a tick missed while interrupts were masked -- which happens on
+/// every context switch -- would silently lengthen every sleep in the table.
+#[derive(Clone, Copy)]
+struct Timer {
+    deadline: u64,
+    thread: ThreadId,
+    /// Distinguishes this registration from any later one that reuses the slot.
+    ///
+    /// The index alone is not identity: `expire_timers` frees a slot the
+    /// instant its deadline passes, and the next `try_sleep_ticks` takes it.
+    /// Matching on the deadline instead -- which this did -- is not identity
+    /// either, because `try_sleep_ticks` reads `TICKS` *before* taking the
+    /// lock and can be preempted in between, so a later sleeper can compute
+    /// the very same deadline. A dropped `Sleep` would then release a
+    /// registration that is still wanted, leaving that sleeper `Pending` with
+    /// nothing scheduled to wake it. A counter has no such collision.
+    generation: u64,
+}
+
+/// Source of [`Timer::generation`]. Monotonic; never reused.
+static TIMER_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `IrqSpinLock`, not `SpinLock`: this is taken from the timer interrupt, so a
+/// plain spinlock would let a tick land on a processor that already holds it
+/// and spin against itself forever.
+static TIMERS: qunix_sync::IrqSpinLock<[Option<Timer>; CAPACITY], qunix_hal_x86_64::Irq> =
+    qunix_sync::IrqSpinLock::new([None; CAPACITY]);
+
+/// Why a sleep could not be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepError {
+    /// Every timer slot is occupied. Refused rather than dropped: a sleep that
+    /// silently failed to register is `Pending` forever with nothing scheduled
+    /// to wake it, which is a hung thread rather than a slow one.
+    Full,
+}
+
+/// Wakes every thread whose deadline has passed. Called from the timer handler.
+///
+/// Takes `now` rather than reading `TICKS` itself, so the handler's increment
+/// and this comparison cannot disagree about which tick this is.
+pub(crate) fn expire_timers(now: u64) {
+    let mut woken: [Option<ThreadId>; CAPACITY] = [None; CAPACITY];
+    let mut count = 0;
+    {
+        let mut timers = TIMERS.lock();
+        for slot in timers.iter_mut() {
+            // `>=`, not `==`. A tick can be missed -- interrupts are masked
+            // across every context switch -- and an equality test would step
+            // straight over the deadline and leave the thread parked forever.
+            if slot.is_some_and(|t| now >= t.deadline) {
+                woken[count] = slot.take().map(|t| t.thread);
+                count += 1;
+            }
+        }
+    }
+    // Unparked after the timer lock is released. `unpark` takes the scheduler
+    // lock and may take a run queue; holding TIMERS across that would order
+    // three locks in a way nothing else in the kernel does, from an interrupt.
+    for id in woken.iter().flatten() {
+        crate::sched::unpark(*id);
+    }
+}
+
+/// A future that completes once `deadline` has passed.
+///
+/// Named rather than returned as `impl Future`, so it can be stored in a struct
+/// and so a test can observe which slot it owns. An anonymous return type hides
+/// the field that distinguishes "a slot was freed" from "*this* sleeper's slot
+/// was freed", which is the difference the twin-sleep case turns on.
+pub struct Sleep {
+    deadline: u64,
+    /// Which slot in [`TIMERS`] this sleeper holds, if any.
+    ///
+    /// An index rather than a flag, because `drop` has to release *this*
+    /// sleeper's slot and nothing else. Matching on `(thread, deadline)`
+    /// instead -- which is what this did -- identifies a slot only when the
+    /// pair is unique, and the module docs advertise the case that breaks it:
+    /// two futures awaited inside one thread. `join(sleep_ticks(5),
+    /// sleep_ticks(5))` registers two slots with identical pairs, and dropping
+    /// either frees whichever the scan reaches first. The survivor is then
+    /// `Pending` with nothing scheduled to wake it, and the dropped one's slot
+    /// is held forever -- the exact leak the cancellation test exists to
+    /// prevent, reintroduced by the way the slot was found.
+    ///
+    /// `None` for a deadline already in the past, which takes no slot at all.
+    slot: Option<usize>,
+    /// The generation of this sleeper's registration, matching [`Timer`].
+    generation: u64,
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: core::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if crate::TICKS.load(core::sync::atomic::Ordering::SeqCst) >= self.deadline {
+            return Poll::Ready(());
+        }
+        // Nothing is registered here. The slot was taken by `try_sleep_ticks`,
+        // before this future existed, which is why that is the fallible entry
+        // point and `poll` is infallible. Registering on first poll instead
+        // would mean a `poll` that can fail with no way to report it, and a
+        // re-poll -- which a spurious wake makes routine -- would take a second
+        // slot for one sleeper and leak the first.
+        //
+        // The waker is deliberately unused: `expire_timers` unparks the thread
+        // by id, which is the same thing this future's waker would do, and
+        // storing a waker per timer would put a `Waker` clone on the interrupt
+        // path for no gain. That is only correct because the thread *is* the
+        // task -- see the module docs.
+        Poll::Pending
+    }
+}
+
+impl Drop for Sleep {
+    /// Releases the slot if the sleeper is dropped before it fires.
+    ///
+    /// Reachable whenever an `await` is abandoned -- a cancelled read, a
+    /// `select` another arm won. Without this the slot is held by a thread that
+    /// is no longer waiting, and after `CAPACITY` cancellations every sleep in
+    /// the kernel is refused.
+    fn drop(&mut self) {
+        let Some(index) = self.slot else {
+            return;
+        };
+        let mut timers = TIMERS.lock();
+        // Checked, not assumed. `expire_timers` clears the slot when the
+        // deadline passes and the index is then free for another sleeper, so a
+        // fired-then-dropped `Sleep` must not release whatever took its place.
+        // The deadline distinguishes them because a reused slot carries a
+        // different one.
+        // Matched on the generation, not the deadline. Two registrations can
+        // share a deadline -- `try_sleep_ticks` reads `TICKS` before taking the
+        // lock, so a sleeper preempted there can compute the same one a later
+        // sleeper computes -- and the slot index is reused the moment
+        // `expire_timers` frees it. Only the generation is identity.
+        if timers[index].is_some_and(|t| t.generation == self.generation) {
+            timers[index] = None;
+        }
+    }
+}
+
+/// Sleeps for `ticks` timer ticks, or refuses if no timer slot is free.
+pub fn try_sleep_ticks(ticks: u64) -> Result<Sleep, SleepError> {
+    let now = crate::TICKS.load(core::sync::atomic::Ordering::SeqCst);
+    let deadline = now.saturating_add(ticks);
+    // A deadline already reached takes no slot at all. Registering one would
+    // park the caller until the next tick for a sleep of zero, and on a
+    // processor whose timer is masked that is forever.
+    if deadline <= now {
+        return Ok(Sleep { deadline, slot: None, generation: 0 });
+    }
+    let me = crate::sched::current_id();
+    let mut timers = TIMERS.lock();
+    let index = timers
+        .iter()
+        .position(|s| s.is_none())
+        .ok_or(SleepError::Full)?;
+    let generation = TIMER_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    timers[index] = Some(Timer { deadline, thread: me, generation });
+    // High-water mark, so pressure on a fixed table is visible before the
+    // panic rather than only after it.
+    let used = CAPACITY - timers.iter().filter(|s| s.is_none()).count();
+    TIMERS_HIGH_WATER.fetch_max(used, core::sync::atomic::Ordering::AcqRel);
+    Ok(Sleep { deadline, slot: Some(index), generation })
+}
+
+/// Sleeps for `ticks` timer ticks.
+///
+/// Panics if the timer table is full. Callers that can do something better than
+/// die should use [`try_sleep_ticks`]; this exists because most cannot, and a
+/// silent non-sleep is worse than a named panic.
+pub fn sleep_ticks(ticks: u64) -> Sleep {
+    match try_sleep_ticks(ticks) {
+        Ok(sleep) => sleep,
+        Err(SleepError::Full) => panic!("no free timer slot for a {ticks}-tick sleep"),
+    }
+}
+
+/// Occupies every free timer slot. Returns how many it newly took.
+///
+/// The entries name `NO_THREAD`, an id `allocate_id` can never issue, so one
+/// expired by mistake is ignored by `unpark` rather than waking a real thread.
+#[cfg(test)]
+pub fn fill_timer_table_for_test() -> alloc::vec::Vec<usize> {
+    let mut timers = TIMERS.lock();
+    let generation = TIMER_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let mut taken = alloc::vec::Vec::new();
+    for (index, slot) in timers.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(Timer {
+                deadline: u64::MAX,
+                thread: ThreadId(qunix_hal_x86_64::percpu::NO_THREAD),
+                generation,
+            });
+            taken.push(index);
+        }
+    }
+    taken
+}
+
+/// Releases exactly the slots [`fill_timer_table_for_test`] took.
+///
+/// Paired with it deliberately. Clearing the whole table instead deletes the
+/// registrations of any thread parked in a real `sleep_ticks`, which then waits
+/// forever with nothing scheduled to wake it -- a hang in some later, unrelated
+/// test, reported as a timeout naming nothing.
+#[cfg(test)]
+pub fn release_timer_slots_for_test(taken: &[usize]) {
+    let mut timers = TIMERS.lock();
+    for &index in taken {
+        timers[index] = None;
+    }
+}
+
+/// Registers a timer with an arbitrary deadline, naming no live thread.
+///
+/// Exists so `expire_timers` can be tested directly. Every other route into the
+/// table goes through `try_sleep_ticks`, which refuses a deadline that has
+/// already passed -- so the case the `>=` comparison exists for is unreachable
+/// from the public API, and mutating it to `==` failed no test.
+#[cfg(test)]
+pub fn insert_timer_for_test(deadline: u64) {
+    let mut timers = TIMERS.lock();
+    let slot = timers.iter_mut().find(|s| s.is_none()).expect("the timer table was full");
+    *slot = Some(Timer {
+        deadline,
+        thread: ThreadId(qunix_hal_x86_64::percpu::NO_THREAD),
+        generation: TIMER_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel),
+    });
+}
+
+/// Whether the timer slot at `index` is occupied. Test-only.
+///
+/// Distinguishes "a slot is occupied" from "*this* sleeper's slot is occupied",
+/// which a free count cannot -- and the difference is the whole of the
+/// twin-sleep bug: freeing the wrong slot keeps the count right.
+#[cfg(test)]
+pub fn slot_is_occupied_for_test(index: usize) -> bool {
+    TIMERS.lock()[index].is_some()
+}
+
+#[cfg(test)]
+pub fn free_timer_slots_for_test() -> usize {
+    TIMERS.lock().iter().filter(|s| s.is_none()).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static FLAG_READY: AtomicBool = AtomicBool::new(false);
+    static FLAG_WAKER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// A future that is `Pending` until a flag is set, and publishes the waker
+    /// it was handed so another thread can complete it -- the shape every
+    /// device future in T4 will have.
+    struct Flag {
+        polls: u64,
+    }
+
+    impl Future for Flag {
+        type Output = u64;
+        fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+            self.polls += 1;
+            if FLAG_READY.load(Ordering::Acquire) {
+                return Poll::Ready(self.polls);
+            }
+            // Taken from the `Waker` the executor handed us, *not* from
+            // `sched::current_id()`. Reading the id directly would give the
+            // right answer here and test nothing: the question is whether the
+            // waker carries the thread it was built for, and a future that
+            // bypassed it would pass with the waker plumbing removed entirely.
+            FLAG_WAKER.store(raw_id_of(cx.waker()), Ordering::Release);
+            Poll::Pending
+        }
+    }
+
+    #[test_case]
+    fn a_future_that_is_ready_immediately_never_parks() {
+        // The cheap path, and the one a mistake in `block_on`'s loop makes
+        // expensive: parking before the first poll would block every ready
+        // future until something else happened to wake the thread -- and for a
+        // future that is ready on the first poll, nothing ever would.
+        //
+        // A watchdog rather than a bare call, because the failure is a thread
+        // parked with nothing in the system able to wake it. Left to itself
+        // that is a 120-second harness timeout naming no test; with the
+        // watchdog it is an assertion that says what happened.
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        WOKE.store(false, Ordering::Release);
+
+        static SAW_PARKED: AtomicBool = AtomicBool::new(false);
+        SAW_PARKED.store(false, Ordering::Release);
+
+        extern "C" fn watchdog(sleeper: u64) -> ! {
+            let deadline = crate::TICKS.load(Ordering::SeqCst) + RESCUE_TICKS;
+            while crate::TICKS.load(Ordering::SeqCst) < deadline {
+                let parked = crate::sched::is_parked(qunix_sched::ThreadId(sleeper));
+                if parked {
+                    SAW_PARKED.store(true, Ordering::Release);
+                }
+                // Only after the sleeper has been *seen* parked may an
+                // unparked observation mean "it finished". Bailing on the first
+                // `!is_parked` exits before `block_on` has even been reached --
+                // the sleeper is running, not parked, at spawn time -- so the
+                // watchdog was gone before the moment it existed to cover, and
+                // whether it caught anything came down to which processor won.
+                if SAW_PARKED.load(Ordering::Acquire) && !parked {
+                    crate::sched::exit_current()
+                }
+                crate::sched::yield_now();
+            }
+            WOKE.store(true, Ordering::Release);
+            crate::sched::unpark(qunix_sched::ThreadId(sleeper));
+            crate::sched::exit_current()
+        }
+
+        let me = crate::sched::current_id();
+        crate::sched::spawn_kernel(watchdog, me.0, qunix_sched::Priority::Normal);
+        assert_eq!(block_on(core::future::ready(7u32)), 7);
+        assert!(
+            !WOKE.load(Ordering::Acquire),
+            "block_on parked on a future that was already ready; only the watchdog released it"
+        );
+    }
+
+    #[test_case]
+    fn a_waker_round_trips_the_thread_id_it_was_built_from() {
+        // The waker's data word *is* the id. Getting the cast wrong is silent:
+        // `unpark` would take an id naming nothing, find no thread, and return,
+        // so every await would hang with no message.
+        // A synthetic, deliberately non-zero id. Asserting against
+        // `current_id()` alone is vacuous on the thread that runs the suite:
+        // the boot thread's id is 0, so a waker whose data word was lost to a
+        // null pointer compares *equal* to it and every mutation of `clone`
+        // passes. Found by mutation, not by review.
+        let synthetic = qunix_sched::ThreadId(0x1234_5678_9abc);
+        let waker = waker_for(synthetic);
+        assert_eq!(raw_id_of(&waker), synthetic.0, "the waker does not name its own thread");
+        // Cloning must not change the id, and must not allocate. The identity
+        // clone is what lets an interrupt handler clone a waker at all.
+        let clone = waker.clone();
+        assert_eq!(raw_id_of(&clone), synthetic.0, "cloning a waker changed the thread it names");
+        // And the real thing, so the accessor is not merely self-consistent.
+        let id = crate::sched::current_id();
+        assert_eq!(raw_id_of(&waker_for(id)), id.0, "a live thread's waker does not name it");
+    }
+
+    #[test_case]
+    fn a_pending_future_resumes_when_another_thread_wakes_it() {
+        // End to end: poll returns Pending, the thread parks, a *different*
+        // thread completes it through the waker the future published, and
+        // `block_on` polls again and returns. This is the whole runtime.
+        FLAG_READY.store(false, Ordering::Release);
+        FLAG_WAKER.store(u64::MAX, Ordering::Release);
+
+        static RESCUED: AtomicBool = AtomicBool::new(false);
+        RESCUED.store(false, Ordering::Release);
+
+        /// Completes the future, or rescues the sleeper and says so.
+        ///
+        /// `arg` is the sleeper's real id, captured by the spawner. The rescue
+        /// is what turns every failure of this test into a named assertion:
+        /// without it, a waker naming the wrong thread parks the sleeper
+        /// forever, and the harness reports a 120-second timeout that names no
+        /// test and gives no reason.
+        extern "C" fn completer(sleeper: u64) -> ! {
+            let deadline = crate::TICKS.load(Ordering::SeqCst) + 60;
+            loop {
+                let raw = FLAG_WAKER.load(Ordering::Acquire);
+                // Waits until the sleeper has actually parked. Setting the flag
+                // earlier would exercise the pending-wake path instead, which
+                // is a different test.
+                if raw != u64::MAX && crate::sched::is_parked(qunix_sched::ThreadId(raw)) {
+                    FLAG_READY.store(true, Ordering::Release);
+                    // Woken through a `Waker` built from the published id, not
+                    // through `sched::unpark` directly, so the vtable's `wake`
+                    // arm is on the path under test.
+                    waker_for(qunix_sched::ThreadId(raw)).wake();
+                    break;
+                }
+                if crate::TICKS.load(Ordering::SeqCst) >= deadline {
+                    RESCUED.store(true, Ordering::Release);
+                    FLAG_READY.store(true, Ordering::Release);
+                    // The *real* id, not the published one, which is exactly
+                    // what may be wrong.
+                    crate::sched::unpark(qunix_sched::ThreadId(sleeper));
+                    break;
+                }
+                crate::sched::yield_now();
+            }
+            crate::sched::exit_current()
+        }
+
+        // The awaiting side runs on a *spawned* thread, not on this one.
+        //
+        // The boot thread's id is 0, and this test's central assertion compares
+        // the waker's published id against the awaiting thread's. On the boot
+        // thread that comparison is `0 == 0`, so a `waker_for` that lost its
+        // data word to a null pointer passes the whole test -- including the
+        // rescue, because `unpark(ThreadId(0))` happens to name the right
+        // thread. That is the same coincidence already fixed in
+        // `a_waker_round_trips_the_thread_id_it_was_built_from`, still live in
+        // the test described as "the whole runtime".
+        static AWAITER: AtomicU64 = AtomicU64::new(u64::MAX);
+        static POLLS: AtomicU64 = AtomicU64::new(0);
+        static AWAITED: AtomicBool = AtomicBool::new(false);
+        AWAITER.store(u64::MAX, Ordering::Release);
+        POLLS.store(0, Ordering::Release);
+        AWAITED.store(false, Ordering::Release);
+
+        extern "C" fn awaiter(_: u64) -> ! {
+            let me = crate::sched::current_id();
+            assert_ne!(
+                me.0, 0,
+                "the awaiter is the boot thread; a null waker data word would compare equal to \
+                 its id and this test would assert nothing"
+            );
+            AWAITER.store(me.0, Ordering::Release);
+            POLLS.store(block_on(Flag { polls: 0 }), Ordering::Release);
+            AWAITED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        let awaiter_id = crate::sched::spawn_kernel(awaiter, 0, qunix_sched::Priority::Normal);
+        assert!(
+            crate::tests::wait_until(
+                || AWAITER.load(Ordering::Acquire) != u64::MAX,
+                crate::tests::WAIT_BUDGET
+            ),
+            "{awaiter_id:?} never started"
+        );
+        crate::sched::spawn_kernel(
+            completer,
+            AWAITER.load(Ordering::Acquire),
+            qunix_sched::Priority::Normal,
+        );
+        assert!(
+            crate::tests::wait_until(
+                || AWAITED.load(Ordering::Acquire),
+                crate::tests::WAIT_BUDGET
+            ),
+            "{awaiter_id:?} never finished awaiting"
+        );
+
+        assert!(
+            !RESCUED.load(Ordering::Acquire),
+            "the future never completed on its own: either it was never polled, or the waker \
+             it published did not name the thread that was parked"
+        );
+        assert!(
+            POLLS.load(Ordering::Acquire) >= 2,
+            "the future completed without ever having been pending"
+        );
+        assert_eq!(
+            FLAG_WAKER.load(Ordering::Acquire),
+            AWAITER.load(Ordering::Acquire),
+            "the future was polled with a waker naming some other thread"
+        );
+    }
+
+    /// Whether the most recent [`with_rescuer`] had to release its caller.
+    #[cfg(test)]
+    static RESCUE_FIRED: AtomicBool = AtomicBool::new(false);
+
+    /// Runs `body` with a bounded rescuer watching the calling thread.
+    ///
+    /// The tests that park on nothing but `expire_timers` are exactly the ones
+    /// whose failure mode is a thread parked with nothing in the system able to
+    /// wake it -- a 120-second harness timeout naming no test, which is the
+    /// worst diagnostic this project produces. The rescuer converts that into a
+    /// named assertion, and asserts it did *not* have to act.
+    fn with_rescuer(what: &str, body: impl FnOnce()) {
+        RESCUE_FIRED.store(false, Ordering::Release);
+
+        extern "C" fn rescuer(sleeper: u64) -> ! {
+            let deadline = crate::TICKS.load(Ordering::SeqCst) + RESCUE_TICKS;
+            let mut saw_parked = false;
+            while crate::TICKS.load(Ordering::SeqCst) < deadline {
+                let parked = crate::sched::is_parked(qunix_sched::ThreadId(sleeper));
+                saw_parked |= parked;
+                // Only meaningful once the sleeper has been seen parked; before
+                // that, "not parked" just means it has not got there yet.
+                if saw_parked && !parked {
+                    crate::sched::exit_current()
+                }
+                crate::sched::yield_now();
+            }
+            RESCUE_FIRED.store(true, Ordering::Release);
+            crate::sched::unpark(qunix_sched::ThreadId(sleeper));
+            crate::sched::exit_current()
+        }
+
+        let me = crate::sched::current_id();
+        crate::sched::spawn_kernel(rescuer, me.0, qunix_sched::Priority::Normal);
+        body();
+        assert!(
+            !RESCUE_FIRED.load(Ordering::Acquire),
+            "{what}: the sleeper was released by the rescuer, not by the timer interrupt"
+        );
+    }
+
+    #[test_case]
+    fn a_sleep_is_woken_by_the_timer_interrupt() {
+        // The milestone's sharpest risk, tested directly: nothing but the timer
+        // handler makes this thread runnable again. If a `Waker` cannot be
+        // driven from interrupt context, this is where it shows.
+        let start = crate::TICKS.load(Ordering::SeqCst);
+        with_rescuer("a 3-tick sleep", || block_on(sleep_ticks(3)));
+        let elapsed = crate::TICKS.load(Ordering::SeqCst) - start;
+        assert!(elapsed >= 3, "slept {elapsed} ticks, asked for 3");
+        // Bounded above as well. A sleep that returned only when something
+        // *else* happened to wake the thread would satisfy the lower bound on a
+        // busy machine and say nothing about the timer path.
+        assert!(elapsed < 100, "slept {elapsed} ticks for a 3-tick sleep");
+    }
+
+    #[test_case]
+    fn a_sleep_of_zero_ticks_does_not_park() {
+        // A deadline already in the past must be `Ready` on the first poll. If
+        // it registered instead, the thread would park until the *next* tick
+        // for a sleep it was told took no time -- and on a processor whose
+        // timer is masked, forever.
+        let free_before = free_timer_slots_for_test();
+        let start = crate::TICKS.load(Ordering::SeqCst);
+        block_on(sleep_ticks(0));
+        assert_eq!(crate::TICKS.load(Ordering::SeqCst) - start, 0, "a zero-tick sleep waited");
+
+        // Asserted while the future is still alive. Checking after it is
+        // dropped proves nothing: `Sleep::drop` releases the slot, so a
+        // zero-tick sleep that wrongly took one would look identical.
+        let sleep = try_sleep_ticks(0).expect("a zero-tick sleep was refused");
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "a zero-tick sleep took a timer slot; a deadline already reached needs no timer"
+        );
+        drop(sleep);
+    }
+
+    #[test_case]
+    fn the_timer_table_reports_how_close_it_has_come_to_full() {
+        // A fixed table with a panic at the end of it needs pressure to be
+        // visible *before* the panic, not only after. This asserts the mark
+        // tracks reality rather than sitting at zero -- a high-water mark that
+        // never moves is indistinguishable from one that is not wired up, and
+        // that is the whole failure mode it exists to prevent.
+        let before = timer_high_water();
+        let taken = fill_timer_table_for_test();
+        // A registration through the real path, so the mark is updated by the
+        // code that ships rather than by the test helper.
+        let extra = try_sleep_ticks(1);
+        release_timer_slots_for_test(&taken);
+        drop(extra);
+
+        assert!(
+            timer_high_water() >= before,
+            "the high-water mark went backwards: {} then {}",
+            before,
+            timer_high_water()
+        );
+        assert!(
+            timer_high_water() > 0,
+            "the high-water mark never moved, so nothing would warn before the table fills"
+        );
+    }
+
+    #[test_case]
+    fn a_full_timer_table_refuses_rather_than_returning_a_sleep_that_never_fires() {
+        // The negative direction, and the one that matters: a registration that
+        // silently failed produces a future that is `Pending` forever with
+        // nothing scheduled to wake it. Refusing is the only outcome a caller
+        // can act on.
+        //
+        // The table is filled directly rather than by spawning CAPACITY
+        // threads, because the assertion is about the registration path, not
+        // about the scheduler's ability to hold that many threads.
+        let taken = fill_timer_table_for_test();
+        assert_eq!(free_timer_slots_for_test(), 0, "the table did not fill");
+        let refused = try_sleep_ticks(1);
+        // Released *before* the assertion, and only the slots this test took.
+        // Asserting first would leave the table full for the rest of the boot
+        // if the assertion fired, so every later `sleep_ticks` in the suite
+        // would panic and one real failure would become an unreadable pile.
+        release_timer_slots_for_test(&taken);
+        assert!(
+            matches!(refused, Err(SleepError::Full)),
+            "a full timer table accepted another sleeper"
+        );
+        assert!(try_sleep_ticks(1).is_ok(), "the table stayed full after being released");
+    }
+
+    #[test_case]
+    fn an_expired_timer_frees_its_slot() {
+        // Otherwise the table fills permanently after CAPACITY sleeps and every
+        // later sleep in the kernel is refused -- long after the code that
+        // filled it ran.
+        let free_before = free_timer_slots_for_test();
+        with_rescuer("a 1-tick sleep", || block_on(sleep_ticks(1)));
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "a completed sleep left its slot occupied"
+        );
+    }
+
+    #[test_case]
+    fn two_sleeps_with_one_deadline_release_their_own_slots() {
+        // The module docs advertise two futures awaited inside one thread, and
+        // that is the case that breaks identifying a timer slot by its
+        // contents: `join(sleep_ticks(5), sleep_ticks(5))` registers two
+        // entries whose `(thread, deadline)` pairs are identical.
+        //
+        // A `drop` that searched for a matching pair freed whichever it reached
+        // first, so the *survivor* could lose its registration -- leaving it
+        // Pending with nothing scheduled to wake it -- while the dropped one's
+        // slot stayed occupied forever. Both directions are asserted below,
+        // because freeing one slot too many and freeing one too few look
+        // identical in a count taken at the end.
+        let free_before = free_timer_slots_for_test();
+        let first = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        let second = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before - 2,
+            "two sleeps did not take two slots"
+        );
+
+        // The *later*-registered one is dropped first, and the order is the
+        // whole point. A drop that searches for a matching `(thread, deadline)`
+        // scans from the start of the table, so dropping the earlier sleep
+        // first finds its own slot by luck and the bug hides completely.
+        // Dropping the later one makes the scan land on its twin's slot
+        // instead. Rust's own drop order for locals is reverse declaration,
+        // so this is also the ordinary case rather than a contrived one.
+        let survivor = first.slot.expect("the surviving sleep was never registered");
+        drop(second);
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before - 1,
+            "dropping one of two identical sleeps released the wrong number of slots"
+        );
+        // The survivor must still hold *its own* slot. A drop that freed the
+        // other future's slot leaves this one Pending with no timer behind it,
+        // and the count above cannot tell the two cases apart -- one slot is
+        // free either way.
+        assert!(
+            slot_is_occupied_for_test(survivor),
+            "the surviving sleep lost its own slot when its twin was dropped; it is now Pending \
+             with no timer registered to wake it"
+        );
+
+        drop(first);
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "the second of two identical sleeps leaked its slot"
+        );
+    }
+
+    #[test_case]
+    fn a_thread_may_exit_while_another_is_sleeping() {
+        // Before threads could block, "nothing runnable" meant "nothing left",
+        // and `exit_current` panicked on it. A parked thread is deliberately in
+        // no run queue, so a processor whose only company is a sleeper now
+        // reaches that same state in the ordinary course of being idle --
+        // and panicking there kills the machine because one thread exited while
+        // another was waiting for a timer.
+        //
+        // Both threads are spawned before either runs, so the exiting one can
+        // genuinely find the sleeper parked and nothing runnable.
+        static SLEPT: AtomicBool = AtomicBool::new(false);
+        static EXITED: AtomicBool = AtomicBool::new(false);
+        SLEPT.store(false, Ordering::Release);
+        EXITED.store(false, Ordering::Release);
+
+        extern "C" fn sleeper(_: u64) -> ! {
+            block_on(sleep_ticks(4));
+            SLEPT.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+        extern "C" fn quitter(_: u64) -> ! {
+            EXITED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        let a = crate::sched::spawn_kernel(sleeper, 0, qunix_sched::Priority::Normal);
+        let b = crate::sched::spawn_kernel(quitter, 0, qunix_sched::Priority::Normal);
+        assert!(
+            crate::tests::wait_until(
+                || SLEPT.load(Ordering::Acquire) && EXITED.load(Ordering::Acquire),
+                crate::tests::WAIT_BUDGET
+            ),
+            "{a:?} or {b:?} never finished; a thread exiting beside a sleeper must not panic"
+        );
+    }
+
+    #[test_case]
+    fn a_deadline_already_passed_is_expired_rather_than_stepped_over() {
+        // `expire_timers` compares `now >= deadline`, and the reason is a tick
+        // it never saw: interrupts are masked across every context switch, and
+        // `try_sleep_ticks` can be preempted between reading `TICKS` and
+        // inserting its slot. An `==` test steps straight over the deadline and
+        // leaves the sleeper parked forever.
+        //
+        // Driven directly rather than through a sleep, because every public
+        // route into the table refuses a deadline that has already passed -- so
+        // the case the comparison exists for is unreachable from the API, and
+        // mutating `>=` to `==` failed no test at all.
+        //
+        // The entry names `NO_THREAD`, an id `allocate_id` can never issue, so
+        // expiring it wakes nothing.
+        let free_before = free_timer_slots_for_test();
+        let now = crate::TICKS.load(Ordering::SeqCst);
+        insert_timer_for_test(now);
+        assert_eq!(free_timer_slots_for_test(), free_before - 1, "the timer was not registered");
+
+        // Three more that must fire, and one that must not. The survivor is
+        // the other direction of the same comparison: without it, mutating the
+        // test to `slot.is_some()` -- expire everything, every tick -- leaves
+        // the suite green and every sleep in the kernel returns early.
+        insert_timer_for_test(now.saturating_sub(1));
+        insert_timer_for_test(now);
+        let survivor = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        let survivor_slot = survivor.slot.expect("the survivor was never registered");
+
+        // A *later* tick than the deadlines, never the exact one.
+        expire_timers(now + 5);
+        assert!(
+            slot_is_occupied_for_test(survivor_slot),
+            "a deadline a million ticks away was expired; every sleep in the kernel would \
+             return early"
+        );
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before - 1,
+            "a deadline that had already passed was stepped over, or the pass stopped after \
+             the first match; the sleeper would wait forever"
+        );
+        drop(survivor);
+        assert_eq!(free_timer_slots_for_test(), free_before, "the survivor leaked its slot");
+    }
+
+    #[test_case]
+    fn a_fired_sleep_dropped_late_does_not_release_the_slot_that_replaced_it() {
+        // `expire_timers` frees a slot the instant its deadline passes, and the
+        // next registration takes it. A `drop` that trusted its stored index
+        // would then release a registration that is still wanted, leaving that
+        // sleeper `Pending` with nothing scheduled to wake it -- and a free-slot
+        // count cannot tell the two cases apart, because one slot is free
+        // either way. That is the twin-sleep bug one step over, which is why
+        // the identity is a generation rather than a deadline: two
+        // registrations can share a deadline, and a reused slot can carry it.
+        let now = crate::TICKS.load(Ordering::SeqCst);
+        let fired = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        let index = fired.slot.expect("the sleep was never registered");
+
+        // Expired without dropping the future, which is exactly the ordering
+        // that makes the stored index stale.
+        expire_timers(now + 1_000_001);
+        assert!(!slot_is_occupied_for_test(index), "expiry did not free the slot");
+
+        let replacement = try_sleep_ticks(1_000_000).expect("the timer table was full");
+        assert_eq!(replacement.slot, Some(index), "the freed slot was not the one reused");
+
+        drop(fired);
+        assert!(
+            slot_is_occupied_for_test(index),
+            "a fired sleeper's drop released the slot that had been reused under it; the \
+             replacement is now Pending with no timer registered to wake it"
+        );
+        drop(replacement);
+    }
+
+    #[test_case]
+    fn abandoning_a_sleep_before_it_fires_frees_its_slot() {
+        // Cancellation is not hypothetical: T4's read futures are dropped
+        // whenever a request is abandoned. A slot leaked per cancellation fills
+        // the table permanently, and every later sleep is refused.
+        let free_before = free_timer_slots_for_test();
+        drop(try_sleep_ticks(1_000_000).expect("the timer table was full"));
+        assert_eq!(
+            free_timer_slots_for_test(),
+            free_before,
+            "an abandoned sleep left its slot occupied"
+        );
+    }
+
+    #[test_case]
+    fn waking_through_a_stale_waker_does_not_disturb_a_later_thread() {
+        // The reason there is no generation counter. A waker kept past its
+        // thread's death must be inert -- if ids were reused, this would wake
+        // whichever thread inherited the number, at a suspension point it never
+        // reached.
+        static DEAD: AtomicU64 = AtomicU64::new(u64::MAX);
+
+        extern "C" fn brief(_: u64) -> ! {
+            DEAD.store(crate::sched::current_id().0, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        let id = crate::sched::spawn_kernel(brief, 0, qunix_sched::Priority::Normal);
+        assert!(
+            crate::tests::wait_until(|| !crate::sched::thread_id_is_live(id), crate::tests::WAIT_BUDGET),
+            "{id:?} never exited"
+        );
+        assert_eq!(DEAD.load(Ordering::Acquire), id.0);
+
+        let stale = waker_for(id);
+
+        // A thread created *after* the death, which is the one that would
+        // inherit the number if ids were ever reused. The previous assertion
+        // compared `thread_count()` before and after, which no mutation can
+        // move -- `unpark` has no path that inserts -- while an unrelated reap
+        // on another processor can. Vacuous and flaky at once, and silent about
+        // the property it was named for.
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+        RELEASED.store(false, Ordering::Release);
+
+        extern "C" fn successor(_: u64) -> ! {
+            crate::sched::park();
+            RELEASED.store(true, Ordering::Release);
+            crate::sched::exit_current()
+        }
+
+        let next = crate::sched::spawn_kernel(successor, 0, qunix_sched::Priority::Normal);
+        assert_ne!(
+            next, id,
+            "an id was reused; every stale waker in the kernel now names a live thread"
+        );
+        assert!(
+            crate::tests::wait_until(
+                || crate::sched::is_parked(next),
+                crate::tests::WAIT_BUDGET
+            ),
+            "{next:?} never parked"
+        );
+
+        stale.wake();
+        assert!(
+            crate::sched::is_parked(next),
+            "a dead thread's waker woke the thread spawned after it"
+        );
+        assert!(
+            !RELEASED.load(Ordering::Acquire),
+            "{next:?} resumed on a wake meant for a thread that had already exited"
+        );
+
+        crate::sched::unpark(next);
+        assert!(
+            crate::tests::wait_until(
+                || RELEASED.load(Ordering::Acquire),
+                crate::tests::WAIT_BUDGET
+            ),
+            "{next:?} never resumed"
+        );
+    }
+}

@@ -24,6 +24,11 @@ use crate::vmspace::VmSpace;
 pub enum ThreadState {
     Ready,
     Running,
+    /// Waiting for something to call `sched::unpark`. Distinct from `Ready`
+    /// because a blocked thread must be in no run queue: `Ready` means "may be
+    /// dispatched", and dispatching a thread waiting on an I/O completion runs
+    /// it at a suspension point it has not returned from.
+    Blocked,
     Exited,
 }
 
@@ -53,6 +58,33 @@ pub struct Thread {
     pub kernel_stack_top: u64,
     pub state: ThreadState,
     pub priority: Priority,
+    /// Whether this thread is parked, and whether a wakeup beat it there.
+    ///
+    /// Mutated only under the scheduler lock, by `sched::park` and
+    /// `sched::unpark`. It is *not* derivable from `state`: the window it
+    /// closes is precisely the one in which `state` has not been updated yet.
+    ///
+    /// `pub(crate)` rather than `pub`: `ParkState` carries *mutating* methods,
+    /// and calling `thread.park.park()` outside `sched` would set the flag
+    /// without updating `state`, without tagging the handoff slot, and without
+    /// removing the thread from any run queue -- reproducing the dispatched-
+    /// while-parked bug this whole mechanism exists to prevent. Narrowed now,
+    /// while `sched` is the only module that touches threads, rather than after
+    /// a second one arrives.
+    pub(crate) park: qunix_sched::ParkState,
+    /// The processor an idle-band thread belongs to, if it is one.
+    ///
+    /// An idle thread adopted the stack its own processor booted on, so running
+    /// it anywhere else puts two processors on one stack. The steal path
+    /// already refuses to take one, but that is only half the rule: `unpark`
+    /// pushes to the *local* queue, so a wake delivered from another processor
+    /// -- a timer interrupt expiring a sleep, say -- would deposit an idle
+    /// thread in a queue whose owner is perfectly entitled to pop it. Nothing
+    /// stole it; it was handed over.
+    ///
+    /// `None` for an ordinary thread, which owns a heap stack and may run
+    /// anywhere.
+    pub home_cpu: Option<u32>,
     /// The address space this thread entered ring 3 on, for a user thread.
     ///
     /// Owned here because `syscall::enter_user` never returns: the frame that
@@ -108,6 +140,9 @@ impl Thread {
             kernel_stack_top: stack_top,
             state: ThreadState::Ready,
             priority,
+            park: qunix_sched::ParkState::default(),
+            // Owns a heap stack, so it may run on any processor.
+            home_cpu: None,
             // Filled in by `sched::adopt_address_space` if this thread turns
             // out to be a user thread; a kernel thread never has one.
             address_space: None,
@@ -126,6 +161,11 @@ impl Thread {
             kernel_stack_top: 0,
             state: ThreadState::Running,
             priority: Priority::Idle,
+            // An idle thread that could not record a park would sleep through
+            // its own wakeups the first time anything in the boot path awaits.
+            park: qunix_sched::ParkState::default(),
+            // Pinned to the processor whose stack it just adopted.
+            home_cpu: Some(qunix_hal_x86_64::percpu::cpu_id()),
             address_space: None,
         }
     }

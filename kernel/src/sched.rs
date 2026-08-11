@@ -37,12 +37,19 @@
 //! remotely — and that removal is the only thing preventing two CPUs from
 //! resuming one context. The other half of the same invariant is that the
 //! outgoing thread is **not** requeued before the switch: see [`HANDOFF_ID`].
+//!
+//! A *parked* outgoing thread goes through the same slot, tagged with
+//! [`HANDOFF_PARKED`]. It must not be requeued while it is parked, but it must
+//! still be covered by the handoff, because between the lock release and the
+//! stack switch it is in no run queue and is current nowhere either. `unpark`
+//! claims the tag instead of pushing, which makes the handoff the single place
+//! such a thread can be queued from.
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use qunix_hal_x86_64::context::{self, Context};
 use qunix_hal_x86_64::percpu::{self, MAX_CPUS, NO_THREAD};
-use qunix_sched::{Priority, ThreadId};
+use qunix_sched::{ParkOutcome, Priority, ThreadId, WakeOutcome};
 use qunix_sync::{IrqControl, IrqSpinLock};
 
 use crate::thread::{Thread, ThreadState};
@@ -65,9 +72,27 @@ impl Scheduler {
         Self { threads: BTreeMap::new(), next_id: 0, reapable: alloc::vec::Vec::new() }
     }
 
+    /// Allocates an id that has never been used before.
+    ///
+    /// **Never reusing an id is load-bearing outside this function.** A
+    /// `Waker` carries a bare `ThreadId` as its data word -- no refcount, no
+    /// generation -- which is only sound because an id that outlives its
+    /// thread can never come to name a different one. `checked_add` rather
+    /// than `+=` for the same reason: the kernel builds without overflow
+    /// checks in release, so a wrapped counter would silently reintroduce
+    /// reuse, and the first symptom would be a completion waking an unrelated
+    /// thread.
+    ///
+    /// No test covers the overflow and none can: reaching it needs 2^64 spawns,
+    /// so mutating it to `wrapping_add` leaves the suite green. Kept because it
+    /// is correct and free, and recorded here so the next mutation pass reads
+    /// this as unfalsifiable rather than as a hole.
     fn allocate_id(&mut self) -> ThreadId {
         let id = ThreadId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.checked_add(1).expect("thread ids exhausted");
+        // `NO_THREAD` is the per-CPU "nothing is running" sentinel, so a thread
+        // carrying it would be indistinguishable from an empty slot.
+        assert_ne!(id.0, NO_THREAD, "thread id collided with the empty sentinel");
         id
     }
 }
@@ -95,10 +120,38 @@ static IDLE_INSTALLED: AtomicU64 = AtomicU64::new(0);
 /// the outgoing thread is handed to whatever runs on this CPU *next*, which by
 /// construction runs after the save has completed, and that publishes it.
 ///
-/// Written and read only by the owning CPU, with interrupts masked, so
-/// `Relaxed` is enough: the ordering that matters is program order on one CPU.
+/// Written by the owning CPU with interrupts masked, and read by it in
+/// `publish_handoff` — but **not exclusively**: `claim_parked_handoff` clears
+/// the parked tag from *another* processor. That is why the slot is swapped and
+/// compare-exchanged with `AcqRel` rather than `Relaxed`, and why the tag lives
+/// in the same word as the id.
+///
+/// This comment used to say the array was touched only by its owning CPU and
+/// that `Relaxed` was therefore enough. That stopped being true the moment
+/// `unpark` gained the ability to claim a slot, and it is corrected here rather
+/// than left to describe a design that no longer exists.
 static HANDOFF_ID: [AtomicU64; MAX_CPUS as usize] =
     [const { AtomicU64::new(NO_THREAD) }; MAX_CPUS as usize];
+
+/// Set in a handoff slot when the thread being handed off is *parked*.
+///
+/// A parked thread must not be requeued by the handoff, but it must still pass
+/// *through* it: between `schedule` releasing the scheduler lock and
+/// `context::switch` storing the thread's stack pointer, the thread is parked,
+/// in no run queue, and -- because this CPU's `current` already names the
+/// incoming thread -- not "current anywhere" either. An `unpark` landing in
+/// that window would see nothing stopping it, push the thread, and let another
+/// processor resume a context that has not been saved yet.
+///
+/// Packed into the id rather than kept beside it so the two are read and
+/// written as one atomic. A separate flag reintroduces the race one level down:
+/// `unpark` could observe the id, `publish_handoff` could swap it away and
+/// observe the flag still set, and the wake would be dropped by both.
+///
+/// Safe as a tag bit because ids come from a counter that starts at zero and is
+/// guarded against overflow; reaching 2^63 threads is not a thing that happens.
+const HANDOFF_PARKED: u64 = 1 << 63;
+
 static HANDOFF_PRIORITY: [AtomicU8; MAX_CPUS as usize] =
     [const { AtomicU8::new(0) }; MAX_CPUS as usize];
 
@@ -136,6 +189,19 @@ static STEAL_CONTENDED: AtomicU64 = AtomicU64::new(0);
 /// Steal attempts abandoned because the remote queue was locked, since boot.
 pub fn steal_contention_count() -> u64 {
     STEAL_CONTENDED.load(Ordering::Acquire)
+}
+
+/// Wake IPIs that could not be sent because this processor had no LAPIC base.
+///
+/// A dropped wake IPI leaves a halted parked thread waiting for a timer tick
+/// that may not be coming. Observable rather than silent, because the state it
+/// produces -- a processor halted while work is runnable -- is one nobody
+/// should have to infer.
+static WAKE_IPI_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Wake IPIs dropped for want of a LAPIC base, since boot.
+pub fn wake_ipi_dropped_count() -> u64 {
+    WAKE_IPI_DROPPED.load(Ordering::Acquire)
 }
 
 /// Times each CPU has gone round [`idle_loop`].
@@ -347,17 +413,411 @@ pub fn yield_now() {
     schedule(ThreadState::Ready);
 }
 
+/// How long a widened race window is held open, in spin iterations.
+///
+/// One name for what was two copies. Long enough that another processor
+/// reliably observes the window; short enough that the processor holding it --
+/// which has interrupts masked -- drops only a tick or two, and every tick
+/// budget in the suite is fed by four processors.
+#[cfg(test)]
+const WIDEN_SPIN: usize = 2_000_000;
+
+/// Set by a test to the id whose park window should be held open.
+#[cfg(test)]
+static WIDEN_PARK: AtomicU64 = AtomicU64::new(NO_THREAD);
+
+/// Set by a test to the id whose *switch-away* window should be held open.
+#[cfg(test)]
+static WIDEN_SWITCH: AtomicU64 = AtomicU64::new(NO_THREAD);
+
+/// The thread currently held inside a widened switch window, or `NO_THREAD`.
+#[cfg(test)]
+static IN_SWITCH: AtomicU64 = AtomicU64::new(NO_THREAD);
+
+/// Arms the switch-window hook for `id`. Test-only.
+#[cfg(test)]
+pub fn widen_next_switch(id: ThreadId) {
+    WIDEN_SWITCH.store(id.0, Ordering::Release);
+}
+
+/// The thread held inside a widened switch window, if any. Test-only.
+#[cfg(test)]
+pub fn thread_in_switch_window() -> Option<ThreadId> {
+    match IN_SWITCH.load(Ordering::Acquire) {
+        NO_THREAD => None,
+        raw => Some(ThreadId(raw)),
+    }
+}
+
+/// Holds open the window between `schedule` releasing the scheduler lock and
+/// `context::switch` storing the outgoing thread's stack pointer.
+///
+/// That window is where a parked outgoing thread is invisible to every guard
+/// except the handoff: it is in no run queue, and this CPU's `current` already
+/// names the incoming thread, so `is_current_anywhere` answers no. It is a few
+/// instructions wide in ordinary running, which makes it exactly the kind of
+/// path CLAUDE.md says must have its contention forced rather than hoped for.
+#[cfg(test)]
+fn widen_the_switch_window(outgoing: ThreadId) {
+    if WIDEN_SWITCH.load(Ordering::Acquire) != outgoing.0 {
+        return;
+    }
+    // Consumed, so one arming widens one switch.
+    WIDEN_SWITCH.store(NO_THREAD, Ordering::Release);
+    WIDENED.fetch_add(1, Ordering::AcqRel);
+    IN_SWITCH.store(outgoing.0, Ordering::Release);
+    for _ in 0..WIDEN_SPIN {
+        core::hint::spin_loop();
+    }
+    IN_SWITCH.store(NO_THREAD, Ordering::Release);
+}
+
+/// Holds a park window open so another processor can win the race with it.
+#[cfg(test)]
+fn widen_the_park_window(me: ThreadId) {
+    if WIDEN_PARK.load(Ordering::Acquire) != me.0 {
+        return;
+    }
+    // Consumed, so one arming widens one park. A sticky flag would slow every
+    // later park in the suite and hide a regression behind the delay.
+    WIDEN_PARK.store(NO_THREAD, Ordering::Release);
+    WIDENED.fetch_add(1, Ordering::AcqRel);
+    // Interrupts are masked here, so this cannot yield; the waking processor is
+    // a different one and needs only wall-clock.
+    for _ in 0..WIDEN_SPIN {
+        core::hint::spin_loop();
+    }
+}
+
+/// How many times the park window has actually been held open.
+#[cfg(test)]
+static WIDENED: AtomicU64 = AtomicU64::new(0);
+
+/// How many race windows have actually been held open. Test-only.
+///
+/// Asserted by the tests that arm them, so "the window opened" is a fact rather
+/// than an inference from having observed something that looked like it. If an
+/// arming ever stops matching -- an id mismatch, a reordering, the hook
+/// compiled out -- the observation could still hold for an unrelated reason and
+/// the test would quietly become the statement about scheduling it must not be.
+#[cfg(test)]
+pub fn widened_count() -> u64 {
+    WIDENED.load(Ordering::Acquire)
+}
+
+/// Arms the park-window hook for `id`. Test-only.
+#[cfg(test)]
+pub fn widen_next_park(id: ThreadId) {
+    WIDEN_PARK.store(id.0, Ordering::Release);
+}
+
+/// Whether any processor names `id` as the thread it is running. Test-only
+/// accessor for the predicate `unpark` gates its queueing on.
+#[cfg(test)]
+pub fn is_running_somewhere(id: ThreadId) -> bool {
+    is_current_anywhere(id)
+}
+
+/// Blocks the calling thread until something calls [`unpark`] on it.
+///
+/// Returns when the thread is woken, which may be spuriously: the contract is
+/// only that a woken thread eventually runs, so callers must re-check their
+/// condition. That is what `task::block_on`'s loop does.
+pub fn park() {
+    let me = current_id();
+    // Captured **once**, outside the loop. It used to be taken per iteration,
+    // which meant the second and later iterations saved the `IF=1` that this
+    // function's own `sti; hlt` had just set -- so a caller that entered with
+    // interrupts masked got them back enabled as soon as `park` went round
+    // once. That is the failure `MachineState` exists to catch, except inside
+    // the scheduler where no per-test check can see it.
+    let irq = qunix_hal_x86_64::Irq::disable_and_save();
+    loop {
+        // Masked across the whole decision. The state transition and the
+        // switch must not be split by a tick: between them this CPU's
+        // `current` and the thread's park state disagree, and a preemption
+        // there would requeue a thread on its way to being blocked.
+        //
+        // `disable`, not `disable_and_save`: the caller's state is already
+        // held in `irq` above, and re-saving here is precisely the bug.
+        x86_64::instructions::interrupts::disable();
+        {
+            let mut sched = SCHED.lock();
+            // Panics rather than returning. Returning looks like the gentler
+            // option and is the worse one: `block_on`'s loop is poll-then-park,
+            // so a `park` that silently does nothing becomes a tight spin that
+            // never completes and never says why -- a livelock that also holds
+            // a processor, which is strictly worse than the hang it was trying
+            // to avoid. Blocking before the scheduler owns you is a programming
+            // error, and CLAUDE.md wants those to be errors rather than notes.
+            let thread = sched.threads.get_mut(&me).unwrap_or_else(|| {
+                panic!("park called on {me:?}, which is not a scheduled thread")
+            });
+            match thread.park.park() {
+                // A wakeup was already waiting, so this is the park that must
+                // not happen.
+                //
+                // Returning here is an *optimisation*, not the guard. `park`
+                // has already consumed the pending wake and left `parked`
+                // false, so falling through to `schedule` would find the thread
+                // unparked, hand it on as `Ready`, and resume it anyway -- the
+                // saving is one pointless context switch. Said plainly because
+                // mutating this arm to fall through fails no test, and the next
+                // reader deserves to know that is correct rather than a hole:
+                // the correctness lives in `schedule`'s re-check.
+                ParkOutcome::Cancelled => {
+                    qunix_hal_x86_64::Irq::restore(irq);
+                    return;
+                }
+                ParkOutcome::Parked => thread.state = ThreadState::Blocked,
+            }
+        }
+
+        // The window this test hook widens is the one `unpark`'s
+        // `is_current_anywhere` check exists for: the scheduler lock is
+        // released above and retaken inside `schedule`, and a wake arriving in
+        // between finds this thread parked *and* still current. Without the
+        // check it is pushed onto a run queue while it is executing, and
+        // another processor resumes a context that is still in use.
+        //
+        // The window is a few instructions wide, so a test that merely hoped to
+        // hit it would be a statement about the scheduler's timing rather than
+        // about the guard -- CLAUDE.md is explicit that contention-dependent
+        // paths must have their contention forced. Compiled out entirely when
+        // not testing.
+        #[cfg(test)]
+        widen_the_park_window(me);
+
+        // `schedule` re-checks the park under its *own* acquisition of SCHED,
+        // because the lock is released between here and there and a completion
+        // in that window clears the park without queueing the thread (it is
+        // still current). Switching away on the stale decision is the lost
+        // wakeup in its most expensive form.
+        schedule(ThreadState::Blocked);
+
+        // Two ways to arrive here: something else ran and switched back, or
+        // there was nothing runnable and `schedule` returned without
+        // switching. One question answers both.
+        if !is_parked(me) {
+            qunix_hal_x86_64::Irq::restore(irq);
+            return;
+        }
+
+        // Still parked, and still running, because nothing else was runnable.
+        // Halting is the only correct move: returning would run a blocked
+        // thread at a suspension point it has not returned from, and spinning
+        // would occupy the CPU the completion interrupt has to be delivered
+        // on. `sti; hlt` is one instruction pair for the reason `idle_loop`
+        // documents -- `sti` takes effect only after the following
+        // instruction, so an interrupt that arrived while masked is delivered
+        // once `hlt` has been entered, which is what wakes it.
+        // SAFETY: no memory is touched and no stack slot is used.
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+
+        // Re-checked here, *before* looping back to park again. Without this
+        // the loop's next iteration calls `park` on a thread that has just been
+        // woken: `wake` cleared `parked` without setting `pending`, so the park
+        // succeeds, the thread blocks again, and the future is never re-polled.
+        // The wake is consumed and its effect discarded -- a hang whose cause
+        // is one missing check, and the exact bug the first `sleep_ticks` test
+        // found. The post-`schedule` check above cannot cover it: this path
+        // never reaches `schedule`, because there was nothing to switch to.
+        if !is_parked(me) {
+            qunix_hal_x86_64::Irq::restore(irq);
+            return;
+        }
+    }
+}
+
+/// Makes a parked thread runnable. Safe to call from an interrupt handler.
+///
+/// Unknown ids are ignored rather than asserted on. A `Waker` outlives the
+/// thread it names -- a device completes an I/O for a thread that has already
+/// exited -- and ids are never reused, so an id absent from the table can only
+/// be a dead thread. Panicking here would turn every late completion into a
+/// kernel panic from interrupt context.
+pub fn unpark(id: ThreadId) {
+    // Whether the thread must be pushed onto a run queue, decided under the
+    // lock and acted on after it is released.
+    let mut woke = false;
+    // Which processor's queue the thread must go on. `None` means the local
+    // one; `Some(cpu)` means that processor specifically, for a thread pinned
+    // to it.
+    let mut home: Option<u32> = None;
+    let queue_at: Option<Priority> = {
+        let mut sched = SCHED.lock();
+        let Some(thread) = sched.threads.get_mut(&id) else {
+            return;
+        };
+        match thread.park.wake() {
+            // Not parked. The wakeup is recorded in the park state and the
+            // thread's own `park` will consume it; queueing it here would put
+            // a running thread in a run queue.
+            WakeOutcome::Noted => None,
+            WakeOutcome::Runnable => {
+                thread.state = ThreadState::Ready;
+                woke = true;
+                let prio = thread.priority;
+                // An idle thread must go back on its *own* processor's queue.
+                // Pushing it locally would hand another processor a thread
+                // whose stack belongs to the one that booted it -- and nothing
+                // downstream would object, because the steal guard only refuses
+                // to *take* an idle thread, not to run one it was given. The
+                // harness caught exactly this: the boot thread started a test
+                // on cpu 0 and finished it on cpu 3, because the tick that
+                // expired its sleep landed elsewhere.
+                home = thread.home_cpu;
+                // A thread still *current* somewhere has not finished
+                // switching away, so it needs no queueing -- it will observe
+                // the cleared park when `schedule` returns to it. Queueing it
+                // is the two-CPUs-one-stack failure: this CPU would push an id
+                // another CPU is executing.
+                //
+                // `claim_parked_handoff` covers the window `is_current_anywhere`
+                // cannot: once `schedule` has stored the incoming thread as
+                // `current`, the outgoing parked thread is current nowhere, yet
+                // its context is still being saved.
+                if is_current_anywhere(id) || claim_parked_handoff(id) {
+                    None
+                } else {
+                    Some(prio)
+                }
+            }
+        }
+    };
+
+    // The scheduler lock is released first. A run queue is a leaf lock, and
+    // taking one under SCHED would give this path a lock order nothing else in
+    // the kernel has -- see the module docs.
+    if let Some(prio) = queue_at {
+        match home.and_then(percpu::run_queue_of) {
+            Some(queue) => queue.lock().push(id, prio),
+            None => percpu::run_queue().lock().push(id, prio),
+        }
+    }
+    // Sent on *any* wake that made a thread runnable, including the one that
+    // queued nothing. A thread that was still current somewhere is sitting in
+    // `park`'s `sti; hlt`, and leaving that needs an interrupt: without this it
+    // would wait for the next timer tick, and on a processor whose timer is not
+    // running it would wait forever. Sent after the push for the reason
+    // `spawn_kernel` documents -- a processor woken by it must be able to see
+    // the work.
+    //
+    // Latency rather than correctness, so no test fails without it: a halted
+    // thread is also woken by the next timer tick. It matters on a processor
+    // whose timer is not running, which is why it is not left to the tick.
+    if woke && !qunix_hal_x86_64::apic::send_ipi_all_excluding_self(crate::WAKE_VECTOR) {
+        // `false` means this processor has no LAPIC base yet, so the IPI was
+        // never sent. That is exactly the case the IPI exists for -- a thread
+        // halted in `park` with no running timer has nothing else to wake it --
+        // so the one situation it covers is the one where it silently does not
+        // happen. Counted rather than asserted: this runs from interrupt
+        // context, where a panic fires again on every subsequent tick.
+        WAKE_IPI_DROPPED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Every thread the scheduler currently considers parked.
+///
+/// Allocates, so it is not for any hot path -- it exists for the harness check
+/// that no parked thread is queued, which runs once per test.
+pub fn parked_thread_ids() -> alloc::vec::Vec<ThreadId> {
+    SCHED
+        .lock()
+        .threads
+        .iter()
+        .filter(|(_, t)| t.park.is_parked())
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Whether `id` is currently parked.
+pub fn is_parked(id: ThreadId) -> bool {
+    SCHED.lock().threads.get(&id).is_some_and(|t| t.park.is_parked())
+}
+
 /// Terminates the calling thread. Never returns.
 ///
 /// The stack is *not* freed here: this code is running on it. The thread is
 /// marked `Exited` and its id queued for another thread to reap.
 pub fn exit_current() -> ! {
-    schedule(ThreadState::Exited);
-    // `schedule` only returns when it did not switch away, which for an exiting
-    // thread means there was nothing to switch to. There is no correct
-    // behaviour left: the caller cannot return, and continuing would run an
-    // exited thread.
-    panic!("the last thread exited with nothing else to run");
+    let me = current_id();
+    let deadline = crate::TICKS.load(Ordering::Relaxed) + EXIT_WAIT_TICKS;
+    loop {
+        schedule(ThreadState::Exited);
+        // `schedule` only returns when it did not switch away, which for an
+        // exiting thread means there was nothing to switch to.
+        //
+        // "Nothing runnable" stopped meaning "nothing left" when threads became
+        // able to block. A parked thread is deliberately in no run queue, so a
+        // processor whose only company is a sleeper finds an empty queue and
+        // reaches here -- and panicking would kill the machine because a thread
+        // exited while another was waiting on a timer that had not fired yet.
+        // That is not an error; it is the ordinary shape of an idle system.
+        //
+        // The distinction is whether anything can still *become* runnable. If
+        // something is parked, halting is correct and the wakeup that arrives
+        // finds this processor ready to take it. If nothing is, there is
+        // genuinely nothing left and the panic is right.
+        //
+        // The rule itself is host-tested in `qunix_sched::exit_disposition`,
+        // because the *state* is unreachable from this harness: `take_next`
+        // falls back to this processor's idle thread, which `publish_handoff`
+        // returns to the queue on every switch away, so "nothing runnable
+        // anywhere" effectively never happens with `-smp 4`. Reverting this
+        // branch to an unconditional panic left the whole suite green, which
+        // means it shipped unexercised in both directions. Unfalsifiable and
+        // untestable are different problems, and only the second one was
+        // fixable -- so the decision moved somewhere it can be asserted.
+        if qunix_sched::exit_disposition(another_thread_is_alive(me))
+            == qunix_sched::ExitDisposition::NothingLeft
+        {
+            panic!("the last thread exited with nothing else to run and nothing blocked");
+        }
+        // Bounded. "Something is parked" is not evidence that *this* wait ends:
+        // a thread parked on a wake that was lost keeps this branch true
+        // forever, and the processor then halts in silence while the exiting
+        // thread's stack -- and, for a user thread, its address space -- is
+        // never reclaimed. Before this loop existed that state was a named
+        // panic; it must not become a quiet wedge.
+        if crate::TICKS.load(Ordering::Relaxed) >= deadline {
+            panic!(
+                "{me:?} has waited {EXIT_WAIT_TICKS} ticks to exit with only parked threads \
+                 left; a wake was lost and this processor would halt forever"
+            );
+        }
+        // `sti; hlt` as one pair, for the reason `idle_loop` documents: `sti`
+        // takes effect only after the following instruction, so an interrupt
+        // that arrived while masked is delivered once `hlt` is entered.
+        //
+        // Running on the exiting thread's stack is safe here precisely because
+        // it has not been reaped: `reap` skips any thread still current on some
+        // processor, and this one is.
+        // SAFETY: no memory is touched and no stack slot is used.
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+    }
+}
+
+/// How long an exiting thread waits for a parked one before declaring the wake
+/// lost. Generous: at ~10 ms a tick this is minutes, and it exists to convert a
+/// silent wedge into a message rather than to bound anything legitimate.
+const EXIT_WAIT_TICKS: u64 = 60_000;
+
+/// Whether any thread other than `me` still exists.
+///
+/// Deliberately *not* "is anything parked". A run queue holds only what is
+/// waiting, so an exiting thread finds it empty both when another thread is
+/// parked and when another processor is simply busy running one. Panicking on
+/// the second case kills a healthy kernel -- which is precisely what the
+/// narrower predicate did, the moment a test parked the boot thread in
+/// `sleep_ticks` while another thread exited elsewhere.
+///
+/// In practice this is almost always true, because every processor has an idle
+/// thread in the table. That is correct rather than useless: the machine really
+/// does still have something to run, and the bounded wait below is what turns a
+/// wake that never arrives into a message.
+fn another_thread_is_alive(me: ThreadId) -> bool {
+    SCHED.lock().threads.keys().any(|&id| id != me)
 }
 
 /// What this CPU should run next, taken *out* of whichever queue held it.
@@ -454,17 +914,74 @@ fn take_next(cpu: u32) -> Option<ThreadId> {
     percpu::run_queue().lock().pop()
 }
 
+/// Clears the parked tag on a handoff slot naming `id`, if there is one.
+///
+/// Returns whether it claimed one. A claim means some processor is mid-switch
+/// away from `id` and will queue it when the switch completes, so the caller
+/// must not queue it as well -- and must not skip it either, which is why this
+/// clears the tag rather than merely reporting it.
+///
+/// A compare-exchange rather than a load and a store: `publish_handoff` swaps
+/// the whole word, and a split read-then-write would let the wake fall between
+/// them and be dropped by both sides. If the exchange fails the slot has
+/// already been published, and the caller queues the thread itself.
+fn claim_parked_handoff(id: ThreadId) -> bool {
+    let tagged = id.0 | HANDOFF_PARKED;
+    (0..MAX_CPUS).any(|cpu| {
+        HANDOFF_ID[cpu as usize]
+            .compare_exchange(tagged, id.0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    })
+}
+
 /// Makes the thread that gave up this CPU runnable again.
 ///
 /// Runs on whatever this CPU turned to next, which is the earliest point at
 /// which the outgoing thread's context is safely stored. See [`HANDOFF_ID`].
 fn publish_handoff() {
     let cpu = percpu::cpu_id();
-    let raw = HANDOFF_ID[cpu as usize].swap(NO_THREAD, Ordering::Relaxed);
+    // `AcqRel`, not `Relaxed`: `unpark` clears the tag from another processor
+    // with a compare-exchange on this same word, and exactly one of the two
+    // must win. The comment sat below this line until a review pointed out it
+    // read as documentation of the tag test instead.
+    let raw = HANDOFF_ID[cpu as usize].swap(NO_THREAD, Ordering::AcqRel);
     if raw == NO_THREAD {
         return;
     }
+    if raw & HANDOFF_PARKED != 0 {
+        // Still parked when the switch completed, so nobody wanted it back. It
+        // stays out of every run queue, which is what being parked means.
+        return;
+    }
     let prio = priority_from_raw(HANDOFF_PRIORITY[cpu as usize].load(Ordering::Relaxed));
+    // Checked at the point of violation rather than sampled afterwards.
+    //
+    // "A parked thread is in no run queue" is an instantaneous invariant, and a
+    // test that scans the queues at some later moment observes whatever the
+    // scheduler happens to be doing then: the offending thread may already have
+    // been popped and re-parked. That is not hypothetical -- the mutation that
+    // deletes `schedule`'s parked branch *was* caught by a scanning test, and
+    // silently stopped being caught when an unrelated fix changed the timing.
+    // A check here cannot drift, because it runs on the push itself.
+    //
+    // Test-only: it costs a scheduler-lock acquisition on every context switch.
+    // Taken *before* the run queue, which is the order the module documents --
+    // SCHED may be taken with no queue held, and nothing takes SCHED while
+    // holding one.
+    // Gated on a feature rather than on `cfg(test)`, because it is not free:
+    // it takes the scheduler lock on **every context switch**, which gives the
+    // test kernel a serialisation point per switch that the shipped one does
+    // not have. Every concurrency test on this branch would then be measuring a
+    // scheduler with a different contention profile from the real thing, and a
+    // race the shipped kernel loses and the test kernel wins would be invisible
+    // by construction. `cargo xtask test` runs the suite both ways: once with
+    // the invariant enforced, once with honest timing.
+    #[cfg(feature = "sched-invariants")]
+    assert!(
+        !SCHED.lock().threads.get(&ThreadId(raw)).is_some_and(|t| t.park.is_parked()),
+        "cpu {cpu} is queueing parked ThreadId({raw}); it would be dispatched and resumed at a \
+         suspension point it has not returned from"
+    );
     percpu::run_queue().lock().push(ThreadId(raw), prio);
 }
 
@@ -531,16 +1048,65 @@ fn schedule(outgoing_state: ThreadState) {
                 HANDOFF_ID[cpu as usize].store(NO_THREAD, Ordering::Relaxed);
             }
             _ => {
+                // Whether this thread is parked decides whether it is handed
+                // on, and it is asked *here*, under this acquisition of SCHED,
+                // rather than trusted from the caller. `park` released the
+                // lock between marking the thread and reaching this line, and
+                // an `unpark` in that window clears the park without queueing
+                // the thread -- it was still current. Handing it on anyway is
+                // the safe direction: a spurious requeue costs one poll, and
+                // the opposite mistake is a thread that never runs again.
+                //
+                // Asked for *every* outgoing state, not only `Blocked`. A
+                // timer tick arrives with `Ready` and would otherwise requeue
+                // a thread that is parked and merely waiting for its own
+                // `hlt`, putting a parked thread in a run queue -- the one
+                // thing this state exists to prevent, reached through the one
+                // path that does not mention it.
+                let parked = sched.threads.get(&current).is_some_and(|t| t.park.is_parked());
                 let prio = sched.threads.get(&current).map_or(Priority::Normal, |t| t.priority);
                 if let Some(t) = sched.threads.get_mut(&current) {
-                    t.state = ThreadState::Ready;
+                    // `Exited` is terminal and must survive a tick. `exit_current`
+                    // now halts with `current` still naming the exited thread, so
+                    // a timer landing there arrives here with `Ready` and would
+                    // otherwise overwrite the state. It recovers -- the thread is
+                    // redispatched and exits properly -- but `state` would stop
+                    // being usable as evidence of liveness, and `Blocked` was
+                    // just introduced on the strength of `state` meaning
+                    // something. The handoff below still runs, because dropping
+                    // it would strand the exiting thread in no run queue and leak
+                    // its stack.
+                    t.state = match t.state {
+                        ThreadState::Exited => ThreadState::Exited,
+                        _ if parked => ThreadState::Blocked,
+                        _ => ThreadState::Ready,
+                    };
                 }
-                // Not pushed to the run queue here. See `HANDOFF_ID`: between
-                // the push and the switch storing this thread's stack pointer,
-                // another CPU could pop it and resume a context that does not
-                // exist yet.
-                HANDOFF_PRIORITY[cpu as usize].store(prio as u8, Ordering::Relaxed);
-                HANDOFF_ID[cpu as usize].store(current.0, Ordering::Relaxed);
+                if parked {
+                    // Handed on *tagged*, not dropped. The thread must not be
+                    // requeued while it is parked -- but it must still be
+                    // covered by the handoff, because from here until
+                    // `context::switch` stores its stack pointer it is parked,
+                    // in no run queue, and no longer "current anywhere" either:
+                    // this CPU's `current` already names the incoming thread. An
+                    // `unpark` landing in that window would find nothing to stop
+                    // it and push a thread whose context is still being saved.
+                    //
+                    // `publish_handoff` drops it if the tag survives, and
+                    // `unpark` clears the tag instead of pushing, which makes
+                    // the handoff the single place the thread can be queued
+                    // from.
+                    HANDOFF_PRIORITY[cpu as usize].store(prio as u8, Ordering::Relaxed);
+                    HANDOFF_ID[cpu as usize]
+                        .store(current.0 | HANDOFF_PARKED, Ordering::Relaxed);
+                } else {
+                    // Not pushed to the run queue here. See `HANDOFF_ID`:
+                    // between the push and the switch storing this thread's
+                    // stack pointer, another CPU could pop it and resume a
+                    // context that does not exist yet.
+                    HANDOFF_PRIORITY[cpu as usize].store(prio as u8, Ordering::Relaxed);
+                    HANDOFF_ID[cpu as usize].store(current.0, Ordering::Relaxed);
+                }
             }
         }
 
@@ -554,11 +1120,19 @@ fn schedule(outgoing_state: ThreadState) {
         incoming_stack_top = next_thread.kernel_stack_top;
         incoming_root = next_thread.address_space.as_ref().map(|s| s.root_frame());
         to_ctx = next_thread.context;
-        // A running thread's context slot is null, and a thread is removed from
-        // its run queue before dispatch, so a null here means two CPUs reached
-        // the same thread -- the invariant this whole module is arranged
-        // around, checked rather than assumed.
-        assert!(!to_ctx.is_null(), "{next:?} has no saved context to resume");
+        // Catches a thread that has never run -- `adopt_current` starts the
+        // slot null and only a completed `switch` fills it in.
+        //
+        // It does **not** catch two processors reaching one thread, whatever
+        // the comment here used to claim. Nothing ever writes null back: a
+        // dispatched thread keeps the pointer its last switch-away stored, so a
+        // second processor dispatching it finds a plausible non-null address and
+        // resumes an old suspension point. That comment described a design that
+        // was never built, and it made this line read as a safety net it is
+        // not -- exactly the drift CLAUDE.md warns about. Removal before
+        // dispatch is what actually prevents the double dispatch, and it is
+        // enforced by `pop`/`steal` and by the handoff, not here.
+        assert!(!to_ctx.is_null(), "{next:?} has never run and has no context to resume");
 
         // SAFETY: this is the CPU doing the scheduling, interrupts are masked,
         // and the incoming thread was removed from every run queue above.
@@ -601,6 +1175,8 @@ fn schedule(outgoing_state: ThreadState) {
 
     // Locks released. From here the outgoing thread stops running and does not
     // resume until something switches back to it.
+    #[cfg(test)]
+    widen_the_switch_window(current);
     unsafe { context::switch(from_slot, to_ctx) };
 
     // Reached only when this thread is scheduled again, on whichever CPU

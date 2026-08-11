@@ -211,21 +211,60 @@ fn main() -> Result<()> {
             }
         }
         Some("test") => {
-            let mut cmd = Command::new(env!("CARGO"));
-            cmd.current_dir(&root);
-            cmd.args(["test", "--package", "qunix-kernel"]);
-            cmd.args(BUILD_STD);
-            // Without this, cargo forces `panic=unwind` for test units, which
-            // makes build-std compile `core` a second time and collide with the
-            // panic=abort copy (E0152: duplicate lang item).
-            cmd.arg("-Zpanic-abort-tests");
-            // The profiles differ behaviourally (`lto = "thin"`, and overflow
-            // checks only in debug), so `--release` has to reach every child.
-            if release {
-                cmd.arg("--release");
-            }
-            if !cmd.status()?.success() {
-                bail!("kernel tests failed");
+            // Twice, and the second run is not redundant.
+            //
+            // `sched-invariants` makes `publish_handoff` assert, under the
+            // scheduler lock, that it is not queueing a parked thread. That
+            // check is worth having -- it catches the violation at the push
+            // rather than by sampling later -- but it costs a lock acquisition
+            // on every context switch, which gives the test kernel a
+            // serialisation point the shipped one does not have. Every
+            // concurrency test would then be measuring a scheduler that is not
+            // the one that ships, and a race the real kernel loses and the test
+            // kernel wins would be invisible by construction.
+            //
+            // So: one boot with the invariant enforced, one with honest timing.
+            for invariants in [true, false] {
+                let mut cmd = Command::new(env!("CARGO"));
+                cmd.current_dir(&root);
+                cmd.args(["test", "--package", "qunix-kernel"]);
+                if invariants {
+                    cmd.args(["--features", "sched-invariants"]);
+                    // Its own target directory, which is not tidiness.
+                    //
+                    // `build_esp` stages one ESP per target directory, and the
+                    // two boots build kernels that differ only by a feature --
+                    // so cargo's build-script output path is the same for both,
+                    // and the second boot restaged the same ESP the first had
+                    // just used. What reached the firmware was a Limine
+                    // directory being rewritten underneath it: `#UD` inside
+                    // BdsDxe, before the kernel ran at all, followed by the
+                    // harness timeout. Green locally, because the local cache
+                    // happened to make the restage a no-op.
+                    cmd.env("CARGO_TARGET_DIR", target_dir().join("sched-invariants"));
+                }
+                cmd.args(BUILD_STD);
+                // Without this, cargo forces `panic=unwind` for test units,
+                // which makes build-std compile `core` a second time and
+                // collide with the panic=abort copy (E0152: duplicate lang
+                // item).
+                cmd.arg("-Zpanic-abort-tests");
+                // The profiles differ behaviourally (`lto = "thin"`, and
+                // overflow checks only in debug), so `--release` has to reach
+                // every child.
+                if release {
+                    cmd.arg("--release");
+                }
+                if !cmd.status()?.success() {
+                    bail!(
+                        "kernel tests failed ({})",
+                        if invariants {
+                            "with scheduler invariants enforced"
+                        } else {
+                            "with unmodified scheduler timing"
+                        }
+                    );
+                }
             }
             // One invocation for all host-testable crates: three separate
             // cargo startups meant three dependency resolutions and no
