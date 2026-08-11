@@ -844,6 +844,7 @@ dependencies = [
  "qunix-mm",
  "qunix-sched",
  "qunix-sync",
+ "qunix-virtio",
  "x86_64",
 ]
 
@@ -864,6 +865,10 @@ version = "0.1.0"
 dependencies = [
  "criterion",
 ]
+
+[[package]]
+name = "qunix-virtio"
+version = "0.1.0"
 
 [[package]]
 name = "quote"
