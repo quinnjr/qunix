@@ -15,6 +15,7 @@ mod process;
 mod sched;
 mod smp;
 mod syscall;
+mod task;
 mod thread;
 mod vmspace;
 mod testing;
@@ -1734,7 +1735,7 @@ mod tests {
     ///
     /// Bounded rather than unbounded because a condition that never holds must
     /// fail the calling test rather than hang the suite.
-    fn wait_until(mut condition: impl FnMut() -> bool, budget: u32) -> bool {
+    pub(crate) fn wait_until(mut condition: impl FnMut() -> bool, budget: u32) -> bool {
         for _ in 0..budget {
             if condition() {
                 return true;
@@ -1750,7 +1751,7 @@ mod tests {
     /// Budget for waiting on other CPUs. Generous: under TCG the guest runs
     /// orders of magnitude slower than under KVM, and a budget tuned to one is
     /// a spurious failure on the other.
-    const WAIT_BUDGET: u32 = 20_000;
+    pub(crate) const WAIT_BUDGET: u32 = 20_000;
 
     /// Spins until `condition` holds or `tick_budget` timer ticks have passed.
     ///
