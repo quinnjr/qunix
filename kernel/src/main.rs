@@ -675,6 +675,98 @@ mod tests {
         );
     }
 
+    #[test_case]
+    fn work_stranded_on_a_processor_that_stops_scheduling_is_migrated() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+        SPIN_RAN.store(0, Ordering::SeqCst);
+        SPIN_STARTED.store(0, Ordering::SeqCst);
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        let before = quiesce();
+
+        // One more spinner than there are processors able to run them, all
+        // queued here -- `spawn_kernel` queues locally by design -- and then
+        // this processor stops scheduling by masking interrupts. The extra
+        // spinner can therefore only run if some other processor comes back for
+        // it after it has already taken one.
+        //
+        // That is the case `take_next` used to fail. An application processor's
+        // own idle thread is pushed onto its run queue the moment it switches
+        // away, so its local queue is never empty again; a `take_next` that
+        // popped whatever was local would take that idle thread and never reach
+        // the steal loop. Every processor then cycled between its own resident
+        // spinner and its own idle thread while real work sat one queue away,
+        // and the extra spinner never started at all.
+        //
+        // Deterministic, not a race: it failed on every run before the fix and
+        // the failure was not timing-dependent, because no amount of waiting
+        // makes a CPU that never looks elsewhere look elsewhere.
+        let cpus = crate::smp::cpu_count() as u64;
+        assert!(cpus >= 2, "qemu must be launched with -smp; only {cpus} cpu(s) reported");
+        let spinners = cpus;
+        assert!(spinners <= 64, "the spinner bitmap is a u64");
+
+        let was = crate::sched::set_preemption(true);
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        for i in 0..spinners {
+            crate::sched::spawn_kernel(spinner, i, Priority::Normal);
+        }
+
+        // Masked for the whole test, and for the reason the preemption test
+        // above documents at length: this thread adopted the boot context, so
+        // it is idle-band, and Normal-band spinners that never yield would
+        // starve it out of existence before it could stop them.
+        x86_64::instructions::interrupts::disable();
+        let all = u64::MAX >> (64 - spinners);
+        // Bounded in ticks rather than instructions: what is being waited on is
+        // other processors making progress, and a count of spin iterations is a
+        // different amount of wall-clock on every host. Ticks still advance
+        // with interrupts masked here -- the application processors have timers
+        // of their own.
+        let deadline = crate::TICKS.load(Ordering::SeqCst) + 40;
+        while SPIN_STARTED.load(Ordering::SeqCst) != all
+            && crate::TICKS.load(Ordering::SeqCst) < deadline
+        {
+            core::hint::spin_loop();
+        }
+
+        let started = SPIN_STARTED.load(Ordering::SeqCst);
+        SPIN_STOP.store(true, Ordering::SeqCst);
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+
+        assert_eq!(
+            started,
+            all,
+            "only {} of {spinners} spinners started; {} were queued on a processor that had \
+             stopped scheduling, and no other processor came back for them",
+            started.count_ones(),
+            spinners - started.count_ones() as u64
+        );
+        // A steal is the only mechanism that could have started them: this
+        // processor dispatched nothing while masked. Asserted separately
+        // because the count above would also be satisfied by a scheduler that
+        // somehow ran them here.
+        assert!(crate::sched::steal_count() > 0, "no thread was ever stolen");
+
+        wait_until(|| crate::sched::thread_count() == before, WAIT_BUDGET);
+        crate::sched::set_preemption(was);
+        assert_eq!(
+            crate::sched::thread_count(),
+            before,
+            "the spinners did not exit; later tests would inherit them"
+        );
+    }
+
     /// Which CPUs a batch of worker threads observed themselves running on.
     static RAN_ON: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     /// One bit per worker, so "all four ran" is distinguishable from "one ran

@@ -255,7 +255,7 @@ silently change which one runs.
 
 QEMU runs with `-smp 4` and **every one of them schedules.** `current` and the
 run queue live in `percpu::PerCpu`, one of each per CPU; the thread table and
-the reapable list stay shared behind one lock. Four things about that are worth
+the reapable list stay shared behind one lock. Five things about that are worth
 knowing before touching the scheduler:
 
 - **A thread is removed from a run queue before it is dispatched** — `pop`
@@ -268,10 +268,21 @@ knowing before touching the scheduler:
 - **Idle threads are never stolen.** An idle thread adopted the stack its own
   CPU booted on, so running it elsewhere puts two CPUs on one stack.
   `RunQueue::runnable_len` excludes the idle band and the steal path checks it.
+- **A CPU steals before it runs its own idle thread**, not only when its queue
+  is empty. `take_next` takes local *runnable* work, then steals, then falls
+  back to the local idle thread. Ordering it the obvious way — local `pop`
+  first, steal only when the queue is empty — silently disables stealing after
+  the first dispatch, because a CPU's idle thread is pushed back onto its own
+  queue the moment it switches away, so the queue is never empty again. Work
+  queued on a CPU that then stops scheduling starved indefinitely while every
+  other CPU cycled between its resident thread and its idle thread with real
+  work one queue away. Before running nothing, look for something.
 - **The boot thread is an *idle*-band thread**, including while it is running
   the test suite. A Normal-band thread that never exits starves it, so a test
-  that spins rather than yields must mask interrupts for the duration or it is
-  never scheduled again.
+  that spins rather than yields must mask interrupts for the duration — and the
+  duration ends when those threads have been *told to stop*, not when the spin
+  ends. Re-enabling interrupts one line early cost a 120-second harness timeout
+  that named no test.
 
 Lock order: the thread table may be taken with no run-queue lock held, and a
 run queue is a leaf. Nothing takes the table while holding a queue, which is

@@ -341,11 +341,39 @@ pub fn exit_current() -> ! {
 ///
 /// Removal before dispatch is what stops two CPUs running one thread, and it is
 /// why both halves of this are `pop`/`steal` rather than a peek.
+///
+/// The order is local *runnable* work, then a steal, then this CPU's own idle
+/// thread. That middle step is not an optimisation. An earlier version popped
+/// whatever the local queue held and only stole when the queue was empty, and
+/// the local queue is essentially never empty: a CPU's idle thread is pushed
+/// back onto it the moment the CPU switches to anything else, so from the first
+/// dispatch onward the CPU always had *something* local and never looked
+/// elsewhere again.
+///
+/// The consequence was that work queued on a CPU which then stopped scheduling
+/// starved indefinitely, while every other CPU cycled between its own resident
+/// thread and its own idle thread with real work sitting one queue away.
+/// Ordering the idle thread last states the rule plainly: **before running
+/// nothing, look for something.**
 fn take_next(cpu: u32) -> Option<ThreadId> {
-    // Locally first: a thread that last ran here has its stack, and possibly
-    // its address space, warm in this CPU's caches.
-    if let Some(id) = percpu::run_queue().lock().pop() {
-        return Some(id);
+    {
+        // Locally first: a thread that last ran here has its stack, and
+        // possibly its address space, warm in this CPU's caches.
+        //
+        // One acquisition for both the test and the take. Asking
+        // `runnable_len` under one lock and popping under another lets a thief
+        // empty the queue in between, and the `pop` would then return this
+        // CPU's idle thread from the branch that has just established there is
+        // real work to run.
+        let mut queue = percpu::run_queue().lock();
+        if queue.runnable_len() > 0 {
+            // `pop` serves the highest non-empty band and `runnable_len`
+            // excludes the idle band, so a non-zero count here guarantees this
+            // is a real thread rather than the idle one.
+            if let Some(id) = queue.pop() {
+                return Some(id);
+            }
+        }
     }
     for other in each_online_cpu() {
         if other == cpu {
@@ -374,7 +402,11 @@ fn take_next(cpu: u32) -> Option<ThreadId> {
             return Some(id);
         }
     }
-    None
+    // Nothing runnable anywhere, so this CPU's own idle thread is the answer.
+    // Only an idle-band thread can be here -- the runnable band was taken
+    // above -- and it is never taken from another CPU, because an idle thread
+    // adopted the stack its own CPU booted on.
+    percpu::run_queue().lock().pop()
 }
 
 /// Makes the thread that gave up this CPU runnable again.
