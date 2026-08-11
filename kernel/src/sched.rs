@@ -572,6 +572,20 @@ pub fn unpark(id: ThreadId) {
     }
 }
 
+/// Every thread the scheduler currently considers parked.
+///
+/// Allocates, so it is not for any hot path -- it exists for the harness check
+/// that no parked thread is queued, which runs once per test.
+pub fn parked_thread_ids() -> alloc::vec::Vec<ThreadId> {
+    SCHED
+        .lock()
+        .threads
+        .iter()
+        .filter(|(_, t)| t.park.is_parked())
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Whether `id` is currently parked.
 pub fn is_parked(id: ThreadId) -> bool {
     SCHED.lock().threads.get(&id).is_some_and(|t| t.park.is_parked())
@@ -695,6 +709,26 @@ fn publish_handoff() {
         return;
     }
     let prio = priority_from_raw(HANDOFF_PRIORITY[cpu as usize].load(Ordering::Relaxed));
+    // Checked at the point of violation rather than sampled afterwards.
+    //
+    // "A parked thread is in no run queue" is an instantaneous invariant, and a
+    // test that scans the queues at some later moment observes whatever the
+    // scheduler happens to be doing then: the offending thread may already have
+    // been popped and re-parked. That is not hypothetical -- the mutation that
+    // deletes `schedule`'s parked branch *was* caught by a scanning test, and
+    // silently stopped being caught when an unrelated fix changed the timing.
+    // A check here cannot drift, because it runs on the push itself.
+    //
+    // Test-only: it costs a scheduler-lock acquisition on every context switch.
+    // Taken *before* the run queue, which is the order the module documents --
+    // SCHED may be taken with no queue held, and nothing takes SCHED while
+    // holding one.
+    #[cfg(test)]
+    assert!(
+        !SCHED.lock().threads.get(&ThreadId(raw)).is_some_and(|t| t.park.is_parked()),
+        "cpu {cpu} is queueing parked ThreadId({raw}); it would be dispatched and resumed at a \
+         suspension point it has not returned from"
+    );
     percpu::run_queue().lock().push(ThreadId(raw), prio);
 }
 

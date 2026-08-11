@@ -132,6 +132,38 @@ fn assert_no_thread_runs_twice(name: &str) {
     }
 }
 
+/// Fails the run if a parked thread is sitting in any processor's run queue.
+///
+/// An instantaneous invariant, like [`assert_no_thread_runs_twice`] and for the
+/// same reason: a thread that is both parked and dispatchable will be resumed
+/// at a suspension point it has not returned from, and the symptom is a future
+/// polled from a state it never reached, somewhere else entirely.
+///
+/// Checked after *every* test rather than inside the one test that looks for
+/// it. The tests that stress the runtime are not the ones that would notice --
+/// `a_parked_thread_is_in_no_run_queue` inspects one thread at one instant,
+/// which is the same shape as the single-test check that missed a whole
+/// milestone's worth of leaked interrupt state.
+fn assert_no_parked_thread_is_queued(name: &str) {
+    use qunix_hal_x86_64::percpu::{MAX_CPUS, run_queue_of};
+    for id in crate::sched::parked_thread_ids() {
+        for cpu in 0..MAX_CPUS {
+            let Some(queue) = run_queue_of(cpu) else { continue };
+            // `try_lock`: a processor mid-dispatch holds its queue, and a
+            // harness check that blocked on it would turn a scheduling delay
+            // into a hung suite. A queue that cannot be inspected is skipped
+            // rather than waited for -- this runs after every test, so a real
+            // violation will not be missed by all of them.
+            let Some(queue) = queue.try_lock() else { continue };
+            assert!(
+                !queue.contains(id),
+                "after {name}: parked {id:?} is queued on cpu {cpu}; it can be dispatched, and \
+                 would resume at a suspension point it has not returned from"
+            );
+        }
+    }
+}
+
 impl MachineState {
     fn capture() -> Self {
         // SAFETY: a read of the live CR3 through the HHDM, which boot maps for
@@ -212,6 +244,7 @@ impl<T: Fn()> Testable for T {
         let expected = EXPECTED_KILLS.swap(0, core::sync::atomic::Ordering::AcqRel);
         MachineState::capture().assert_restored(&before, name, expected);
         assert_no_thread_runs_twice(name);
+        assert_no_parked_thread_is_queued(name);
         println!("ok");
     }
 }

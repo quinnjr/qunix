@@ -308,6 +308,28 @@ knowing before touching the scheduler:
   ends. Re-enabling interrupts one line early cost a 120-second harness timeout
   that named no test.
 
+M2 T3 added an async runtime on top of that, and three of its rules matter
+before touching either:
+
+- **A parked thread is in no run queue.** `park` marks the thread, `schedule`
+  declines to hand it on, and `unpark` queues it only when it is parked *and*
+  not still current on some processor. Three reachings of one invariant, and
+  `publish_handoff` asserts it at the push itself in test builds — a scanning
+  test samples whatever the scheduler happens to be doing later, and one such
+  test silently stopped catching its mutation when an unrelated fix changed the
+  timing. A parked thread that is dispatchable resumes at a suspension point it
+  never returned from.
+- **A `Waker` holds a bare `ThreadId` and nothing else.** No `Arc`, no
+  generation counter, no allocation — sound only because
+  `Scheduler::allocate_id` never reuses an id, so waking a dead thread is inert
+  by construction. If ids ever become reusable, every late completion in the
+  kernel becomes a wakeup delivered to the wrong thread.
+- **`park` re-checks after its `hlt`, not only after `schedule`.** `wake` clears
+  `parked` without setting `pending`, so a thread that loops straight back into
+  parking consumes its own wakeup and blocks forever. The halt path never
+  reaches `schedule`, so the check after `schedule` cannot cover it. This was a
+  real hang, found by the first test that made an interrupt complete a future.
+
 Lock order: the thread table may be taken with no run-queue lock held, and a
 run queue is a leaf. Nothing takes the table while holding a queue, which is
 what lets two CPUs steal from each other without deadlocking.
