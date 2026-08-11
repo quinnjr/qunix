@@ -15,6 +15,7 @@ x86_64 = "0.15"
 qunix-abi = { path = "crates/qunix-abi" }
 qunix-elf = { path = "crates/qunix-elf" }
 qunix-sched = { path = "crates/qunix-sched" }
+qunix-virtio = { path = "crates/qunix-virtio" }
 qunix-sync = { path = "crates/qunix-sync" }
 qunix-mm = { path = "crates/qunix-mm" }
 qunix-hal-x86_64 = { path = "crates/qunix-hal-x86_64" }

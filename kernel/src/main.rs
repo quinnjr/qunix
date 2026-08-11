@@ -16,6 +16,7 @@ mod sched;
 mod smp;
 mod syscall;
 mod task;
+mod virtio;
 mod thread;
 mod vmspace;
 mod testing;
