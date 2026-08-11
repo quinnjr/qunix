@@ -7,12 +7,11 @@ target = "targets/x86_64-qunix-kernel.json"
 # lang item error. `xtask` passes it explicitly for kernel builds instead.
 
 [target.x86_64-qunix-kernel]
-# Layout is expressed as LLD flags rather than a GNU ld linker script:
-#   --image-base  puts the kernel in the higher half, where Limine expects it
-#   --entry       names the entry symbol, since there is no `_start`
+# Layout lives in `kernel/linker.ld`, which owns both the load address and the
+# entry symbol -- the `--image-base` and `--entry` flags that used to be here
+# would now conflict with it. The script is passed by `kernel/build.rs`, which
+# is the only place that can name its path; see the comment there.
 rustflags = [
-    "-Clink-arg=--image-base=0xffffffff80000000",
-    "-Clink-arg=--entry=kmain",
     # Panic backtraces walk the RBP chain, which only exists with frame
     # pointers. Cargo has no profile key for this, so it lives here.
     "-Cforce-frame-pointers=yes",
