@@ -195,3 +195,33 @@
 - Spec coverage: §1→T1,6,12; §2→T3-6; §3→T9,12; §4→T7,8,10; §5→T11; §6→every task's negative cases. Staleness warning lands in T6; zsh flagship chain is an online-gated usage, not a CI test — deliberate, network builds can't run in CI.
 - Type names are consistent (`PackageRecord`, `BuiltRecord`, `Pkgbuild`, `Repo`) across tasks.
 - No placeholders; where a rule was uncertain (vercmp `1.01` vs `1.1`) the expected behaviour is stated in the test list itself.
+
+## Execution Deviations
+
+- **D1 — worktrees cannot live inside the repository.** The planned execution
+  worktree at `.worktrees/qpkg` broke the kernel test suite before a line of
+  qpkg existed: cargo merges every `.cargo/config.toml` on the walk up from
+  the working directory and *joins list values*, so the kernel target's
+  `runner` was concatenated with itself and invoked with its own command line
+  as the ELF path. Moved to `../qunix-worktrees/qpkg`; gotcha recorded in
+  CLAUDE.md.
+- **D2 — the plan's vercmp expectation `1.0 < 1.0a` was wrong.** vercmp(8)
+  documents `1.0a < … < 1.0rc < 1.0 < 1.0.a < 1.0.1`: an *attached* alpha
+  trailer ages a version. Implemented and tested per the man page.
+- **D3 — `PackageRecord` gained `package_base`** (Task 5, not planned):
+  split packages fetch their PKGBUILD by base, not name, in both the AUR
+  snapshot and the official GitLab layout; the repo-db parser reads `%BASE%`
+  for the same reason.
+- **D4 — `xz2` added** (Task 8): real-world sources are overwhelmingly
+  `.tar.xz`; the host is Arch, so liblzma is a given.
+- **D5 — GitLab project-name mangling is more than `+`→`plus`** (found by a
+  live build of `tree`): names on GitLab's reserved-route list carry a
+  `unix-` prefix (`tree` → `unix-tree`), and a missed name 302s to the
+  sign-in page as 200 HTML — now sniffed and refused with a message naming
+  the cause rather than surfacing as a bash syntax error.
+- **D6 — live validation.** `qpkg sync` indexed 15,191 official + 117,309
+  AUR packages from production data; `qpkg build tree` fetched, rewrote,
+  cross-compiled and packaged a runnable statically-linked musl x86-64
+  binary end to end. `zlib` correctly *refused*: GitHub serves different
+  bytes for a generated commit-patch than the maintainer summed — the
+  checksum path working as designed, not a qpkg defect.

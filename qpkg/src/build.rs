@@ -74,7 +74,9 @@ pub fn build_inner(
             let file = entry.split_once("::").map(|(d, _)| d).unwrap_or(entry.as_str());
             if !entry.contains("://") && !entry.starts_with("git+") {
                 let url = official_raw_url(&rec.package_base, &rec.version, file);
-                std::fs::write(pkgbuild_dir.join(file), fetch(&url)?)?;
+                let bytes = fetch(&url)?;
+                refuse_html(&url, &bytes)?;
+                std::fs::write(pkgbuild_dir.join(file), bytes)?;
             }
         }
     }
@@ -98,7 +100,9 @@ fn fetch_pkgbuild(rec: &PackageRecord, workdir: &Path, fetch: Fetch) -> Result<(
     match rec.repo {
         Repo::Core | Repo::Extra => {
             let url = official_raw_url(&rec.package_base, &rec.version, "PKGBUILD");
-            Ok((fetch(&url)?, workdir.to_path_buf()))
+            let bytes = fetch(&url)?;
+            refuse_html(&url, &bytes)?;
+            Ok((bytes, workdir.to_path_buf()))
         }
         Repo::Aur => {
             // The snapshot tarball carries the PKGBUILD *and* its local
@@ -118,13 +122,39 @@ fn fetch_pkgbuild(rec: &PackageRecord, workdir: &Path, fetch: Fetch) -> Result<(
     }
 }
 
-/// The Arch GitLab packaging layout. Project paths and tags mangle characters
+/// Package names GitLab reserves as route words; Arch's packaging repos
+/// carry them under a `unix-` prefix (`tree` lives at `unix-tree`). The set
+/// is GitLab's documented reserved-name list, filtered to plausible package
+/// names.
+const GITLAB_RESERVED: &[&str] =
+    &["badges", "blame", "blob", "builds", "commits", "create", "edit", "environments",
+      "files", "new", "preview", "raw", "refs", "tree", "update", "wikis"];
+
+/// The Arch GitLab packaging layout. Project paths and tags mangle what
 /// GitLab refuses: `+` becomes `plus` in the project name, `:` (epoch)
-/// becomes `-` in the tag.
+/// becomes `-` in the tag, and reserved route words gain a `unix-` prefix.
 fn official_raw_url(base: &str, version: &str, file: &str) -> String {
-    let project = base.replace('+', "plus");
+    let mut project = base.replace('+', "plus");
+    if GITLAB_RESERVED.contains(&project.as_str()) {
+        project = format!("unix-{project}");
+    }
     let tag = version.replace(':', "-");
     format!("https://gitlab.archlinux.org/archlinux/packaging/packages/{project}/-/raw/{tag}/{file}")
+}
+
+/// A GitLab miss can 302 to the sign-in page, which arrives as 200 HTML —
+/// without this check it surfaces later as a baffling bash syntax error.
+fn refuse_html(url: &str, bytes: &[u8]) -> Result<()> {
+    let head = bytes.get(..64).unwrap_or(bytes);
+    let head = String::from_utf8_lossy(head);
+    let head = head.trim_start();
+    if head.starts_with("<!DOCTYPE") || head.starts_with("<html") {
+        return Err(Error::Network(format!(
+            "{url} returned an HTML page, not a file — the packaging repo \
+             probably lives under a different project name"
+        )));
+    }
+    Ok(())
 }
 
 /// After a sync: every built package whose indexed version now sorts above
@@ -287,6 +317,42 @@ mod tests {
         assert!(artifact.exists());
         // The local source came out of the snapshot, checksum-verified.
         assert_eq!(index.built("hello").unwrap().unwrap().version_built, "1-2");
+    }
+
+    #[test]
+    fn gitlab_names_mangle_reserved_words_pluses_and_epochs() {
+        assert_eq!(
+            official_raw_url("tree", "2.3.2-1", "PKGBUILD"),
+            "https://gitlab.archlinux.org/archlinux/packaging/packages/unix-tree/-/raw/2.3.2-1/PKGBUILD"
+        );
+        assert!(official_raw_url("libsigc++", "3.6-1", "PKGBUILD").contains("/libsigcplusplus/"));
+        assert!(official_raw_url("zlib", "1:1.3.2-3", "PKGBUILD").contains("/raw/1-1.3.2-3/"));
+        // Negative: an unreserved name passes through unprefixed.
+        assert!(official_raw_url("zsh", "5.9-5", "PKGBUILD").contains("/packages/zsh/-/"));
+    }
+
+    #[test]
+    fn an_html_answer_is_refused_with_a_real_message() {
+        let (dir, index) = seeded(Repo::Core, "1-2");
+        let workdir = dir.path().join("work");
+        let env = minimal_env(&workdir);
+        let err = build_inner(
+            &index,
+            "hello",
+            false,
+            &|_| Ok(b"<!DOCTYPE html>\n<html>sign in please</html>".to_vec()),
+            &dir.path().join("artifacts"),
+            &workdir,
+            &env,
+            1,
+        )
+        .unwrap_err();
+        match err {
+            Error::Network(msg) => assert!(msg.contains("HTML"), "{msg}"),
+            other => panic!("expected Network, got {other:?}"),
+        }
+        // And no built row, as always on failure.
+        assert!(index.built("hello").unwrap().is_none());
     }
 
     #[test]
