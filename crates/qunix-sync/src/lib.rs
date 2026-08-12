@@ -7,12 +7,12 @@ use core::mem::ManuallyDrop;
 /// Spins a `deadlock-panic` build tolerates before calling a lock wedged.
 ///
 /// Generous on purpose. Real contention here is a handful of critical sections
-/// tens of instructions long, so a hundred million iterations is several orders
+/// tens of instructions long, so twenty million iterations is several orders
 /// of magnitude beyond anything a live holder can take -- even under TCG, where
 /// every guest instruction is translated. Set low enough to fire on genuine
 /// contention it would turn a slow machine into a failing one.
 #[cfg(feature = "deadlock-panic")]
-const DEADLOCK_SPINS: u64 = 100_000_000;
+const DEADLOCK_SPINS: u64 = 20_000_000;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 

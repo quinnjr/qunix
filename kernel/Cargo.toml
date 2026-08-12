@@ -20,7 +20,12 @@ test = true
 # switch that the shipped kernel does not have -- so the concurrency tests would
 # be measuring a different scheduler. `cargo xtask test` runs the suite both
 # with and without it.
-sched-invariants = ["qunix-sync/deadlock-panic"]
+sched-invariants = []
+
+# Bounds every spinlock wait so a lock that will never be released panics with
+# a backtrace instead of stopping the machine in silence. `cargo xtask test`
+# turns this on for both boots; the shipped kernel keeps the unbounded wait.
+deadlock-panic = ["qunix-sync/deadlock-panic"]
 
 [dependencies]
 limine.workspace = true

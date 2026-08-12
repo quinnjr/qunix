@@ -230,6 +230,12 @@ fn main() -> Result<()> {
                 let mut cmd = Command::new(env!("CARGO"));
                 cmd.current_dir(&root);
                 cmd.args(["test", "--package", "qunix-kernel"]);
+                // Both boots, not only the invariant one. A lock nobody will
+                // release stops every processor with interrupts masked, so the
+                // kernel cannot report it and the harness sees only a timeout
+                // naming no test. The boot that wedged on CI was, of course,
+                // the one that had this turned off.
+                cmd.args(["--features", "deadlock-panic"]);
                 if invariants {
                     cmd.args(["--features", "sched-invariants"]);
                     // Its own target directory, which is not tidiness.
