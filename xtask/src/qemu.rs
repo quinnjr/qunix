@@ -108,6 +108,40 @@ fn select_ovmf(override_path: Option<&str>, exists: &dyn Fn(&str) -> bool) -> Re
 /// `-no-shutdown` and it can never be observed, and reduce `-smp` to 1 and the
 /// SMP tests assert things about a machine that has no APs while still passing.
 /// See the tests below for what each argument is guarding.
+/// Asks a running QEMU where each vCPU is, through the human monitor.
+///
+/// The failure this exists for is a *hard* lockup: every processor spinning
+/// with interrupts masked, so no in-kernel diagnostic can run -- the timer
+/// interrupt that would drive one is exactly what is not being delivered. The
+/// hypervisor is outside that, and `info registers -a` names the instruction
+/// each vCPU is executing, which is the difference between "the kernel hung"
+/// and a symbol to look at.
+///
+/// Best-effort by construction: this runs while reporting a failure, so a
+/// monitor that cannot be reached must not replace the real error with its own.
+fn dump_cpu_state(socket: &Path) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.write_all(b"info registers -a\n").ok()?;
+    stream.flush().ok()?;
+    // Read until the monitor goes quiet rather than until a prompt: the banner,
+    // the echo and the prompt all arrive interleaved with the payload, and a
+    // parser for that is more ways to lose the output than it is worth.
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = stream.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        if out.len() > 256 * 1024 {
+            break;
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
 fn qemu_args(ovmf: &str, esp: &Path, disk: &Path, headless: bool, kvm: bool) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     // A macro rather than a closure: a closure capturing `args` mutably blocks
@@ -178,8 +212,15 @@ fn qemu_args(ovmf: &str, esp: &Path, disk: &Path, headless: bool, kvm: bool) -> 
 pub fn run_esp(esp: &Path, disk: &Path, headless: bool) -> Result<Exit> {
     let ovmf = find_ovmf()?;
 
+    // One socket per invocation: `cargo xtask test` boots twice, and a shared
+    // path would leave the second run talking to the first run's stale node.
+    let monitor = std::env::temp_dir().join(format!("qunix-monitor-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&monitor);
+
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(qemu_args(&ovmf, esp, disk, headless, kvm_usable()));
+    cmd.arg("-monitor");
+    cmd.arg(format!("unix:{},server,nowait", monitor.display()));
 
     let budget = timeout()?;
     // `Instant + Duration` panics on overflow, so an absurd but well-formed
@@ -193,14 +234,24 @@ pub fn run_esp(esp: &Path, disk: &Path, headless: bool) -> Result<Exit> {
             break status;
         }
         if Instant::now() >= deadline {
+            // Asked *before* the kill: the registers are the only evidence of
+            // where a hung kernel stopped, and a dead QEMU has none.
+            let state = dump_cpu_state(&monitor);
             // The child owns the terminal's stdio, so leaving it running would
             // poison every later invocation; reap it before reporting.
             let _ = child.kill();
             let _ = child.wait();
+            let _ = std::fs::remove_file(&monitor);
+            let where_ = match state {
+                Some(text) => format!("\n\nvCPU state at the timeout:\n{text}"),
+                None => String::from(
+                    "\n\n(the qemu monitor could not be reached, so there is no vCPU state)",
+                ),
+            };
             bail!(
                 "qemu did not exit within {}s (set QUNIX_QEMU_TIMEOUT to change); \
                  it was killed. The kernel most likely hung before reaching \
-                 isa-debug-exit",
+                 isa-debug-exit{where_}",
                 budget.as_secs()
             );
         }
