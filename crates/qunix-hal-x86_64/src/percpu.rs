@@ -194,6 +194,47 @@ pub const MAX_CPUS: u32 = 64;
 /// unable to send, so the mask means "can acknowledge", not "exists".
 static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
 
+/// This CPU's index, keyed by its initial APIC id, or `u32::MAX` for an id no
+/// processor has claimed.
+///
+/// Exists so a processor can identify itself **without touching `GS`**.
+/// [`cpu_id`] reads `gs:[0x20]`, which is correct everywhere it is used from a
+/// known context and fatal from an arbitrary one: ring 3 can zero the hidden
+/// `GS.base` with `mov gs, ax`, and the read then lands on linear address 0x20
+/// under whatever tables are active. A spinlock wait is exactly such an
+/// arbitrary context -- it happens on every processor in every address space --
+/// so the TLB shootdown it has to service cannot go through `GS`.
+static APIC_TO_CPU: [AtomicU32; MAX_CPUS as usize] =
+    [const { AtomicU32::new(u32::MAX) }; MAX_CPUS as usize];
+
+/// This processor's initial APIC id, from `CPUID` leaf 1.
+///
+/// A pure register operation: no memory is read, so it is valid in any context,
+/// including one whose `GS.base` is zero and whose page tables are a user
+/// process's.
+pub fn initial_apic_id() -> u32 {
+    // SAFETY: `CPUID` is unconditionally available on x86-64 and leaf 1 is
+    // architectural. It touches no memory and faults on nothing.
+    let result = unsafe { core::arch::x86_64::__cpuid(1) };
+    result.ebx >> 24
+}
+
+/// This CPU's index, derived without reading `GS`.
+///
+/// `None` before this processor has installed its per-CPU block, which is also
+/// exactly when no shootdown can be waiting on it: `mark_online` runs later
+/// still, so its bit is not in any `remote_mask`.
+pub fn cpu_id_without_gs() -> Option<u32> {
+    let apic = initial_apic_id();
+    if apic >= MAX_CPUS {
+        return None;
+    }
+    match APIC_TO_CPU[apic as usize].load(Ordering::Acquire) {
+        u32::MAX => None,
+        cpu => Some(cpu),
+    }
+}
+
 /// Sentinel for "this CPU is running no thread the scheduler knows about".
 ///
 /// A real id, not zero: thread 0 is the bootstrap processor's own idle thread,
@@ -327,6 +368,18 @@ unsafe fn finish_install(block: &mut PerCpu, cpu_id: u32) {
     // not be counted again -- `installed_count` is how SMP bring-up knows how
     // many CPUs are live, and double-counting would make it wait for a CPU that
     // does not exist.
+    // Published before anything else here. From this point the processor can
+    // name itself without `GS`, which is what lets a spinlock wait service a
+    // shootdown -- and the window this closes is the one where the block is
+    // installed but unannounced, during which a wait would spin deaf.
+    let apic = initial_apic_id();
+    assert!(
+        apic < MAX_CPUS,
+        "initial apic id {apic} exceeds the {MAX_CPUS}-entry table; this cpu could not identify \
+         itself to service a tlb shootdown, and a lock wait here would deadlock the machine"
+    );
+    APIC_TO_CPU[apic as usize].store(cpu_id, Ordering::Release);
+
     let first_time = block.selectors.is_none();
     block.cpu_id = cpu_id;
     block.self_ptr = block as *const PerCpu;

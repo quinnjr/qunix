@@ -29,4 +29,18 @@ impl qunix_sync::IrqControl for Irq {
             x86_64::instructions::interrupts::enable();
         }
     }
+
+    /// Answers a TLB shootdown while spinning for a lock.
+    ///
+    /// The IPI cannot be delivered here -- taking the lock masked interrupts --
+    /// and the initiator does not return until this processor acknowledges. So
+    /// a CPU that masks and spins for a lock the initiator holds stops the
+    /// machine: every processor halted with `IF` clear, no timer, and nothing
+    /// left running that could report it.
+    ///
+    /// Polling the same idempotent function the IPI handler runs is what
+    /// breaks that cycle.
+    fn service_while_waiting() {
+        crate::tlb::service_pending();
+    }
 }

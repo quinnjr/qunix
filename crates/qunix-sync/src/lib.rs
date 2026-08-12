@@ -47,6 +47,34 @@ impl<T: ?Sized> SpinLock<T> {
     /// demonstrated it by calling `lock` twice would hang instead of failing,
     /// so `try_lock_fails_while_held` asserts the same fact in the form that
     /// can be asserted.
+    /// [`Self::lock`], running `while_waiting` on each turn of the wait.
+    ///
+    /// Split out rather than folded into `lock` so the plain path keeps its
+    /// bare spin: this exists for [`IrqSpinLock`], whose waiter has masked the
+    /// interrupts it would otherwise be woken by.
+    #[inline]
+    pub fn lock_while(&self, while_waiting: impl Fn()) -> SpinLockGuard<'_, T> {
+        #[cfg(feature = "deadlock-panic")]
+        let mut spins: u64 = 0;
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+            while_waiting();
+            #[cfg(feature = "deadlock-panic")]
+            {
+                spins += 1;
+                assert!(
+                    spins < DEADLOCK_SPINS,
+                    "spinlock still held after {DEADLOCK_SPINS} spins; nothing is going to \
+                     release it. Either this processor already holds it, or its word was \
+                     overwritten."
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         // Bounded under `deadlock-panic`, unbounded otherwise.
@@ -160,6 +188,19 @@ impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
 pub trait IrqControl {
     fn disable_and_save() -> bool;
     fn restore(was_enabled: bool);
+
+    /// Work this processor must keep doing while it waits with interrupts
+    /// masked.
+    ///
+    /// Masking to take a lock makes the waiter deaf to every interrupt --
+    /// including one another processor is waiting on it to answer. A TLB
+    /// shootdown is exactly that: the initiator does not return until every
+    /// other CPU acknowledges, so a CPU that masks and spins for a lock the
+    /// initiator holds deadlocks the machine.
+    ///
+    /// Defaulted to nothing, so the host tests -- which have no interrupts to
+    /// be deaf to -- are unaffected.
+    fn service_while_waiting() {}
 }
 
 pub struct IrqSpinLock<T: ?Sized, I: IrqControl> {
@@ -184,7 +225,11 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
     #[inline]
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T, I> {
         let was_enabled = I::disable_and_save();
-        let guard = self.inner.lock();
+        // Not `inner.lock()`, which spins and does nothing else. Interrupts
+        // are masked from the line above, so this processor cannot answer the
+        // shootdown whose initiator may be holding the very lock being waited
+        // for; see `IrqControl::service_while_waiting`.
+        let guard = self.inner.lock_while(I::service_while_waiting);
         IrqSpinLockGuard {
             guard: ManuallyDrop::new(guard),
             was_enabled,

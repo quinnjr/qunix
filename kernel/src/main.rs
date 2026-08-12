@@ -1200,6 +1200,94 @@ mod tests {
         crate::sched::exit_current();
     }
 
+    /// Mismatches seen by [`identity_worker`], as a bitmap of CPU indices.
+    static GS_FREE_ID_MISMATCH: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    /// Which CPUs ran [`identity_worker`].
+    static GS_FREE_ID_SEEN: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    /// How many processors the workers wait to see before exiting.
+    static GS_FREE_ID_TARGET: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    extern "C" fn identity_worker(_arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        // Masked across the comparison. Otherwise a preemption between the two
+        // reads can move this thread to another processor, and the test would
+        // report a mismatch that is really a migration.
+        use qunix_sync::IrqControl as _;
+        let irq = qunix_hal_x86_64::Irq::disable_and_save();
+        let through_gs = qunix_hal_x86_64::percpu::cpu_id();
+        let gs_free = qunix_hal_x86_64::percpu::cpu_id_without_gs();
+        if gs_free != Some(through_gs) {
+            GS_FREE_ID_MISMATCH.fetch_or(1u64 << through_gs, Ordering::SeqCst);
+        }
+        GS_FREE_ID_SEEN.fetch_or(1u64 << through_gs, Ordering::SeqCst);
+        qunix_hal_x86_64::Irq::restore(irq);
+        // Held here, unmasked, until every processor has checked in. A worker
+        // that exits immediately is dispatched again on whichever CPU is
+        // free -- two of them serviced all twelve on the first attempt -- and
+        // the mapping then goes unverified on the processors that never ran
+        // one, which is precisely where a wrong entry would hide.
+        let mut budget = 50_000_000u64;
+        while (GS_FREE_ID_SEEN.load(Ordering::SeqCst).count_ones() as u64)
+            < GS_FREE_ID_TARGET.load(Ordering::SeqCst)
+            && budget > 0
+        {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        crate::sched::exit_current();
+    }
+
+    #[test_case]
+    fn every_cpu_names_itself_the_same_way_with_and_without_gs() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        // The whole point of `cpu_id_without_gs` is that a spinlock wait can
+        // service a TLB shootdown, and it services it *by index*. An index one
+        // out acknowledges on behalf of a processor that has not invalidated
+        // anything, and the initiator then frees a frame that CPU still
+        // resolves an address through -- silent memory corruption, reported as
+        // a successful shootdown. So the mapping is asserted on every
+        // processor rather than assumed from the one that built it.
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        let cpus = crate::smp::cpu_count() as u64;
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        GS_FREE_ID_MISMATCH.store(0, Ordering::SeqCst);
+        GS_FREE_ID_SEEN.store(0, Ordering::SeqCst);
+        GS_FREE_ID_TARGET.store(cpus, Ordering::SeqCst);
+        let workers = cpus * 3;
+        assert!(workers <= 64, "the seen bitmap is a u64");
+        for i in 0..workers {
+            crate::sched::spawn_kernel(identity_worker, i, Priority::Normal);
+        }
+        wait_until(
+            || GS_FREE_ID_SEEN.load(Ordering::SeqCst).count_ones() as u64 >= cpus,
+            WAIT_BUDGET,
+        );
+
+        let seen = GS_FREE_ID_SEEN.load(Ordering::SeqCst);
+        assert_eq!(
+            seen.count_ones() as u64,
+            cpus,
+            "only {} of {cpus} processors ran the check, so the mapping is unverified on the rest",
+            seen.count_ones()
+        );
+        assert_eq!(
+            GS_FREE_ID_MISMATCH.load(Ordering::SeqCst),
+            0,
+            "a processor's apic-derived index disagrees with its own `GS` block"
+        );
+    }
+
     #[test_case]
     fn work_queued_on_one_cpu_is_stolen_by_another_when_the_owner_never_dispatches() {
         use core::sync::atomic::Ordering;
