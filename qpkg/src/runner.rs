@@ -29,7 +29,12 @@ pub fn run_functions(
     for stage in STAGES.iter().filter(|s| pb.functions.contains(**s)) {
         // `"$2"` invokes the sourced function by name; `set -e` makes any
         // failing command inside it fail the stage rather than scroll past.
-        let output = Command::new("bash")
+        writeln!(log, "==> {stage}()")?;
+        log.flush()?;
+        // Both streams write straight into the log file: a verbose build can
+        // emit tens of MB per stage, none of which needs to sit in memory,
+        // and the log fills as the stage runs instead of at its end.
+        let status = Command::new("bash")
             .args(["--noprofile", "--norc", "-c", r#"set -e; source "$1"; cd "$srcdir"; "$2""#, "qpkg-run"])
             .arg(pkgbuild_path)
             .arg(stage)
@@ -40,12 +45,11 @@ pub fn run_functions(
             .env("pkgname", pb.pkgname.first().map(String::as_str).unwrap_or_default())
             .env("pkgver", &pb.pkgver)
             .env("pkgrel", &pb.pkgrel)
-            .output()
+            .stdout(log.try_clone()?)
+            .stderr(log.try_clone()?)
+            .status()
             .map_err(|e| Error::Extraction(format!("spawning bash for {stage}(): {e}")))?;
-        writeln!(log, "==> {stage}()")?;
-        log.write_all(&output.stdout)?;
-        log.write_all(&output.stderr)?;
-        if !output.status.success() {
+        if !status.success() {
             return Err(Error::Build { stage: stage_name(stage), log: log_path });
         }
     }
