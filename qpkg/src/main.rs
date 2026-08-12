@@ -6,6 +6,7 @@ mod index;
 mod paths;
 mod pkgbuild;
 mod repodb;
+mod sources;
 mod sync;
 #[cfg(test)]
 mod testutil;
