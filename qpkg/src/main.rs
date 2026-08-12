@@ -4,6 +4,7 @@ mod commands;
 mod error;
 mod index;
 mod paths;
+mod pkgbuild;
 mod repodb;
 mod sync;
 #[cfg(test)]
