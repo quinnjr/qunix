@@ -37,6 +37,38 @@ use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::percpu::MAX_CPUS;
 
+/// How many irq-masking locks each processor holds.
+///
+/// Indexed by CPU rather than kept in the per-CPU block, because every reader
+/// and writer here is on a path that must not touch `GS`.
+static LOCK_DEPTH: [core::sync::atomic::AtomicU32; MAX_CPUS as usize] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS as usize];
+
+/// Records a lock acquisition on this processor.
+pub fn enter_lock() {
+    if let Some(cpu) = crate::percpu::cpu_id_without_gs() {
+        LOCK_DEPTH[cpu as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Records a lock release on this processor.
+pub fn leave_lock() {
+    if let Some(cpu) = crate::percpu::cpu_id_without_gs() {
+        LOCK_DEPTH[cpu as usize].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Locks this processor currently holds.
+///
+/// Read before code re-enables interrupts by hand. A handler that then takes a
+/// lock the interrupted frame owns deadlocks the processor against itself, and
+/// the report blames the handler rather than the frame that left the lock held.
+pub fn lock_depth() -> u32 {
+    crate::percpu::cpu_id_without_gs()
+        .map(|cpu| LOCK_DEPTH[cpu as usize].load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// Vector the shootdown IPI is delivered on.
 ///
 /// One above the timer. Installed by `idt::build_and_load` rather than by the

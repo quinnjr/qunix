@@ -611,6 +611,17 @@ pub fn park() {
         // documents -- `sti` takes effect only after the following
         // instruction, so an interrupt that arrived while masked is delivered
         // once `hlt` has been entered, which is what wakes it.
+        // Asserted at the point of violation. Enabling interrupts here with a
+        // lock held lets the completion or timer handler take that same lock on
+        // this processor, which wedges it against itself -- and the report then
+        // names the handler, not the frame that arrived holding the lock.
+        #[cfg(feature = "deadlock-panic")]
+        assert_eq!(
+            qunix_hal_x86_64::tlb::lock_depth(),
+            0,
+            "park is about to enable interrupts while holding a lock; an interrupt handler that \
+             takes it would deadlock this processor against itself"
+        );
         // SAFETY: no memory is touched and no stack slot is used.
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
 
@@ -1272,6 +1283,12 @@ pub fn idle_loop() -> ! {
             // an interrupt that arrived while masked is delivered only once
             // `hlt` has been entered -- which is what wakes it. Splitting them
             // reopens the window this whole block exists to close.
+            #[cfg(feature = "deadlock-panic")]
+            assert_eq!(
+                qunix_hal_x86_64::tlb::lock_depth(),
+                0,
+                "the idle loop is about to enable interrupts while holding a lock"
+            );
             // SAFETY: no memory is touched and no stack slot is used.
             unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
         }

@@ -174,6 +174,18 @@ pub trait IrqControl {
     /// be deaf to -- are unaffected.
     fn service_while_waiting() {}
 
+    /// Records that this processor has taken an irq-masking lock.
+    ///
+    /// Paired with [`Self::left_lock`]. The arch layer keeps the depth so that
+    /// code which re-enables interrupts by hand -- `sti; hlt` in the idle and
+    /// park loops -- can refuse to do so while a lock is held. Enabling
+    /// interrupts there lets a handler take a lock the interrupted frame owns,
+    /// on the same processor, which no amount of masking discipline elsewhere
+    /// can save.
+    fn entered_lock() {}
+    /// Pairs with [`Self::entered_lock`].
+    fn left_lock() {}
+
     /// This processor's index, for reporting who holds a wedged lock.
     ///
     /// Must not read per-CPU state through a segment base a running process
@@ -250,6 +262,7 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
             core::hint::spin_loop();
         };
         self.owner.store(I::cpu_index(), Ordering::Relaxed);
+        I::entered_lock();
         IrqSpinLockGuard {
             guard: ManuallyDrop::new(guard),
             owner: &self.owner,
@@ -267,6 +280,7 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
         match self.inner.try_lock() {
             Some(guard) => {
                 self.owner.store(I::cpu_index(), Ordering::Relaxed);
+                I::entered_lock();
                 Some(IrqSpinLockGuard {
                     guard: ManuallyDrop::new(guard),
                     owner: &self.owner,
@@ -335,6 +349,7 @@ impl<T: ?Sized, I: IrqControl> Drop for IrqSpinLockGuard<'_, T, I> {
         // free, and a processor that took it in that gap would have its own
         // owner store overwritten by this one.
         self.owner.store(NO_OWNER, Ordering::Relaxed);
+        I::left_lock();
         // Release the spinlock before restoring interrupts, so an interrupt
         // handler that takes the same lock cannot deadlock against us.
         unsafe { ManuallyDrop::drop(&mut self.guard) };

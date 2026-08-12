@@ -52,4 +52,12 @@ impl qunix_sync::IrqControl for Irq {
     fn cpu_index() -> u32 {
         crate::percpu::cpu_id_without_gs().unwrap_or(u32::MAX)
     }
+
+    fn entered_lock() {
+        crate::tlb::enter_lock();
+    }
+
+    fn left_lock() {
+        crate::tlb::leave_lock();
+    }
 }
