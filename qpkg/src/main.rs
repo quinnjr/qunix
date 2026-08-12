@@ -1,6 +1,7 @@
 mod cli;
 mod error;
 mod paths;
+mod vercmp;
 
 use clap::Parser;
 
