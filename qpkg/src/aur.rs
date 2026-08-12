@@ -32,21 +32,49 @@ struct DumpEntry {
 
 pub fn parse_aur_dump(reader: impl Read) -> Result<Vec<PackageRecord>> {
     let gz = flate2::read::GzDecoder::new(reader);
-    let entries: Vec<DumpEntry> = serde_json::from_reader(gz)
+    // The dump is one ~130k-element JSON array. Deserializing it as a
+    // `Vec<DumpEntry>` and then mapping would hold two full-cardinality
+    // allocations at once; streaming the array converts each entry as it
+    // decodes, so only the output Vec exists.
+    let mut out = Vec::new();
+    let mut de = serde_json::Deserializer::from_reader(gz);
+    use serde::de::{DeserializeSeed, SeqAccess, Visitor};
+    struct Stream<'a>(&'a mut Vec<PackageRecord>);
+    impl<'de> Visitor<'de> for Stream<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of AUR package objects")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
+            while let Some(e) = seq.next_element::<DumpEntry>()? {
+                self.0.push(PackageRecord {
+                    package_base: e.package_base.unwrap_or_else(|| e.name.clone()),
+                    name: e.name,
+                    version: e.version,
+                    repo: Repo::Aur,
+                    description: e.description.unwrap_or_default(),
+                    url: e.url.unwrap_or_default(),
+                    depends: e.depends.unwrap_or_default(),
+                    makedepends: e.makedepends.unwrap_or_default(),
+                });
+            }
+            Ok(())
+        }
+    }
+    struct Seed<'a>(&'a mut Vec<PackageRecord>);
+    impl<'de> DeserializeSeed<'de> for Seed<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            de: D,
+        ) -> std::result::Result<(), D::Error> {
+            de.deserialize_seq(Stream(self.0))
+        }
+    }
+    Seed(&mut out)
+        .deserialize(&mut de)
         .map_err(|e| Error::Index(format!("AUR metadata dump: {e}")))?;
-    Ok(entries
-        .into_iter()
-        .map(|e| PackageRecord {
-            package_base: e.package_base.unwrap_or_else(|| e.name.clone()),
-            name: e.name,
-            version: e.version,
-            repo: Repo::Aur,
-            description: e.description.unwrap_or_default(),
-            url: e.url.unwrap_or_default(),
-            depends: e.depends.unwrap_or_default(),
-            makedepends: e.makedepends.unwrap_or_default(),
-        })
-        .collect())
+    Ok(out)
 }
 
 /// PKGBUILD snapshots are keyed by package *base*: a split package's members
