@@ -32,7 +32,10 @@ Host crates test against **musl**, not glibc:
 
 ## Hard rules
 
-- **`no_std`** everywhere except `xtask` and `fuzz/`. Both are host-only tools.
+- **`no_std`** everywhere except `xtask`, `qpkg` and `fuzz/`. All three are
+  host-only tools; `qpkg` (the distribution's package pipeline) additionally
+  tests on the *host* triple rather than musl, because it links C (zstd) and a
+  musl cross C toolchain is not a test prerequisite worth taking.
   `fuzz/` is additionally its own workspace, so it is outside `cargo xtask
   test` and the coverage ratchet — `cargo xtask fuzz` is the only thing that
   builds it. The licensing check *does* reach it, because that walks the
@@ -208,6 +211,12 @@ LeakSanitizer.
   instead of faulting, so recursion in the panic path is unbounded by default.
 - `-cpu host` is rejected under TCG. Gate it on `/dev/kvm` being *openable*, not
   merely present — the `accel=kvm:tcg` fallback is silent.
+- **A git worktree must live outside the repository directory.** Cargo merges
+  every `.cargo/config.toml` it finds walking up from the working directory,
+  and merging *joins lists* — so a worktree under `.worktrees/` sees the kernel
+  target's `runner` twice, concatenated, and the runner is invoked with its own
+  command line as the "ELF" ("reading source metadata for cargo"). Put
+  worktrees in a sibling directory (e.g. `../qunix-worktrees/`).
 - `git checkout <file>` restores from the **index**, not `HEAD`. With work staged
   but uncommitted, that destroys it. This has happened here.
 
