@@ -78,13 +78,22 @@ impl Index {
         }
         let db = Database::create(path)
             .map_err(|e| Error::Index(format!("{}: {e}", path.display())))?;
-        // Open every table once so a fresh database serves reads without a
-        // "table missing" special case.
-        let tx = db.begin_write().map_err(idx)?;
-        tx.open_table(PACKAGES).map_err(idx)?;
-        tx.open_table(BUILT).map_err(idx)?;
-        tx.open_table(META).map_err(idx)?;
-        tx.commit().map_err(idx)?;
+        // Fast path first: an already-initialized database must serve a
+        // plain `search`/`info` without taking the write lock and paying a
+        // commit+fsync. Only a database missing a table — genuinely fresh —
+        // takes the write bootstrap.
+        let ready = db.begin_read().is_ok_and(|tx| {
+            tx.open_table(PACKAGES).is_ok()
+                && tx.open_table(BUILT).is_ok()
+                && tx.open_table(META).is_ok()
+        });
+        if !ready {
+            let tx = db.begin_write().map_err(idx)?;
+            tx.open_table(PACKAGES).map_err(idx)?;
+            tx.open_table(BUILT).map_err(idx)?;
+            tx.open_table(META).map_err(idx)?;
+            tx.commit().map_err(idx)?;
+        }
         Ok(Self { db })
     }
 
