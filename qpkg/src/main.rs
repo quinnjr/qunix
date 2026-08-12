@@ -1,3 +1,4 @@
+mod artifact;
 mod aur;
 mod cli;
 mod commands;
