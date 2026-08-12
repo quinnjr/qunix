@@ -43,4 +43,13 @@ impl qunix_sync::IrqControl for Irq {
     fn service_while_waiting() {
         crate::tlb::service_pending();
     }
+
+    /// This processor's index, without touching `GS`.
+    ///
+    /// Reached from a lock wait, so it must not read `gs:[0x20]` -- that is
+    /// linear address 0x20 whenever ring 3 has zeroed the hidden base, and a
+    /// fault there with interrupts masked is a triple fault.
+    fn cpu_index() -> u32 {
+        crate::percpu::cpu_id_without_gs().unwrap_or(u32::MAX)
+    }
 }
