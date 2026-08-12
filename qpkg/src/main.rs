@@ -2,6 +2,7 @@ mod cli;
 mod error;
 mod paths;
 mod index;
+mod repodb;
 mod vercmp;
 
 use clap::Parser;
