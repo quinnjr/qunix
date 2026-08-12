@@ -42,7 +42,7 @@ pub fn run_functions(
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .env("srcdir", &srcdir)
             .env("pkgdir", &pkgdir)
-            .env("pkgname", pb.pkgname.first().map(String::as_str).unwrap_or_default())
+            .env("pkgname", pb.pkgname[0].as_str())
             .env("pkgver", &pb.pkgver)
             .env("pkgrel", &pb.pkgrel)
             .stdout(log.try_clone()?)

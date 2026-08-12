@@ -18,12 +18,12 @@ pub fn package(pb: &Pkgbuild, pkgdir: &Path, out_dir: &Path) -> Result<PathBuf> 
         // built table honest.
         return Err(Error::Build {
             stage: "package",
-            log: pkgdir.parent().unwrap_or(pkgdir).join("build.log"),
+            log: pkgdir.parent().expect("pkgdir is always workdir/pkg").join("build.log"),
         });
     }
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-    let name = pb.pkgname.first().cloned().unwrap_or_default();
+    let name = pb.pkgname[0].clone();
     let full = pb.full_version();
     let size: u64 = entries
         .iter()

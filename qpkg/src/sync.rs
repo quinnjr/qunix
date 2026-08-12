@@ -7,37 +7,28 @@ use crate::error::Result;
 use crate::index::{Index, Repo};
 use crate::repodb::parse_repo_db;
 
-pub struct SyncConfig {
-    pub mirror: String,
-    pub aur_dump_url: String,
-}
-
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            // Arch's geo-routed default; overridable once a config file earns
-            // its keep.
-            mirror: "https://geo.mirror.pkgbuild.com".into(),
-            aur_dump_url: "https://aur.archlinux.org/packages-meta-ext-v1.json.gz".into(),
-        }
-    }
-}
+// Arch's geo-routed default. Deliberately a literal, not configuration: no
+// caller has ever wanted a different mirror, and a knob nobody turns is
+// surface area. Reintroduce a config struct when a config file earns its
+// keep.
+const MIRROR: &str = "https://geo.mirror.pkgbuild.com";
+const AUR_DUMP_URL: &str = "https://aur.archlinux.org/packages-meta-ext-v1.json.gz";
 
 pub struct SyncReport {
     pub official: usize,
     pub aur: usize,
 }
 
-pub fn run(index: &Index, config: &SyncConfig, now: u64) -> Result<SyncReport> {
+pub fn run(index: &Index, now: u64) -> Result<SyncReport> {
     // Three independent payloads, and the AUR dump dominates the wall clock:
     // fetch them concurrently so a sync costs the slowest transfer, not the
     // sum. Ingest still only runs when all three arrived, so the
     // all-or-nothing stamping semantics are unchanged.
-    let core_url = format!("{}/core/os/x86_64/core.db", config.mirror);
-    let extra_url = format!("{}/extra/os/x86_64/extra.db", config.mirror);
+    let core_url = format!("{MIRROR}/core/os/x86_64/core.db");
+    let extra_url = format!("{MIRROR}/extra/os/x86_64/extra.db");
     let (core, extra, aur) = std::thread::scope(|s| {
         let extra = s.spawn(|| http::fetch(&extra_url));
-        let aur = s.spawn(|| http::fetch(&config.aur_dump_url));
+        let aur = s.spawn(|| http::fetch(AUR_DUMP_URL));
         let core = http::fetch(&core_url);
         // A panic in a fetch thread is a bug, not a network failure.
         (core, extra.join().expect("fetch thread panicked"), aur.join().expect("fetch thread panicked"))
@@ -131,7 +122,7 @@ mod tests {
         ingest(&index, &mini_db("zsh", "5.9-5"), &mini_db("x", "1-1"), &aur, 2_000).unwrap();
         assert_eq!(index.get("zsh").unwrap().unwrap().version, "5.9-5");
         // Negative: replaced, not accumulated.
-        assert_eq!(index.search("zsh").unwrap().len(), 1);
+        assert_eq!(index.search_with_built("zsh").unwrap().len(), 1);
     }
 
     #[test]
@@ -150,7 +141,7 @@ mod tests {
     fn live_sync_lands_a_real_index() {
         let dir = tempfile::tempdir().unwrap();
         let index = Index::open(&dir.path().join("i.redb")).unwrap();
-        let report = run(&index, &SyncConfig::default(), 1).unwrap();
+        let report = run(&index, 1).unwrap();
         assert!(report.official > 1_000, "core+extra is thousands of packages");
         assert!(report.aur > 10_000, "the AUR is tens of thousands");
         assert!(index.get("zsh").unwrap().is_some());

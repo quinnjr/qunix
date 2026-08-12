@@ -119,18 +119,11 @@ impl Index {
         }
     }
 
-    /// Substring search over name and description, case-insensitive. An exact
-    /// name match sorts first, then name substrings, then description-only
-    /// hits; ties stay in name order because the table iterates sorted.
-    pub fn search(&self, term: &str) -> Result<Vec<PackageRecord>> {
-        let tx = self.db.begin_read().map_err(idx)?;
-        let table = tx.open_table(PACKAGES).map_err(idx)?;
-        ranked_hits(&table, term)
-    }
-
-    /// Search plus built-status under one read transaction: the CLI shows a
-    /// built marker per hit, and a broad term returns hundreds of hits —
-    /// each must not pay its own transaction and table open.
+    /// Substring search over name and description, case-insensitive, with
+    /// built-status per hit, all under one read transaction: an exact name
+    /// match sorts first, then name substrings, then description-only hits —
+    /// and a broad term returns hundreds of hits, each of which must not pay
+    /// its own transaction and table open.
     pub fn search_with_built(
         &self,
         term: &str,
@@ -187,17 +180,6 @@ impl Index {
             Some(v) => Ok(Some(decode(v.value())?)),
             None => Ok(None),
         }
-    }
-
-    pub fn all_built(&self) -> Result<Vec<BuiltRecord>> {
-        let tx = self.db.begin_read().map_err(idx)?;
-        let table = tx.open_table(BUILT).map_err(idx)?;
-        let mut out = Vec::new();
-        for entry in table.iter().map_err(idx)? {
-            let (_, v) = entry.map_err(idx)?;
-            out.push(decode(v.value())?);
-        }
-        Ok(out)
     }
 
     pub fn set_sync_time(&self, source: &str, unix: u64) -> Result<()> {
@@ -337,7 +319,7 @@ mod tests {
         let got = index.get("zsh").unwrap().unwrap();
         assert_eq!(got.version, "5.9-2");
         // Negative: replaced, not duplicated — and absent names are None.
-        assert_eq!(index.search("zsh").unwrap().len(), 1);
+        assert_eq!(index.search_with_built("zsh").unwrap().len(), 1);
         assert!(index.get("does-not-exist").unwrap().is_none());
     }
 
@@ -352,13 +334,13 @@ mod tests {
                 record("unrelated", "1-1", Repo::Core, "nothing here"),
             ])
             .unwrap();
-        let hits = index.search("zsh").unwrap();
-        let names: Vec<&str> = hits.iter().map(|r| r.name.as_str()).collect();
+        let hits = index.search_with_built("zsh").unwrap();
+        let names: Vec<&str> = hits.iter().map(|(r, _)| r.name.as_str()).collect();
         assert_eq!(names, ["zsh", "grml-zsh-config", "fish"]);
         // Negative: non-matching rows are absent, not ranked last.
         assert!(!names.contains(&"unrelated"));
         // Case-insensitive, description path.
-        assert_eq!(index.search("Z SHELL").unwrap()[0].name, "zsh");
+        assert_eq!(index.search_with_built("Z SHELL").unwrap()[0].0.name, "zsh");
     }
 
     #[test]
@@ -368,10 +350,10 @@ mod tests {
         rec.description = "ein schönes Werkzeug".into();
         index.upsert_packages(&[rec]).unwrap();
         // The Unicode fallback path: case-folding beyond ASCII.
-        assert_eq!(index.search("SCHÖNES").unwrap().len(), 1);
+        assert_eq!(index.search_with_built("SCHÖNES").unwrap().len(), 1);
         // Negative: the fast path did not quietly loosen matching — an
         // unaccented spelling is a different word and finds nothing.
-        assert!(index.search("schones").unwrap().is_empty());
+        assert!(index.search_with_built("schones").unwrap().is_empty());
     }
 
     #[test]
@@ -387,7 +369,8 @@ mod tests {
         };
         index.record_built(&rec).unwrap();
         assert_eq!(index.built("zsh").unwrap().unwrap(), rec);
-        assert_eq!(index.all_built().unwrap(), vec![rec]);
+        // No upstream record was ever indexed for it, so the pairing is None.
+        assert_eq!(index.built_with_upstream().unwrap(), vec![(rec, None)]);
     }
 
     #[test]

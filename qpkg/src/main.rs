@@ -41,7 +41,7 @@ fn run() -> Result<()> {
     let mut warn = std::io::stderr();
     match cli.command {
         cli::Command::Sync => {
-            let report = sync::run(&index, &sync::SyncConfig::default(), now_unix())?;
+            let report = sync::run(&index, now_unix())?;
             println!("synced {} official and {} AUR packages", report.official, report.aur);
             Ok(())
         }
@@ -57,7 +57,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         cli::Command::Update { build: rebuild } => {
-            let report = sync::run(&index, &sync::SyncConfig::default(), now_unix())?;
+            let report = sync::run(&index, now_unix())?;
             eprintln!("synced {} official and {} AUR packages", report.official, report.aur);
             let names = build::outdated(&index, &mut out)?;
             if names.is_empty() {

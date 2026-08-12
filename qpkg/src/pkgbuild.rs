@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 /// declares is its own business.
 const VARS: &[&str] = &[
     "pkgname", "pkgver", "pkgrel", "epoch", "arch", "source", "sha256sums", "b2sums", "depends",
-    "makedepends", "options",
+    "makedepends",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,7 +27,6 @@ pub struct Pkgbuild {
     pub b2sums: Vec<String>,
     pub depends: Vec<String>,
     pub makedepends: Vec<String>,
-    pub options: Vec<String>,
     /// Every shell function the PKGBUILD defines — `build`, `package`,
     /// `pkgver`, `package_<name>` splits, helpers, all of them.
     pub functions: BTreeSet<String>,
@@ -46,7 +45,8 @@ impl Pkgbuild {
             Ok(())
         } else {
             Err(Error::UnsupportedArch {
-                name: self.pkgname.first().cloned().unwrap_or_default(),
+                // parse_transcript refuses an empty pkgname, so [0] holds.
+                name: self.pkgname[0].clone(),
                 arches: self.arch.clone(),
             })
         }
@@ -148,7 +148,6 @@ fn parse_transcript(text: &str) -> Result<Pkgbuild> {
         b2sums: array(&vars, "b2sums"),
         depends: array(&vars, "depends"),
         makedepends: array(&vars, "makedepends"),
-        options: array(&vars, "options"),
         functions,
     })
 }
@@ -259,13 +258,11 @@ mod tests {
             concat!(
                 "pkgname=(zsh zsh-docs)\npkgver=5.9\npkgrel=5\nepoch=1\narch=(x86_64 aarch64)\n",
                 "depends=('pcre2' 'ncurses>=6.4' \"lib cap\")\nmakedepends=(yodl)\n",
-                "options=(!emptydirs)\n",
             ),
         );
         let pb = extract(&path, dir.path()).unwrap();
         assert_eq!(pb.pkgname, ["zsh", "zsh-docs"]);
         assert_eq!(pb.depends, ["pcre2", "ncurses>=6.4", "lib cap"]);
-        assert_eq!(pb.options, ["!emptydirs"]);
         assert_eq!(pb.full_version(), "1:5.9-5");
         assert!(pb.check_arch().is_ok());
     }
