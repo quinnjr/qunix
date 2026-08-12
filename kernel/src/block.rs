@@ -26,7 +26,7 @@ use qunix_hal_x86_64::pci;
 use qunix_sched::ThreadId;
 use qunix_sync::IrqSpinLock;
 use qunix_virtio::blk::{BlkStatus, RequestHeader, SECTOR_BYTES, status_from_byte};
-use qunix_virtio::{QUEUE_SIZE, RING_HEADER, SplitQueue, ring_layout};
+use qunix_virtio::{Descriptor, QUEUE_SIZE, RING_HEADER, SplitQueue, ring_layout};
 
 use crate::virtio::{Transport, VIRTIO_BLK_MODERN, VIRTIO_F_VERSION_1};
 
@@ -458,29 +458,54 @@ fn submit(lba: u64, len: usize, out: Option<&[u8]>) -> Result<u16, BlockError> {
         Some(Slot { thread: crate::sched::current_id(), done: false, status: 0xff });
 
     blk.queue.publish(head);
-    write_rings(blk);
+    write_rings(blk, head);
     blk.transport.notify();
     Ok(head)
 }
 
-/// Copies the driver's descriptor table and available ring into DMA memory.
-fn write_rings(blk: &Blk) {
+/// Copies the chain `head` names, and the ring slot naming it, into DMA memory.
+///
+/// Only that chain and only that slot. Writing the whole table -- 64
+/// descriptors and 64 ring slots, serialised into two heap allocations -- is
+/// what this did on every submission, under the device lock with interrupts
+/// masked, to publish three descriptors and one slot. It also rewrote entries
+/// belonging to requests already in flight, with the same bytes, which is
+/// pointless work the device is entitled to be reading through.
+fn write_rings(blk: &Blk, head: u16) {
     let layout = ring_layout(QUEUE_SIZE);
-    let desc = blk.queue.desc_bytes();
-    let slots = blk.queue.avail_slots_bytes();
-    // The descriptor table and the ring slot first, *without* the index.
-    // SAFETY: both offsets are inside the ring frame this module allocated, and
-    // `ring_layout` is what told the device where they are.
+    // The chain's descriptors and its ring slot first, *without* the index.
+    let mut next = Some(head);
+    while let Some(index) = next {
+        let bytes = blk
+            .queue
+            .descriptor_bytes(index)
+            .expect("a chain names a descriptor outside the table");
+        // SAFETY: the offset is inside the ring frame this module allocated,
+        // and `ring_layout` is what told the device where the table is.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (blk.ring_virt + layout.desc as u64 + index as u64 * Descriptor::BYTES as u64)
+                    as *mut u8,
+                bytes.len(),
+            );
+        }
+        next = blk.queue.next_in_chain(index);
+    }
+    // The slot `publish` just filled: the ring position, which is the
+    // free-running index reduced modulo the queue size. Using the index itself
+    // writes outside the ring the moment it passes `QUEUE_SIZE`.
+    let slot = blk.queue.avail_index().wrapping_sub(1) % QUEUE_SIZE;
+    let slot_bytes = blk.queue.avail_slot_bytes(slot).expect("the published slot is off the ring");
+    // SAFETY: as above; `slot` is below `QUEUE_SIZE` by construction.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            desc.as_ptr(),
-            (blk.ring_virt + layout.desc as u64) as *mut u8,
-            desc.len(),
-        );
-        core::ptr::copy_nonoverlapping(
-            slots.as_ptr(),
-            (blk.ring_virt + layout.avail as u64 + SplitQueue::AVAIL_SLOTS_OFFSET as u64) as *mut u8,
-            slots.len(),
+            slot_bytes.as_ptr(),
+            (blk.ring_virt
+                + layout.avail as u64
+                + SplitQueue::AVAIL_SLOTS_OFFSET as u64
+                + slot as u64 * 2) as *mut u8,
+            slot_bytes.len(),
         );
     }
     // Then the barrier, then the index. This order is the protocol, not

@@ -227,6 +227,24 @@ impl SplitQueue {
         out
     }
 
+    /// One descriptor, as the device reads it.
+    ///
+    /// The per-descriptor form exists because a request touches three of them
+    /// and the whole-table form serialises all 64 -- under the driver's lock,
+    /// with interrupts masked, on every submission.
+    pub fn descriptor_bytes(&self, index: u16) -> Option<[u8; Descriptor::BYTES]> {
+        self.desc.get(index as usize).map(|d| d.to_bytes())
+    }
+
+    /// One available-ring slot, as the device reads it.
+    ///
+    /// `slot` is a ring position, not the free-running index: the two are
+    /// different numbers and conflating them writes outside the ring for any
+    /// queue smaller than 65536, which is every queue.
+    pub fn avail_slot_bytes(&self, slot: u16) -> Option<[u8; 2]> {
+        self.avail_ring.get(slot as usize).map(|s| s.to_le_bytes())
+    }
+
     /// The available ring's *slots*, without its index.
     ///
     /// The index is deliberately excluded, because publishing it is a separate
@@ -460,6 +478,35 @@ mod tests {
         assert_eq!(q.ingest_used(&short, 0), None, "a short used ring was ingested");
         let exact = alloc::vec![0u8; RING_HEADER + 8 * QUEUE_SIZE as usize];
         assert_eq!(q.ingest_used(&exact, 7), Some(7), "an exactly-sized used ring was refused");
+    }
+
+    #[test]
+    fn a_single_descriptor_serialises_the_same_as_the_whole_table() {
+        // The interrupt-free path writes descriptors one at a time now. If the
+        // two disagreed, the device would read a table the driver believes it
+        // wrote -- the wrong-answer failure this crate is arranged around.
+        let mut q = SplitQueue::new(QUEUE_SIZE);
+        let head = q.alloc_chain(3).expect("a fresh queue has descriptors");
+        q.describe(head, 0x1234_5000, 16, false);
+        let table = q.desc_bytes();
+        let one = q.descriptor_bytes(head).expect("an in-range descriptor was refused");
+        let base = head as usize * Descriptor::BYTES;
+        assert_eq!(&table[base..base + Descriptor::BYTES], &one[..], "the two forms disagree");
+        assert_eq!(q.descriptor_bytes(QUEUE_SIZE), None, "a descriptor past the table was served");
+    }
+
+    #[test]
+    fn a_single_avail_slot_serialises_the_same_as_the_whole_ring() {
+        let mut q = SplitQueue::new(QUEUE_SIZE);
+        let head = q.alloc_chain(1).expect("a fresh queue has descriptors");
+        q.publish(head);
+        let ring = q.avail_slots_bytes();
+        let slot = q.avail_index().wrapping_sub(1) % QUEUE_SIZE;
+        let one = q.avail_slot_bytes(slot).expect("an in-range slot was refused");
+        let base = slot as usize * 2;
+        assert_eq!(&ring[base..base + 2], &one[..], "the two forms disagree");
+        assert_eq!(u16::from_le_bytes(one), head, "the published slot does not name the chain");
+        assert_eq!(q.avail_slot_bytes(QUEUE_SIZE), None, "a slot past the ring was served");
     }
 
     #[test]
