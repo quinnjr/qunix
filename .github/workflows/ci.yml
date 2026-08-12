@@ -59,6 +59,22 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+      # TEMPORARY -- revert once the shootdown deadlock is closed. A kernel
+      # backtrace is a list of addresses, and resolving them against a locally
+      # rebuilt binary is guesswork: the same source and toolchain still lay
+      # symbols out differently enough that frames resolve to the wrong
+      # functions. The ELF that actually printed them is the only thing that
+      # symbolises them.
+      - name: Upload the kernel images
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-elf-debug
+          path: |
+            target/x86_64-qunix-kernel/debug/build/qunix-kernel/*/out/qunix_kernel-*
+            target/sched-invariants/x86_64-qunix-kernel/debug/build/qunix-kernel/*/out/qunix_kernel-*
+          if-no-files-found: warn
+
   # The release profile is what ships, and it differs in ways that matter:
   # overflow checks are off, so arithmetic the debug build would have panicked on
   # wraps silently. Nothing else in CI compiled it, which meant a `--release`-only
