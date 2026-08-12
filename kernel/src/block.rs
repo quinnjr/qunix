@@ -109,6 +109,13 @@ struct Slot {
     done: bool,
     /// The status byte the device wrote.
     status: u8,
+    /// The submitter gave up waiting, but the device was never told.
+    ///
+    /// The chain stays allocated while this is set. A timeout means the driver
+    /// stopped waiting, not that the device stopped owning the descriptors and
+    /// the bounce buffer -- a merely slow completion still lands, and if the
+    /// head has been recycled it lands on somebody else's request.
+    abandoned: bool,
 }
 
 /// The device and everything that must be consistent with it, under one lock.
@@ -153,6 +160,23 @@ pub fn completions() -> u64 {
 /// something the driver can recover from silently, and "the machine hangs" is
 /// not a diagnosis.
 static DEVICE_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Requests whose deadline expired, leaving their chain quarantined.
+static ABANDONED: AtomicU64 = AtomicU64::new(0);
+
+/// Quarantined chains the device later completed, and which were then freed.
+///
+/// The gap between this and [`ABANDONED`] is chains leaked for good: the device
+/// never handed them back, so the driver may never reuse them.
+static RECLAIMED: AtomicU64 = AtomicU64::new(0);
+
+pub fn abandoned() -> u64 {
+    ABANDONED.load(Ordering::Acquire)
+}
+
+pub fn reclaimed() -> u64 {
+    RECLAIMED.load(Ordering::Acquire)
+}
 
 pub fn device_faults() -> u64 {
     DEVICE_FAULTS.load(Ordering::Acquire)
@@ -455,7 +479,7 @@ fn submit(lba: u64, len: usize, out: Option<&[u8]>) -> Result<u16, BlockError> {
     blk.queue.describe(status, status_phys, 1, true);
 
     blk.slots[head as usize] =
-        Some(Slot { thread: crate::sched::current_id(), done: false, status: 0xff });
+        Some(Slot { thread: crate::sched::current_id(), done: false, status: 0xff, abandoned: false });
 
     blk.queue.publish(head);
     write_rings(blk, head);
@@ -597,6 +621,25 @@ impl Completion {
 fn finish(head: u16, status: u8, into: Option<&mut [u8]>) -> Result<(), BlockError> {
     let mut guard = DEVICE.lock();
     let blk = guard.as_mut().ok_or(BlockError::NoDevice)?;
+    if status == STATUS_TIMED_OUT {
+        // Quarantined, not freed. The deadline expiring says the driver gave
+        // up; it says nothing about the device, which may still be reading the
+        // descriptors and writing the bounce buffer. Freeing the chain here
+        // hands both to the next request, and a late completion then marks that
+        // request done from a status byte written for this one -- a wrong
+        // answer reported as success, which is the failure this driver is
+        // arranged to prevent.
+        //
+        // The chain is reclaimed by `handle_completion` if the completion ever
+        // arrives, and leaked if it never does. A permanently leaked chain
+        // costs one of 21 in-flight slots and is visible in `free_count`; the
+        // alternative costs correctness.
+        if let Some(slot) = blk.slots[head as usize].as_mut() {
+            slot.abandoned = true;
+        }
+        ABANDONED.fetch_add(1, Ordering::AcqRel);
+        return Err(BlockError::Timeout);
+    }
     if let Some(buf) = into {
         let data_virt = blk.data_virt + head as u64 * SLOT_BYTES as u64;
         // SAFETY: the bounce buffer is `SLOT_BYTES` and `buf.len()` was bounded
@@ -605,9 +648,6 @@ fn finish(head: u16, status: u8, into: Option<&mut [u8]>) -> Result<(), BlockErr
     }
     blk.queue.free_chain(head);
     blk.slots[head as usize] = None;
-    if status == STATUS_TIMED_OUT {
-        return Err(BlockError::Timeout);
-    }
     match status_from_byte(status) {
         BlkStatus::Ok => Ok(()),
         other => Err(BlockError::Device(other)),
@@ -694,10 +734,20 @@ pub fn handle_completion() {
                 // SAFETY: inside the metadata frame this module allocated.
                 let status = unsafe { core::ptr::read_volatile(status_virt as *const u8) };
                 if let Some(entry) = blk.slots[head as usize].as_mut() {
-                    entry.done = true;
-                    entry.status = status;
-                    woken[count] = Some(entry.thread);
-                    count += 1;
+                    if entry.abandoned {
+                        // The submitter timed out and left the chain behind for
+                        // exactly this moment. Nothing to wake -- it took its
+                        // error long ago -- and the descriptors are safe to
+                        // reclaim now that the device has handed them back.
+                        blk.queue.free_chain(head);
+                        blk.slots[head as usize] = None;
+                        RECLAIMED.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        entry.done = true;
+                        entry.status = status;
+                        woken[count] = Some(entry.thread);
+                        count += 1;
+                    }
                 }
                 COMPLETIONS.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -947,6 +997,54 @@ mod tests {
             "the device completed a request the driver refused, so it had been notified"
         );
         assert_eq!(device_faults(), faults_before, "the refusal produced a device fault");
+    }
+
+    #[test_case]
+    fn a_timed_out_request_keeps_its_chain_until_the_device_gives_it_back() {
+        // The device owns a chain until it completes it, and a deadline says
+        // nothing about the device. Freeing on timeout hands the descriptors
+        // and the bounce buffer to the next request, and the late completion
+        // then marks *that* request done from a status byte written for this
+        // one: a wrong answer reported as success.
+        //
+        // `finish` is called directly with the timeout status rather than by
+        // waiting out five seconds of ticks, because the property under test is
+        // what the driver does with the verdict, not how long it takes to reach
+        // it. The request itself is real and the device does complete it, which
+        // is what makes the reclaim half observable.
+        ready();
+        let free_before = { DEVICE.lock().as_ref().unwrap().queue.free_count() };
+        let abandoned_before = abandoned();
+        let reclaimed_before = reclaimed();
+
+        let head = submit(0, SECTOR_BYTES, None).expect("the queue refused a lone request");
+        assert_eq!(
+            finish(head, STATUS_TIMED_OUT, None),
+            Err(BlockError::Timeout),
+            "a timed-out request did not report a timeout"
+        );
+        assert_eq!(abandoned(), abandoned_before + 1, "the timeout was not recorded");
+        assert!(
+            { DEVICE.lock().as_ref().unwrap().queue.free_count() } < free_before,
+            "the chain was freed while the device still owned it"
+        );
+
+        // The device completes it regardless; the handler is what reclaims it.
+        let mut budget = 200_000_000u64;
+        while reclaimed() == reclaimed_before && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        assert_eq!(
+            reclaimed(),
+            reclaimed_before + 1,
+            "the completion never reclaimed the quarantined chain, so it is leaked"
+        );
+        assert_eq!(
+            { DEVICE.lock().as_ref().unwrap().queue.free_count() },
+            free_before,
+            "the reclaimed chain was not returned to the free list"
+        );
     }
 
     #[test_case]
