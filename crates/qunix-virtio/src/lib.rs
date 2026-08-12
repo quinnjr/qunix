@@ -87,7 +87,11 @@ pub struct RingLayout {
 }
 
 /// Bytes of ring header before the entries: `flags` and `idx`.
-pub(crate) const RING_HEADER: usize = 4;
+///
+/// Public because the kernel reads individual used-ring entries out of DMA
+/// memory and needs the same offset the layout was built with; a second copy of
+/// the number is one edit away from addressing the wrong entry.
+pub const RING_HEADER: usize = 4;
 /// Bytes of ring footer after the entries: the event suppression field.
 const RING_FOOTER: usize = 2;
 

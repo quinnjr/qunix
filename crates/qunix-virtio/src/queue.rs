@@ -278,6 +278,25 @@ impl SplitQueue {
         Some(idx)
     }
 
+    /// Copies one used-ring entry the device wrote into the driver's mirror.
+    ///
+    /// The per-entry form exists because the whole-ring one is the wrong shape
+    /// for an interrupt: a completion typically brings one entry, and copying
+    /// all of them re-reads every slot the device may be writing *right now*.
+    /// Rejecting an out-of-range slot rather than wrapping it is deliberate --
+    /// the caller derives it from a device-supplied index, and silently
+    /// folding a bad one onto a live entry marks the wrong request done.
+    pub fn ingest_used_slot(&mut self, slot: u16, bytes: [u8; 8]) -> bool {
+        if slot >= self.size {
+            return false;
+        }
+        self.used_ring[slot as usize] = UsedElem {
+            id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            len: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        };
+        true
+    }
+
     /// The byte length of the ring allocation this queue needs.
     pub fn ring_bytes(&self) -> usize {
         ring_layout(self.size).bytes
@@ -441,5 +460,29 @@ mod tests {
         assert_eq!(q.ingest_used(&short, 0), None, "a short used ring was ingested");
         let exact = alloc::vec![0u8; RING_HEADER + 8 * QUEUE_SIZE as usize];
         assert_eq!(q.ingest_used(&exact, 7), Some(7), "an exactly-sized used ring was refused");
+    }
+
+    #[test]
+    fn one_used_entry_can_be_ingested_without_reading_the_rest() {
+        // What the interrupt path uses. The entry must land in the slot named
+        // and carry the device's bytes verbatim, little-endian.
+        let mut q = SplitQueue::new(QUEUE_SIZE);
+        let head = q.alloc_chain(1).expect("a fresh queue has descriptors");
+        let mut bytes = [0u8; 8];
+        bytes[0..4].copy_from_slice(&(head as u32).to_le_bytes());
+        bytes[4..8].copy_from_slice(&512u32.to_le_bytes());
+        assert!(q.ingest_used_slot(3, bytes), "an in-range slot was refused");
+        assert_eq!(q.take_used(3), Some((head, 512)), "the entry did not land in slot 3");
+    }
+
+    #[test]
+    fn a_used_slot_past_the_ring_is_refused_rather_than_wrapped() {
+        // The slot comes from a device-supplied index. Wrapping it would write
+        // over a live entry and mark some other request done, reported as a
+        // successful completion -- so the negative direction is the one that
+        // matters here.
+        let mut q = SplitQueue::new(QUEUE_SIZE);
+        assert!(!q.ingest_used_slot(QUEUE_SIZE, [0u8; 8]), "a slot past the ring was accepted");
+        assert!(!q.ingest_used_slot(u16::MAX, [0u8; 8]), "a wildly out-of-range slot was accepted");
     }
 }

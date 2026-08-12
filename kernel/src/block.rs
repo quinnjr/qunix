@@ -26,7 +26,7 @@ use qunix_hal_x86_64::pci;
 use qunix_sched::ThreadId;
 use qunix_sync::IrqSpinLock;
 use qunix_virtio::blk::{BlkStatus, RequestHeader, SECTOR_BYTES, status_from_byte};
-use qunix_virtio::{QUEUE_SIZE, SplitQueue, ring_layout};
+use qunix_virtio::{QUEUE_SIZE, RING_HEADER, SplitQueue, ring_layout};
 
 use crate::virtio::{Transport, VIRTIO_BLK_MODERN, VIRTIO_F_VERSION_1};
 
@@ -620,19 +620,6 @@ pub fn handle_completion() {
         let device_idx = unsafe { core::ptr::read_volatile((used_base + 2) as *const u16) };
         core::sync::atomic::fence(Ordering::Acquire);
 
-        // Copied out volatilely rather than borrowed, for the same reason.
-        // Header, entries, and the two-byte event-suppression footer that
-        // `ring_layout` reserves -- sized from the layout rather than from a
-        // remembered sum, which is what got this wrong first time.
-        let mut snapshot = [0u8; 4 + 8 * QUEUE_SIZE as usize + 2];
-        for (i, byte) in snapshot.iter_mut().enumerate().take(used_len) {
-            // SAFETY: inside the used ring established above.
-            *byte = unsafe { core::ptr::read_volatile((used_base + i as u64) as *const u8) };
-        }
-        if blk.queue.ingest_used(&snapshot[..used_len], device_idx).is_none() {
-            return;
-        }
-
         // The device chose `device_idx`, so the distance it claims to have
         // advanced is device-supplied too. More than the ring holds means the
         // device is lying: consuming that many entries would walk the mirror
@@ -646,8 +633,36 @@ pub fn handle_completion() {
         // Consumed in order from the last index seen. Reading only the newest
         // entry would drop every completion that arrived while this handler was
         // between the read and the lock.
+        //
+        // Each entry is copied out immediately before it is taken, and only the
+        // entries the index says are ready. Copying the whole ring first --
+        // which this did -- re-read all 64 slots on every interrupt for a
+        // `pending` that is almost always 1, and those reads cover the slots
+        // the device may be filling *right now*: bytes with no acquire
+        // relationship to anything, kept in a mirror until some later
+        // interrupt's index happens to reach them.
         for _ in 0..pending {
             let slot = blk.last_used % QUEUE_SIZE;
+            let mut entry = [0u8; 8];
+            // The bound the `SAFETY` note below rests on, checked rather than
+            // asserted in prose: `used_len` is what `ring_layout` reserved, and
+            // an entry that reached past it would be a read into whatever
+            // follows the ring.
+            debug_assert!(
+                RING_HEADER + (slot as usize + 1) * 8 <= used_len,
+                "used-ring entry {slot} lies outside the {used_len}-byte ring"
+            );
+            let entry_base = used_base + RING_HEADER as u64 + slot as u64 * 8;
+            for (i, byte) in entry.iter_mut().enumerate() {
+                // SAFETY: `slot` is below `QUEUE_SIZE`, so this is inside the
+                // used ring established above -- `used_len` covers the header,
+                // every entry, and the footer.
+                *byte = unsafe { core::ptr::read_volatile((entry_base + i as u64) as *const u8) };
+            }
+            if !blk.queue.ingest_used_slot(slot, entry) {
+                DEVICE_FAULTS.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             if let Some((head, _len)) = blk.queue.take_used(slot) {
                 let status_virt =
                     blk.meta_virt + head as u64 * META_STRIDE + RequestHeader::BYTES as u64;
