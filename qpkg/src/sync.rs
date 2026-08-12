@@ -52,16 +52,20 @@ pub fn ingest(
     aur: &[u8],
     now: u64,
 ) -> Result<SyncReport> {
-    let mut official = parse_repo_db(core, Repo::Core)?;
-    official.extend(parse_repo_db(extra, Repo::Extra)?);
-    index.upsert_packages(&official)?;
-    let aur_records = parse_aur_dump(aur)?;
-    index.upsert_packages(&aur_records)?;
-    // Stamped only after both halves land: a sync that died between them must
-    // read as "never happened", not as fresh.
+    // Parse everything first, then land it in one write transaction — one
+    // commit+fsync instead of two, and a mid-ingest crash can no longer
+    // leave official rows committed without their AUR counterparts.
+    let mut all = parse_repo_db(core, Repo::Core)?;
+    all.extend(parse_repo_db(extra, Repo::Extra)?);
+    let official = all.len();
+    all.extend(parse_aur_dump(aur)?);
+    let aur_count = all.len() - official;
+    index.upsert_packages(&all)?;
+    // Stamped only after the rows land: a sync that died before the commit
+    // must read as "never happened", not as fresh.
     index.set_sync_time("official", now)?;
     index.set_sync_time("aur", now)?;
-    Ok(SyncReport { official: official.len(), aur: aur_records.len() })
+    Ok(SyncReport { official, aur: aur_count })
 }
 
 pub mod http {
