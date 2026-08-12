@@ -105,14 +105,6 @@ jobs:
           exit 1
 
       - name: Test (release profile)
-        env:
-          # TEMPORARY DIAGNOSTIC -- revert before merge. The release boot times
-          # out in one block test on this runner and nowhere else; the whole
-          # environment (QEMU 8.2.2, TCG, `-cpu max`, the unified OVMF, both
-          # scheduler configurations) reproduces green in a container. This
-          # distinguishes "the request never completes" from "the request is
-          # slower than the 120s budget".
-          QUNIX_QEMU_TIMEOUT: "600"
         run: cargo xtask test --release
 
   coverage:
