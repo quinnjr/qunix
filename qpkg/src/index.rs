@@ -241,17 +241,36 @@ fn ranked_hits(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     term: &str,
 ) -> Result<Vec<PackageRecord>> {
-    let needle = term.to_lowercase();
+    // An ASCII term — the overwhelmingly common case; package names are
+    // ASCII by repo policy — matches without allocating. A non-ASCII term
+    // falls back to the Unicode-correct lowercase path, so it stays right
+    // rather than fast. Scanning ~145k rows, the old path paid two String
+    // allocations per row.
+    let is_ascii = term.is_ascii();
+    let needle_lower = term.to_lowercase();
+    let contains = |hay: &str| {
+        if is_ascii {
+            contains_ignore_ascii_case(hay, term)
+        } else {
+            hay.to_lowercase().contains(&needle_lower)
+        }
+    };
+    let equals = |hay: &str| {
+        if is_ascii {
+            hay.eq_ignore_ascii_case(term)
+        } else {
+            hay.to_lowercase() == needle_lower
+        }
+    };
     let mut hits: Vec<(u8, PackageRecord)> = Vec::new();
     for entry in table.iter().map_err(idx)? {
         let (_, v) = entry.map_err(idx)?;
         let rec: PackageRecord = decode(v.value())?;
-        let name = rec.name.to_lowercase();
-        let rank = if name == needle {
+        let rank = if equals(&rec.name) {
             0
-        } else if name.contains(&needle) {
+        } else if contains(&rec.name) {
             1
-        } else if rec.description.to_lowercase().contains(&needle) {
+        } else if contains(&rec.description) {
             2
         } else {
             continue;
@@ -260,6 +279,22 @@ fn ranked_hits(
     }
     hits.sort_by_key(|(rank, _)| *rank);
     Ok(hits.into_iter().map(|(_, rec)| rec).collect())
+}
+
+/// Allocation-free ASCII case-insensitive substring test. Sound against
+/// UTF-8 haystacks because an ASCII needle byte never equals a byte of a
+/// multi-byte sequence (those all have the high bit set), so a window match
+/// cannot start mid-character.
+fn contains_ignore_ascii_case(hay: &str, needle: &str) -> bool {
+    let hay = hay.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -315,6 +350,19 @@ mod tests {
         assert!(!names.contains(&"unrelated"));
         // Case-insensitive, description path.
         assert_eq!(index.search("Z SHELL").unwrap()[0].name, "zsh");
+    }
+
+    #[test]
+    fn a_non_ascii_term_still_matches_case_insensitively() {
+        let (_dir, index) = temp_index();
+        let mut rec = record("umlaut", "1-1", Repo::Aur, "ein schönes Werkzeug");
+        rec.description = "ein schönes Werkzeug".into();
+        index.upsert_packages(&[rec]).unwrap();
+        // The Unicode fallback path: case-folding beyond ASCII.
+        assert_eq!(index.search("SCHÖNES").unwrap().len(), 1);
+        // Negative: the fast path did not quietly loosen matching — an
+        // unaccented spelling is a different word and finds nothing.
+        assert!(index.search("schones").unwrap().is_empty());
     }
 
     #[test]
