@@ -74,13 +74,16 @@ pub fn package(pb: &Pkgbuild, pkgdir: &Path, out_dir: &Path) -> Result<PathBuf> 
                 tar.append_data(&mut header, rel, std::io::empty())
                     .map_err(|e| Error::Extraction(e.to_string()))?;
             }
-            Kind::File { mode, .. } => {
-                let content = std::fs::read(pkgdir.join(rel))?;
+            Kind::File { size, mode } => {
+                // Streamed, not read whole: a musl -static binary can be
+                // large and tar::Builder copies any Read through a small
+                // internal buffer.
+                let file = std::fs::File::open(pkgdir.join(rel))?;
                 header.set_entry_type(tar::EntryType::Regular);
                 header.set_mode(*mode);
-                header.set_size(content.len() as u64);
+                header.set_size(*size);
                 header.set_cksum();
-                tar.append_data(&mut header, rel, content.as_slice())
+                tar.append_data(&mut header, rel, file)
                     .map_err(|e| Error::Extraction(e.to_string()))?;
             }
             Kind::Symlink { target } => {
