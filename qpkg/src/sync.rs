@@ -29,10 +29,20 @@ pub struct SyncReport {
 }
 
 pub fn run(index: &Index, config: &SyncConfig, now: u64) -> Result<SyncReport> {
-    let core = http::fetch(&format!("{}/core/os/x86_64/core.db", config.mirror))?;
-    let extra = http::fetch(&format!("{}/extra/os/x86_64/extra.db", config.mirror))?;
-    let aur = http::fetch(&config.aur_dump_url)?;
-    ingest(index, &core, &extra, &aur, now)
+    // Three independent payloads, and the AUR dump dominates the wall clock:
+    // fetch them concurrently so a sync costs the slowest transfer, not the
+    // sum. Ingest still only runs when all three arrived, so the
+    // all-or-nothing stamping semantics are unchanged.
+    let core_url = format!("{}/core/os/x86_64/core.db", config.mirror);
+    let extra_url = format!("{}/extra/os/x86_64/extra.db", config.mirror);
+    let (core, extra, aur) = std::thread::scope(|s| {
+        let extra = s.spawn(|| http::fetch(&extra_url));
+        let aur = s.spawn(|| http::fetch(&config.aur_dump_url));
+        let core = http::fetch(&core_url);
+        // A panic in a fetch thread is a bug, not a network failure.
+        (core, extra.join().expect("fetch thread panicked"), aur.join().expect("fetch thread panicked"))
+    });
+    ingest(index, &core?, &extra?, &aur?, now)
 }
 
 pub fn ingest(
