@@ -320,3 +320,41 @@ impl Drop for VmSpace {
         }
     }
 }
+
+
+/// Maps one page of device registers uncacheable, replacing whatever covers it.
+///
+/// Two callers need exactly this -- the LAPIC page and every page of a virtio
+/// BAR -- and they had it written out twice. The sequence is not obvious in
+/// either direction, which is why it is worth one place: Limine's HHDM is
+/// permitted to span the low 4 GiB and so may already cover device physical
+/// memory, `translate` reports *presence* and not cacheability, and a
+/// write-back mapping of device registers corrupts register access silently.
+/// So an existing mapping is replaced rather than trusted.
+///
+/// `unmap`, not `unmap_and_prune`: the tables covering an HHDM range are the
+/// bootloader's, and pruning would hand firmware-owned frames to this kernel's
+/// allocator.
+///
+/// # Safety
+/// `phys` must name device memory rather than RAM, so no allocator owns it and
+/// no alias is created, and nothing may hold a reference derived from `va`.
+pub unsafe fn map_device_page(
+    space: &mut AddressSpace,
+    va: u64,
+    phys: u64,
+) -> Result<(), MapError> {
+    if space.translate(va).is_some() {
+        // SAFETY: the caller guarantees no live reference derives from `va`.
+        unsafe { space.unmap(va)? };
+    }
+    // SAFETY: the caller guarantees `phys` is device memory.
+    unsafe {
+        space.map(
+            va,
+            phys,
+            PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_CACHE | PageFlags::NO_EXECUTE,
+            &mut || crate::frames::alloc(0),
+        )
+    }
+}

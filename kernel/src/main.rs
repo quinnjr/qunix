@@ -68,7 +68,7 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
 /// protocol allows it to span the low 4 GiB; either way the mapping this
 /// installs is the only one with guaranteed-uncacheable flags.
 pub fn map_lapic() {
-    use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+    use qunix_hal_x86_64::paging::AddressSpace;
 
     // Idempotency is tracked explicitly rather than inferred from the page
     // being present. `translate` reports presence, not cacheability, so an
@@ -83,37 +83,17 @@ pub fn map_lapic() {
     let phys = qunix_hal_x86_64::apic::phys_base();
     let va = hhdm + phys;
     let mut space = unsafe { AddressSpace::active(hhdm) };
-    // The Limine protocol permits the HHDM to span the low 4 GiB, which covers
-    // the LAPIC at 0xFEE0_0000, so a pre-existing mapping is a legal bootloader
-    // configuration rather than an error. It is still unusable as-is --
-    // `translate` reports presence, not cacheability, and a write-back mapping
-    // of the LAPIC silently corrupts register access -- so replace it instead
-    // of trusting it. `unmap`, not `unmap_and_prune`: these tables are the
-    // bootloader's, and pruning would hand firmware-owned frames to our
-    // allocator.
-    if space.translate(va).is_some() {
-        // SAFETY: nothing in the kernel has touched the LAPIC yet -- apic::init
-        // runs after this function -- so no reference derived from `va` exists.
-        unsafe {
-            space.unmap(va).expect(
-                "LAPIC page is covered by a huge HHDM mapping; cannot make it uncacheable \
-                 without splitting the parent entry",
-            );
-        }
-    }
-    unsafe {
-        space
-            .map(
-                va,
-                phys,
-                PageFlags::PRESENT
-                    | PageFlags::WRITABLE
-                    | PageFlags::NO_CACHE
-                    | PageFlags::NO_EXECUTE,
-                &mut || frames::alloc(0),
-            )
-            .expect("failed to map the local APIC");
-    }
+    // Why an existing mapping is replaced rather than trusted is on
+    // `map_device_page`; the LAPIC at 0xFEE0_0000 is inside the low 4 GiB the
+    // Limine HHDM is permitted to span, so a pre-existing mapping here is a
+    // legal bootloader configuration rather than an error.
+    // SAFETY: nothing in the kernel has touched the LAPIC yet -- `apic::init`
+    // runs after this function -- so no reference derived from `va` exists, and
+    // `phys` is the LAPIC's register window rather than RAM.
+    unsafe { crate::vmspace::map_device_page(&mut space, va, phys) }.expect(
+        "failed to map the local APIC uncacheable; it may be covered by a huge HHDM mapping, \
+         which cannot be made uncacheable without splitting the parent entry",
+    );
     LAPIC_MAPPED.store(true, Ordering::Release);
 }
 

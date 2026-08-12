@@ -507,7 +507,7 @@ fn map_window(phys: u64, len: u32) -> Option<Window> {
     if len == 0 {
         return None;
     }
-    use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+    use qunix_hal_x86_64::paging::AddressSpace;
     let hhdm = crate::boot::hhdm_offset();
     // SAFETY: reads the live CR3 and wraps it; nothing is dereferenced.
     let mut space = unsafe { AddressSpace::active(hhdm) };
@@ -516,33 +516,10 @@ fn map_window(phys: u64, len: u32) -> Option<Window> {
     let mut page = first;
     while page <= last {
         let va = hhdm + page;
-        if space.translate(va).is_some() {
-            // Limine's HHDM may already cover this range, and `translate`
-            // reports presence rather than cacheability -- a write-back mapping
-            // of device registers is unusable. Replaced rather than trusted,
-            // exactly as `map_lapic` does for the LAPIC page.
-            // SAFETY: nothing holds a reference derived from this address; the
-            // device has not been touched yet.
-            unsafe {
-                space.unmap(va).expect(
-                    "a virtio BAR is covered by a huge HHDM mapping; cannot make it \
-                     uncacheable without splitting the parent entry",
-                );
-            }
-        }
         // SAFETY: `page` is a device physical address from a BAR, not RAM, so
-        // no allocator owns it and no alias is created.
-        let mapped = unsafe {
-            space.map(
-                va,
-                page,
-                PageFlags::PRESENT
-                    | PageFlags::WRITABLE
-                    | PageFlags::NO_CACHE
-                    | PageFlags::NO_EXECUTE,
-                &mut || crate::frames::alloc(0),
-            )
-        };
+        // no allocator owns it and no alias is created, and nothing holds a
+        // reference derived from `va` -- the device has not been touched yet.
+        let mapped = unsafe { crate::vmspace::map_device_page(&mut space, va, page) };
         // Reported, not asserted. The failure this actually has is frame
         // exhaustion -- a resource condition, on a path whose every other
         // failure is a `ProbeError` the caller can act on -- so panicking here

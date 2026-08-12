@@ -213,9 +213,11 @@ static APIC_TO_CPU: [AtomicU32; MAX_CPUS as usize] =
 /// including one whose `GS.base` is zero and whose page tables are a user
 /// process's.
 pub fn initial_apic_id() -> u32 {
-    // SAFETY: `CPUID` is unconditionally available on x86-64 and leaf 1 is
-    // architectural. It touches no memory and faults on nothing.
-    let result = unsafe { core::arch::x86_64::__cpuid(1) };
+    // Safe: `CPUID` is unconditionally available on x86-64, leaf 1 is
+    // architectural, and the intrinsic is safe for exactly that reason. It
+    // touches no memory and faults on nothing, which is what makes it usable
+    // from a lock wait.
+    let result = core::arch::x86_64::__cpuid(1);
     result.ebx >> 24
 }
 
