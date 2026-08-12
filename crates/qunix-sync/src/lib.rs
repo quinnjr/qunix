@@ -3,6 +3,16 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+
+/// Spins a `deadlock-panic` build tolerates before calling a lock wedged.
+///
+/// Generous on purpose. Real contention here is a handful of critical sections
+/// tens of instructions long, so a hundred million iterations is several orders
+/// of magnitude beyond anything a live holder can take -- even under TCG, where
+/// every guest instruction is translated. Set low enough to fire on genuine
+/// contention it would turn a slow machine into a failing one.
+#[cfg(feature = "deadlock-panic")]
+const DEADLOCK_SPINS: u64 = 100_000_000;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -39,11 +49,36 @@ impl<T: ?Sized> SpinLock<T> {
     /// can be asserted.
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        // Bounded under `deadlock-panic`, unbounded otherwise.
+        //
+        // An unbounded spin is the right shipped behaviour and the worst
+        // possible test behaviour: a lock that is never released -- taken
+        // twice by one CPU, or with its word overwritten -- stops every
+        // processor here with interrupts masked, so no timer fires, no
+        // watchdog runs and no panic prints. The whole machine goes quiet and
+        // the harness reports only that QEMU never exited. That is exactly how
+        // this was found, and it cost a day of bisecting environments.
+        //
+        // The bound is not a timeout to recover from. It converts silence into
+        // a panic, and the panic's backtrace names the waiter -- including, for
+        // a recursive acquisition, the outer frame that already holds it.
+        #[cfg(feature = "deadlock-panic")]
+        let mut spins: u64 = 0;
         loop {
             if let Some(guard) = self.try_lock() {
                 return guard;
             }
             while self.locked.load(Ordering::Relaxed) {
+                #[cfg(feature = "deadlock-panic")]
+                {
+                    spins += 1;
+                    assert!(
+                        spins < DEADLOCK_SPINS,
+                        "spinlock still held after {DEADLOCK_SPINS} spins; nothing is going to \
+                         release it. Either this processor already holds it, or its word was \
+                         overwritten."
+                    );
+                }
                 core::hint::spin_loop();
             }
         }

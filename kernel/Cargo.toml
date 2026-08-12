@@ -20,7 +20,7 @@ test = true
 # switch that the shipped kernel does not have -- so the concurrency tests would
 # be measuring a different scheduler. `cargo xtask test` runs the suite both
 # with and without it.
-sched-invariants = []
+sched-invariants = ["qunix-sync/deadlock-panic"]
 
 [dependencies]
 limine.workspace = true
