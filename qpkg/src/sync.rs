@@ -74,6 +74,16 @@ pub mod http {
 
     use crate::error::{Error, Result};
 
+    /// Streaming variant for the build pipeline's `sources::Fetch` contract:
+    /// the body never has to exist in memory.
+    pub fn fetch_reader(url: &str) -> Result<Box<dyn Read + Send>> {
+        let response = ureq::get(url)
+            .timeout(Duration::from_secs(60))
+            .call()
+            .map_err(|e| Error::Network(format!("{url}: {e}")))?;
+        Ok(Box::new(response.into_reader()))
+    }
+
     pub fn fetch(url: &str) -> Result<Vec<u8>> {
         let response = ureq::get(url)
             .timeout(Duration::from_secs(60))

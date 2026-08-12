@@ -1,8 +1,13 @@
 //! Staging of `source=` entries: download, verify, extract — all in Rust,
 //! precisely so a PKGBUILD cannot skip its own checksum verification. The
 //! network edge is an injected closure; nothing here dials out on its own.
+//!
+//! Remote bodies are *streamed* to disk through an incremental hasher — a
+//! source tarball can be hundreds of MB and never needs to exist in memory —
+//! and independent remote entries download concurrently, then verify and
+//! extract in entry order so error selection stays deterministic.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,12 +16,70 @@ use blake2::Digest as _;
 use crate::error::{Error, Result};
 use crate::pkgbuild::Pkgbuild;
 
-pub type Fetch<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>>;
+/// Returns a body reader; `Sync` because remote entries fetch concurrently,
+/// `Send` on the reader because each is consumed on its own thread.
+pub type Fetch<'a> = &'a (dyn Fn(&str) -> Result<Box<dyn Read + Send>> + Sync);
+
+/// Drains a fetched body into memory — for the small payloads (PKGBUILDs,
+/// packaging support files) where buffering is the point, not a problem.
+pub fn fetch_bytes(fetch: Fetch, url: &str) -> Result<Vec<u8>> {
+    let mut reader = fetch(url)?;
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Network(format!("{url}: {e}")))?;
+    Ok(bytes)
+}
 
 enum Sums<'a> {
     Sha256(&'a [String]),
     B2(&'a [String]),
     None,
+}
+
+impl Sums<'_> {
+    fn expected(&self, i: usize) -> Option<&str> {
+        match self {
+            Sums::Sha256(s) | Sums::B2(s) => Some(s[i].as_str()),
+            Sums::None => None,
+        }
+    }
+}
+
+enum Hasher {
+    Sha(sha2::Sha256),
+    B2(blake2::Blake2b512),
+    None,
+}
+
+impl Hasher {
+    fn for_sums(sums: &Sums) -> Self {
+        match sums {
+            Sums::Sha256(_) => Hasher::Sha(sha2::Sha256::new()),
+            Sums::B2(_) => Hasher::B2(blake2::Blake2b512::new()),
+            Sums::None => Hasher::None,
+        }
+    }
+    fn update(&mut self, buf: &[u8]) {
+        match self {
+            Hasher::Sha(h) => h.update(buf),
+            Hasher::B2(h) => h.update(buf),
+            Hasher::None => {}
+        }
+    }
+    fn hex(self) -> Option<String> {
+        match self {
+            Hasher::Sha(h) => Some(hex::encode(h.finalize())),
+            Hasher::B2(h) => Some(hex::encode(h.finalize())),
+            Hasher::None => None,
+        }
+    }
+}
+
+enum Plan<'a> {
+    Remote { url: &'a str, name: String },
+    Local { file: &'a str, name: &'a str },
+    Git { url: &'a str, dest: Option<&'a str> },
 }
 
 /// Populates `workdir/src/` from the PKGBUILD's `source=` array: remote files
@@ -44,30 +107,115 @@ pub fn stage(pb: &Pkgbuild, pkgbuild_dir: &Path, workdir: &Path, fetch: Fetch) -
         }
     }
 
-    for (i, entry) in pb.source.iter().enumerate() {
-        let (dest, url) = match entry.split_once("::") {
-            Some((d, u)) => (Some(d), u),
-            None => (None, entry.as_str()),
-        };
-        if let Some(git_url) = url.strip_prefix("git+") {
-            stage_git(git_url, dest, &srcdir)?;
-        } else if url.contains("://") {
-            let bytes = fetch(url)?;
-            let name = dest.map(str::to_string).unwrap_or_else(|| remote_file_name(url));
-            verify(&sums, i, &name, &bytes)?;
-            let staged = srcdir.join(&name);
-            std::fs::write(&staged, &bytes)?;
-            extract_if_archive(&staged, &srcdir)?;
-        } else {
-            // A bare name is a file shipped beside the PKGBUILD.
-            let name = dest.unwrap_or(url);
-            let bytes = std::fs::read(pkgbuild_dir.join(url)).map_err(|e| {
-                Error::Extraction(format!("local source {url}: {e}"))
-            })?;
-            verify(&sums, i, name, &bytes)?;
-            let staged = srcdir.join(name);
-            std::fs::write(&staged, &bytes)?;
-            extract_if_archive(&staged, &srcdir)?;
+    let plans: Vec<(usize, Plan)> = pb
+        .source
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let (dest, url) = match entry.split_once("::") {
+                Some((d, u)) => (Some(d), u),
+                None => (None, entry.as_str()),
+            };
+            let plan = if let Some(git_url) = url.strip_prefix("git+") {
+                Plan::Git { url: git_url, dest }
+            } else if url.contains("://") {
+                let name = dest.map(str::to_string).unwrap_or_else(|| remote_file_name(url));
+                Plan::Remote { url, name }
+            } else {
+                Plan::Local { file: url, name: dest.unwrap_or(url) }
+            };
+            (i, plan)
+        })
+        .collect();
+
+    // Remote entries first, concurrently: each thread streams its body to its
+    // own staged file through the hasher. Verification result is collected
+    // per entry and judged in entry order afterwards, so which error wins is
+    // the same as it was when this loop was serial.
+    let remote_failures: Vec<(usize, Error)> = std::thread::scope(|s| {
+        let handles: Vec<_> = plans
+            .iter()
+            .filter_map(|(i, plan)| match plan {
+                Plan::Remote { url, name } => {
+                    let staged = srcdir.join(name);
+                    let sums = &sums;
+                    Some((
+                        *i,
+                        s.spawn(move || stream_verified(fetch, url, name, &staged, sums, *i)),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|(i, h)| match h.join().expect("fetch thread panicked") {
+                Ok(()) => None,
+                Err(e) => Some((i, e)),
+            })
+            .collect()
+    });
+    if let Some((_, err)) = remote_failures.into_iter().min_by_key(|(i, _)| *i) {
+        return Err(err);
+    }
+
+    // Everything else — and extraction of the fetched archives — runs in
+    // entry order.
+    for (i, plan) in &plans {
+        match plan {
+            Plan::Remote { name, .. } => {
+                extract_if_archive(&srcdir.join(name), &srcdir)?;
+            }
+            Plan::Local { file, name } => {
+                let bytes = std::fs::read(pkgbuild_dir.join(file))
+                    .map_err(|e| Error::Extraction(format!("local source {file}: {e}")))?;
+                verify_bytes(&sums, *i, name, &bytes)?;
+                let staged = srcdir.join(name);
+                std::fs::write(&staged, &bytes)?;
+                extract_if_archive(&staged, &srcdir)?;
+            }
+            Plan::Git { url, dest } => stage_git(url, *dest, &srcdir)?,
+        }
+    }
+    Ok(())
+}
+
+/// Streams one remote body to `staged`, hashing as it lands; a checksum
+/// mismatch deletes the file so a refused download leaves nothing behind.
+fn stream_verified(
+    fetch: Fetch,
+    url: &str,
+    name: &str,
+    staged: &Path,
+    sums: &Sums,
+    i: usize,
+) -> Result<()> {
+    let mut reader = fetch(url)?;
+    let expected = sums.expected(i);
+    let mut hasher = match expected {
+        Some(e) if e != "SKIP" => Hasher::for_sums(sums),
+        _ => Hasher::None,
+    };
+    let mut file = std::fs::File::create(staged)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| Error::Network(format!("{url}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n])?;
+    }
+    file.flush()?;
+    drop(file);
+    if let (Some(expected), Some(got)) = (expected, hasher.hex()) {
+        if !expected.eq_ignore_ascii_case(&got) {
+            let _ = std::fs::remove_file(staged);
+            return Err(Error::ChecksumMismatch {
+                file: name.to_string(),
+                expected: expected.to_string(),
+                got,
+            });
         }
     }
     Ok(())
@@ -119,18 +267,24 @@ fn remote_file_name(url: &str) -> String {
     no_query.rsplit('/').next().unwrap_or(no_query).to_string()
 }
 
-fn verify(sums: &Sums, i: usize, file: &str, bytes: &[u8]) -> Result<()> {
-    let (expected, got) = match sums {
-        Sums::Sha256(s) => (&s[i], hex::encode(sha2::Sha256::digest(bytes))),
-        Sums::B2(s) => (&s[i], hex::encode(blake2::Blake2b512::digest(bytes))),
-        Sums::None => return Ok(()),
+fn verify_bytes(sums: &Sums, i: usize, file: &str, bytes: &[u8]) -> Result<()> {
+    let Some(expected) = sums.expected(i) else {
+        return Ok(());
     };
-    if expected == "SKIP" || expected.eq_ignore_ascii_case(&got) {
+    if expected == "SKIP" {
+        return Ok(());
+    }
+    let got = match sums {
+        Sums::Sha256(_) => hex::encode(sha2::Sha256::digest(bytes)),
+        Sums::B2(_) => hex::encode(blake2::Blake2b512::digest(bytes)),
+        Sums::None => unreachable!("expected() returned Some for Sums::None"),
+    };
+    if expected.eq_ignore_ascii_case(&got) {
         Ok(())
     } else {
         Err(Error::ChecksumMismatch {
             file: file.to_string(),
-            expected: expected.clone(),
+            expected: expected.to_string(),
             got,
         })
     }
@@ -173,7 +327,7 @@ fn extract_if_archive(path: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{gzipped, tar_bytes};
+    use crate::testutil::{body, gzipped, tar_bytes};
 
     fn pb(source: &[&str], sha256sums: &[&str]) -> Pkgbuild {
         Pkgbuild {
@@ -190,7 +344,7 @@ mod tests {
         hex::encode(sha2::Sha256::digest(bytes))
     }
 
-    fn no_fetch(url: &str) -> Result<Vec<u8>> {
+    fn no_fetch(url: &str) -> Result<Box<dyn Read + Send>> {
         panic!("unexpected fetch of {url}")
     }
 
@@ -203,7 +357,7 @@ mod tests {
         let fetched = archive.clone();
         stage(&pb, dir.path(), dir.path(), &move |url| {
             assert_eq!(url, "https://example.com/dl/hello-1.tar.gz?ref=x");
-            Ok(fetched.clone())
+            Ok(body(&fetched))
         })
         .unwrap();
         // Extracted tree AND the archive itself, query string stripped.
@@ -218,7 +372,7 @@ mod tests {
         let content = b"--- a\n+++ b\n".to_vec();
         let pb = pb(&["https://example.com/fix.patch"], &[&sha(&content)]);
         let fetched = content.clone();
-        stage(&pb, dir.path(), dir.path(), &move |_| Ok(fetched.clone())).unwrap();
+        stage(&pb, dir.path(), dir.path(), &move |_| Ok(body(&fetched))).unwrap();
         assert!(dir.path().join("src/fix.patch").exists());
     }
 
@@ -243,7 +397,7 @@ mod tests {
         let archive = gzipped(&tar_bytes(&[("evil-1/payload", "boom")]));
         let pb = pb(&["https://example.com/evil-1.tar.gz"], &[&"0".repeat(64)]);
         let fetched = archive.clone();
-        let err = stage(&pb, dir.path(), dir.path(), &move |_| Ok(fetched.clone())).unwrap_err();
+        let err = stage(&pb, dir.path(), dir.path(), &move |_| Ok(body(&fetched))).unwrap_err();
         match err {
             Error::ChecksumMismatch { file, expected, got } => {
                 assert_eq!(file, "evil-1.tar.gz");
@@ -252,7 +406,8 @@ mod tests {
             }
             other => panic!("expected ChecksumMismatch, got {other:?}"),
         }
-        // The payload never touched the source tree.
+        // The payload never touched the source tree — the refused download
+        // is deleted, not merely unextracted.
         assert!(!dir.path().join("src/evil-1/payload").exists());
         assert!(!dir.path().join("src/evil-1.tar.gz").exists());
     }
@@ -267,7 +422,11 @@ mod tests {
         );
         let fetched = good.clone();
         stage(&skipped, dir.path(), dir.path(), &move |url| {
-            Ok(if url.ends_with("a.bin") { b"anything at all".to_vec() } else { fetched.clone() })
+            Ok(if url.ends_with("a.bin") {
+                body(b"anything at all")
+            } else {
+                body(&fetched)
+            })
         })
         .unwrap();
         // Negative: SKIP on one entry does not blind the other.
@@ -275,8 +434,24 @@ mod tests {
             &["https://example.com/a.bin", "https://example.com/b.bin"],
             &["SKIP", &"1".repeat(64)],
         );
-        let err = stage(&wrong, dir.path(), dir.path(), &|_| Ok(b"x".to_vec())).unwrap_err();
+        let err = stage(&wrong, dir.path(), dir.path(), &|_| Ok(body(b"x"))).unwrap_err();
         assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn the_lowest_index_failure_wins_under_concurrent_fetches() {
+        // Both remote entries fail verification; the reported error must be
+        // entry 0's regardless of which thread finished first.
+        let dir = tempfile::tempdir().unwrap();
+        let pb = pb(
+            &["https://example.com/first.bin", "https://example.com/second.bin"],
+            &[&"0".repeat(64), &"1".repeat(64)],
+        );
+        let err = stage(&pb, dir.path(), dir.path(), &|_| Ok(body(b"neither"))).unwrap_err();
+        match err {
+            Error::ChecksumMismatch { file, .. } => assert_eq!(file, "first.bin"),
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -295,11 +470,11 @@ mod tests {
         let mut pkg = pb(&["https://example.com/f.bin"], &[]);
         pkg.b2sums = vec![b2];
         let fetched = content.clone();
-        stage(&pkg, dir.path(), dir.path(), &move |_| Ok(fetched.clone())).unwrap();
+        stage(&pkg, dir.path(), dir.path(), &move |_| Ok(body(&fetched))).unwrap();
         // Negative: a wrong b2 refuses too.
         let mut pkg = pb(&["https://example.com/f.bin"], &[]);
         pkg.b2sums = vec!["f".repeat(128)];
-        let err = stage(&pkg, dir.path(), dir.path(), &|_| Ok(b"blake me".to_vec())).unwrap_err();
+        let err = stage(&pkg, dir.path(), dir.path(), &|_| Ok(body(b"blake me"))).unwrap_err();
         assert!(matches!(err, Error::ChecksumMismatch { .. }));
     }
 

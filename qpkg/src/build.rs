@@ -25,7 +25,7 @@ pub fn run(index: &Index, name: &str, no_rewrite: bool, now: u64) -> Result<Path
         index,
         name,
         no_rewrite,
-        &sync::http::fetch,
+        &sync::http::fetch_reader,
         &paths::artifacts_dir(),
         &workdir,
         &env,
@@ -74,7 +74,9 @@ pub fn build_inner(
             let file = entry.split_once("::").map(|(d, _)| d).unwrap_or(entry.as_str());
             if !entry.contains("://") && !entry.starts_with("git+") {
                 let url = official_raw_url(&rec.package_base, &rec.version, file);
-                let bytes = fetch(&url)?;
+                // Buffered on purpose: these are KB-scale packaging files and
+                // the HTML sniff needs the head bytes in hand.
+                let bytes = sources::fetch_bytes(fetch, &url)?;
                 refuse_html(&url, &bytes)?;
                 std::fs::write(pkgbuild_dir.join(file), bytes)?;
             }
@@ -100,14 +102,14 @@ fn fetch_pkgbuild(rec: &PackageRecord, workdir: &Path, fetch: Fetch) -> Result<(
     match rec.repo {
         Repo::Core | Repo::Extra => {
             let url = official_raw_url(&rec.package_base, &rec.version, "PKGBUILD");
-            let bytes = fetch(&url)?;
+            let bytes = sources::fetch_bytes(fetch, &url)?;
             refuse_html(&url, &bytes)?;
             Ok((bytes, workdir.to_path_buf()))
         }
         Repo::Aur => {
             // The snapshot tarball carries the PKGBUILD *and* its local
             // support files; unpack the whole thing.
-            let bytes = fetch(&crate::aur::snapshot_url(&rec.package_base))?;
+            let bytes = sources::fetch_bytes(fetch, &crate::aur::snapshot_url(&rec.package_base))?;
             let gz = flate2::read::GzDecoder::new(bytes.as_slice());
             let mut archive = tar::Archive::new(gz);
             archive
@@ -177,7 +179,7 @@ pub fn outdated(index: &Index, out: &mut impl Write) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{gzipped, tar_bytes};
+    use crate::testutil::{body, gzipped, tar_bytes};
 
     fn minimal_env(workdir: &Path) -> Vec<(String, String)> {
         vec![
@@ -227,7 +229,7 @@ mod tests {
                     url.starts_with("https://gitlab.archlinux.org/archlinux/packaging/packages/hello/-/raw/1-2/"),
                     "official fetch goes to the version tag: {url}"
                 );
-                Ok(pkgbuild.as_bytes().to_vec())
+                Ok(body(pkgbuild.as_bytes()))
             },
             &dir.join("artifacts"),
             &workdir,
@@ -306,7 +308,7 @@ mod tests {
             false,
             &move |url| {
                 assert_eq!(url, "https://aur.archlinux.org/cgit/aur.git/snapshot/hello.tar.gz");
-                Ok(snapshot_clone.clone())
+                Ok(body(&snapshot_clone))
             },
             &dir.path().join("artifacts"),
             &workdir,
@@ -340,7 +342,7 @@ mod tests {
             &index,
             "hello",
             false,
-            &|_| Ok(b"<!DOCTYPE html>\n<html>sign in please</html>".to_vec()),
+            &|_| Ok(body(b"<!DOCTYPE html>\n<html>sign in please</html>")),
             &dir.path().join("artifacts"),
             &workdir,
             &env,

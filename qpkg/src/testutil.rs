@@ -2,7 +2,12 @@
 //! in memory with the same crates the parsers read them with — no binary
 //! fixtures in git.
 
-use std::io::Write;
+use std::io::{Read, Write};
+
+/// A fetched body for stubbing the `sources::Fetch` contract.
+pub fn body(bytes: &[u8]) -> Box<dyn Read + Send> {
+    Box::new(std::io::Cursor::new(bytes.to_vec()))
+}
 
 pub fn desc(fields: &[(&str, &[&str])]) -> String {
     let mut out = String::new();
