@@ -6,6 +6,7 @@ mod index;
 mod paths;
 mod pkgbuild;
 mod repodb;
+mod runner;
 mod sources;
 mod sync;
 mod toolchain;
