@@ -1,5 +1,6 @@
 mod artifact;
 mod aur;
+mod build;
 mod cli;
 mod commands;
 mod error;
@@ -19,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
-use error::{Error, Result};
+use error::Result;
 use index::Index;
 
 fn main() {
@@ -50,8 +51,24 @@ fn run() -> Result<()> {
         cli::Command::Info { name } => {
             commands::info(&index, &name, &mut out, &mut warn, now_unix())
         }
-        cli::Command::Build { .. } | cli::Command::Update { .. } => Err(Error::Index(
-            "this build of qpkg predates its build pipeline".into(),
-        )),
+        cli::Command::Build { name, no_rewrite } => {
+            let artifact = build::run(&index, &name, no_rewrite, now_unix())?;
+            println!("built {}", artifact.display());
+            Ok(())
+        }
+        cli::Command::Update { build: rebuild } => {
+            let report = sync::run(&index, &sync::SyncConfig::default(), now_unix())?;
+            eprintln!("synced {} official and {} AUR packages", report.official, report.aur);
+            let names = build::outdated(&index, &mut out)?;
+            if names.is_empty() {
+                println!("everything built is current");
+            } else if rebuild {
+                for name in names {
+                    let artifact = build::run(&index, &name, false, now_unix())?;
+                    println!("rebuilt {}", artifact.display());
+                }
+            }
+            Ok(())
+        }
     }
 }
