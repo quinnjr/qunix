@@ -819,6 +819,10 @@ name = "qunix-abi"
 version = "0.1.0"
 
 [[package]]
+name = "qunix-bcache"
+version = "0.1.0"
+
+[[package]]
 name = "qunix-elf"
 version = "0.1.0"
 
