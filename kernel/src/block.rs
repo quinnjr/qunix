@@ -833,16 +833,21 @@ mod tests {
         // whole number of sectors makes the device write past its end -- and it
         // will, because nothing between here and the DMA engine checks.
         ready();
-        let mut short = [0u8; SECTOR_BYTES - 1];
+        // On the heap, not the stack. Between them these buffers are 8.7 KiB in
+        // one frame -- more than any other test here -- and Limine's stack has
+        // no guard page, so overrunning it corrupts whatever lies below instead
+        // of faulting. A kernel test that needs kilobytes of buffer asks the
+        // allocator for them.
+        let mut short = alloc::vec![0u8; SECTOR_BYTES - 1];
         assert_eq!(block_on(read_at(0, &mut short)), Err(BlockError::Unaligned));
         let mut empty = [0u8; 0];
         assert_eq!(block_on(read_at(0, &mut empty)), Err(BlockError::Unaligned));
         assert_eq!(MAX_SECTORS * SECTOR_BYTES, SLOT_BYTES, "MAX_SECTORS does not describe the bound");
-        let mut huge = [0u8; SLOT_BYTES + SECTOR_BYTES];
+        let mut huge = alloc::vec![0u8; SLOT_BYTES + SECTOR_BYTES];
         assert_eq!(block_on(read_at(0, &mut huge)), Err(BlockError::TooLarge));
         // The largest legal transfer is accepted, so the bound cannot drift
         // downward and refuse a request it should carry.
-        let mut biggest = [0u8; SLOT_BYTES];
+        let mut biggest = alloc::vec![0u8; SLOT_BYTES];
         block_on(read_at(0, &mut biggest)).expect("the largest legal read was refused");
         assert_eq!(u64::from_le_bytes(biggest[0..8].try_into().unwrap()), 0);
         assert_eq!(
