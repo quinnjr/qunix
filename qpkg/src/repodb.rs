@@ -48,6 +48,7 @@ pub fn parse_repo_db(mut reader: impl Read, repo: Repo) -> Result<Vec<PackageRec
 /// malformed entry must not sink the other few thousand.
 fn parse_desc(text: &str, repo: Repo) -> Option<PackageRecord> {
     let mut name = None;
+    let mut base = None;
     let mut version = None;
     let mut description = String::new();
     let mut url = String::new();
@@ -66,6 +67,7 @@ fn parse_desc(text: &str, repo: Repo) -> Option<PackageRecord> {
         }
         match field {
             Some("NAME") => name = Some(line.to_string()),
+            Some("BASE") => base = Some(line.to_string()),
             Some("VERSION") => version = Some(line.to_string()),
             Some("DESC") => description = line.to_string(),
             Some("URL") => url = line.to_string(),
@@ -74,8 +76,11 @@ fn parse_desc(text: &str, repo: Repo) -> Option<PackageRecord> {
             _ => {}
         }
     }
+    let name = name?;
     Some(PackageRecord {
-        name: name?,
+        // A desc without %BASE% is a non-split package: its base is itself.
+        package_base: base.unwrap_or_else(|| name.clone()),
+        name,
         version: version?,
         repo,
         description,
@@ -130,6 +135,7 @@ mod tests {
     fn sample_tar() -> Vec<u8> {
         let zsh = desc(&[
             ("NAME", &["zsh"]),
+            ("BASE", &["zsh"]),
             ("VERSION", &["5.9-5"]),
             ("DESC", &["A very advanced and programmable command interpreter"]),
             ("URL", &["https://www.zsh.org/"]),
@@ -156,6 +162,8 @@ mod tests {
         assert_eq!(zsh.makedepends, ["yodl"]);
         assert_eq!(zsh.url, "https://www.zsh.org/");
         let tiny = records.iter().find(|r| r.name == "tiny").unwrap();
+        // No %BASE% means the package is its own base.
+        assert_eq!(tiny.package_base, "tiny");
         assert_eq!(tiny.description, "");
         assert!(tiny.depends.is_empty());
         // Negative: nothing invented a record from the `files` entry.

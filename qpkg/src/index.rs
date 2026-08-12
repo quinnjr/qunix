@@ -37,6 +37,10 @@ pub struct PackageRecord {
     pub name: String,
     pub version: String,
     pub repo: Repo,
+    /// The pkgbase this package's PKGBUILD lives under — differs from `name`
+    /// for split packages, and PKGBUILDs are only fetchable by base.
+    #[serde(default)]
+    pub package_base: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -216,6 +220,7 @@ mod tests {
     fn record(name: &str, version: &str, repo: Repo, description: &str) -> PackageRecord {
         PackageRecord {
             name: name.into(),
+            package_base: name.into(),
             version: version.into(),
             repo,
             description: description.into(),

@@ -1,3 +1,4 @@
+mod aur;
 mod cli;
 mod error;
 mod paths;
