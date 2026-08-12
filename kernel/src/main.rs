@@ -50,6 +50,10 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // after `preempt` would let this processor pick its next thread while the
     // one this tick released was still parked.
     crate::task::expire_timers(now);
+    // After the timers, so a tick that both expires a sleep and reaches the
+    // deadline reports the sleep as woken rather than as stuck.
+    #[cfg(test)]
+    crate::testing::watchdog_check(now);
     // EOI before any switch. Switching first would leave the LAPIC waiting for
     // an EOI that only arrives when this thread runs again, so the CPU would
     // take no further timer interrupts until then -- which, if the thread is

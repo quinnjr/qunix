@@ -274,6 +274,71 @@ impl MachineState {
     }
 }
 
+/// Ticks a single test may take before the watchdog declares it wedged.
+///
+/// TICKS is bumped by every processor, so with `-smp 4` at 10 ms this is
+/// roughly fifteen seconds -- two orders of magnitude more than the whole suite
+/// needs, and comfortably inside the harness's own budget so that the kernel
+/// gets to say what happened first.
+const WATCHDOG_TICKS: u64 = 6000;
+
+/// Deadline for the running test, or 0 when no test is in flight.
+static WATCHDOG_DEADLINE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// The running test's name, as a `&'static str` split into pointer and length.
+static WATCHDOG_NAME: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static WATCHDOG_NAME_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Fails the run, from the timer interrupt, when a test stops making progress.
+///
+/// The harness signals its verdict with one port write, so a thread that parks
+/// on a wakeup that never arrives produces no verdict at all: QEMU is killed by
+/// the host after two minutes and the error names no test. This project's own
+/// notes call that the worst diagnostic it produces, and it is what a lost
+/// wakeup looks like every time.
+///
+/// Called from the timer handler, which is the only context that still runs
+/// when every thread is blocked -- the point of the check is precisely that
+/// nothing else is executing. Taking the scheduler lock here is sound because
+/// it is an `IrqSpinLock`: a processor holding it has interrupts masked and
+/// cannot be interrupted into this function.
+pub fn watchdog_check(now: u64) {
+    use core::sync::atomic::Ordering;
+    let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
+    if deadline == 0 || now < deadline {
+        return;
+    }
+    // Disarmed before reporting: every processor runs this, and the report
+    // itself must not be re-entered by the next tick.
+    WATCHDOG_DEADLINE.store(0, Ordering::Relaxed);
+    let ptr = WATCHDOG_NAME.load(Ordering::Relaxed) as *const u8;
+    let len = WATCHDOG_NAME_LEN.load(Ordering::Relaxed);
+    // SAFETY: the pair was published from a `&'static str` by `arm_watchdog`,
+    // and a `'static` name outlives every tick that can read it.
+    let name = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) };
+    let parked = crate::sched::parked_thread_ids();
+    panic!(
+        "{name} made no progress for {WATCHDOG_TICKS} ticks; parked threads: {parked:?}. \
+         A test that stops here is blocked on a wakeup that never arrived, not slow."
+    );
+}
+
+fn arm_watchdog(name: &'static str) {
+    use core::sync::atomic::Ordering;
+    WATCHDOG_NAME.store(name.as_ptr() as usize, Ordering::Relaxed);
+    WATCHDOG_NAME_LEN.store(name.len(), Ordering::Relaxed);
+    WATCHDOG_DEADLINE.store(
+        crate::TICKS.load(Ordering::Relaxed) + WATCHDOG_TICKS,
+        Ordering::Relaxed,
+    );
+}
+
+fn disarm_watchdog() {
+    WATCHDOG_DEADLINE.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub trait Testable {
     fn run(&self);
 }
@@ -282,6 +347,7 @@ impl<T: Fn()> Testable for T {
     fn run(&self) {
         let name = core::any::type_name::<T>();
         print!("{name} ... ");
+        arm_watchdog(name);
         // Cleared before the body, not after: a declaration left behind by a
         // test that never reached its `expect_process_kills` would otherwise
         // excuse a kill in the *next* test.
@@ -291,6 +357,7 @@ impl<T: Fn()> Testable for T {
         // After the test body and before "ok" is printed, so a leak is
         // attributed to the test that caused it rather than to whichever test
         // later trips over it.
+        disarm_watchdog();
         let expected = EXPECTED_KILLS.swap(0, core::sync::atomic::Ordering::AcqRel);
         MachineState::capture().assert_restored(&before, name, expected);
         assert_no_thread_runs_twice(name);
