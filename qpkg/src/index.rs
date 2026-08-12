@@ -114,27 +114,50 @@ impl Index {
     /// name match sorts first, then name substrings, then description-only
     /// hits; ties stay in name order because the table iterates sorted.
     pub fn search(&self, term: &str) -> Result<Vec<PackageRecord>> {
-        let needle = term.to_lowercase();
         let tx = self.db.begin_read().map_err(idx)?;
         let table = tx.open_table(PACKAGES).map_err(idx)?;
-        let mut hits: Vec<(u8, PackageRecord)> = Vec::new();
-        for entry in table.iter().map_err(idx)? {
+        ranked_hits(&table, term)
+    }
+
+    /// Search plus built-status under one read transaction: the CLI shows a
+    /// built marker per hit, and a broad term returns hundreds of hits —
+    /// each must not pay its own transaction and table open.
+    pub fn search_with_built(
+        &self,
+        term: &str,
+    ) -> Result<Vec<(PackageRecord, Option<BuiltRecord>)>> {
+        let tx = self.db.begin_read().map_err(idx)?;
+        let packages = tx.open_table(PACKAGES).map_err(idx)?;
+        let built = tx.open_table(BUILT).map_err(idx)?;
+        ranked_hits(&packages, term)?
+            .into_iter()
+            .map(|rec| {
+                let b = match built.get(rec.name.as_str()).map_err(idx)? {
+                    Some(v) => Some(decode(v.value())?),
+                    None => None,
+                };
+                Ok((rec, b))
+            })
+            .collect()
+    }
+
+    /// Every built package paired with its current upstream record, under one
+    /// read transaction — the update check's whole working set in one pass.
+    pub fn built_with_upstream(&self) -> Result<Vec<(BuiltRecord, Option<PackageRecord>)>> {
+        let tx = self.db.begin_read().map_err(idx)?;
+        let built = tx.open_table(BUILT).map_err(idx)?;
+        let packages = tx.open_table(PACKAGES).map_err(idx)?;
+        let mut out = Vec::new();
+        for entry in built.iter().map_err(idx)? {
             let (_, v) = entry.map_err(idx)?;
-            let rec: PackageRecord = decode(v.value())?;
-            let name = rec.name.to_lowercase();
-            let rank = if name == needle {
-                0
-            } else if name.contains(&needle) {
-                1
-            } else if rec.description.to_lowercase().contains(&needle) {
-                2
-            } else {
-                continue;
+            let rec: BuiltRecord = decode(v.value())?;
+            let upstream = match packages.get(rec.name.as_str()).map_err(idx)? {
+                Some(v) => Some(decode(v.value())?),
+                None => None,
             };
-            hits.push((rank, rec));
+            out.push((rec, upstream));
         }
-        hits.sort_by_key(|(rank, _)| *rank);
-        Ok(hits.into_iter().map(|(_, rec)| rec).collect())
+        Ok(out)
     }
 
     pub fn record_built(&self, rec: &BuiltRecord) -> Result<()> {
@@ -211,6 +234,32 @@ impl Index {
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(idx)
+}
+
+/// The one full-table ranking pass, shared by every search entry point.
+fn ranked_hits(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    term: &str,
+) -> Result<Vec<PackageRecord>> {
+    let needle = term.to_lowercase();
+    let mut hits: Vec<(u8, PackageRecord)> = Vec::new();
+    for entry in table.iter().map_err(idx)? {
+        let (_, v) = entry.map_err(idx)?;
+        let rec: PackageRecord = decode(v.value())?;
+        let name = rec.name.to_lowercase();
+        let rank = if name == needle {
+            0
+        } else if name.contains(&needle) {
+            1
+        } else if rec.description.to_lowercase().contains(&needle) {
+            2
+        } else {
+            continue;
+        };
+        hits.push((rank, rec));
+    }
+    hits.sort_by_key(|(rank, _)| *rank);
+    Ok(hits.into_iter().map(|(_, rec)| rec).collect())
 }
 
 #[cfg(test)]

@@ -26,8 +26,8 @@ pub fn search(
     now: u64,
 ) -> Result<()> {
     warn_if_stale(index, warn, now)?;
-    for rec in index.search(term)? {
-        let built = match index.built(&rec.name)? {
+    for (rec, built) in index.search_with_built(term)? {
+        let built = match built {
             Some(b) => format!("  [built {}]", b.version_built),
             None => String::new(),
         };

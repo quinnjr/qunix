@@ -161,8 +161,8 @@ fn refuse_html(url: &str, bytes: &[u8]) -> Result<()> {
 /// the built one. The caller decides whether reporting turns into rebuilding.
 pub fn outdated(index: &Index, out: &mut impl Write) -> Result<Vec<String>> {
     let mut names = Vec::new();
-    for built in index.all_built()? {
-        let Some(rec) = index.get(&built.name)? else {
+    for (built, upstream) in index.built_with_upstream()? {
+        let Some(rec) = upstream else {
             // Dropped from the repos entirely; not an update.
             continue;
         };
