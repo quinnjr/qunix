@@ -306,7 +306,7 @@ static WATCHDOG_NAME_LEN: core::sync::atomic::AtomicUsize =
 /// cannot be interrupted into this function.
 pub fn watchdog_check(now: u64) {
     use core::sync::atomic::Ordering;
-    let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
+    let deadline = WATCHDOG_DEADLINE.load(Ordering::Acquire);
     if deadline == 0 || now < deadline {
         return;
     }
@@ -315,6 +315,12 @@ pub fn watchdog_check(now: u64) {
     WATCHDOG_DEADLINE.store(0, Ordering::Relaxed);
     let ptr = WATCHDOG_NAME.load(Ordering::Relaxed) as *const u8;
     let len = WATCHDOG_NAME_LEN.load(Ordering::Relaxed);
+    // Both were published before the deadline, which was stored with `Release`
+    // and loaded above with `Acquire`, so a processor that sees a deadline sees
+    // the pair that belongs to it. Without that pairing a stale pointer could
+    // meet a longer name's length and the panic path would read past the end of
+    // a string literal -- in the one situation where the kernel has nothing
+    // left to report with.
     // SAFETY: the pair was published from a `&'static str` by `arm_watchdog`,
     // and a `'static` name outlives every tick that can read it.
     let name = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) };
@@ -329,9 +335,12 @@ fn arm_watchdog(name: &'static str) {
     use core::sync::atomic::Ordering;
     WATCHDOG_NAME.store(name.as_ptr() as usize, Ordering::Relaxed);
     WATCHDOG_NAME_LEN.store(name.len(), Ordering::Relaxed);
+    // `Release`, and stored last: it is what makes the name visible. The two
+    // stores above are plain, so nothing but this ordering stops another
+    // processor pairing a new deadline with the previous test's name.
     WATCHDOG_DEADLINE.store(
         crate::TICKS.load(Ordering::Relaxed) + WATCHDOG_TICKS,
-        Ordering::Relaxed,
+        Ordering::Release,
     );
 }
 
