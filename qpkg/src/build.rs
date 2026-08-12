@@ -52,6 +52,11 @@ pub fn build_inner(
     let rec = index
         .get(name)?
         .ok_or_else(|| Error::Index(format!("{name} is not in the index (try `qpkg sync`)")))?;
+    // A previous build's tree — possibly of an older version — must not leak
+    // into this one's staging.
+    if workdir.exists() {
+        std::fs::remove_dir_all(workdir)?;
+    }
     std::fs::create_dir_all(workdir)?;
 
     // pkgbuild_dir is where local `source=` files live: the snapshot checkout
@@ -95,6 +100,12 @@ pub fn build_inner(
         artifact_path: artifact_path.clone(),
         built_at_unix: now,
     })?;
+    // Success: the extracted sources and install tree — hundreds of MB for a
+    // real package — have served their purpose. The PKGBUILD and build.log
+    // stay for provenance; every tree stays on *failure*, which is when
+    // inspection matters.
+    let _ = std::fs::remove_dir_all(workdir.join("src"));
+    let _ = std::fs::remove_dir_all(workdir.join("pkg"));
     Ok((artifact_path, rewrites))
 }
 
@@ -319,6 +330,27 @@ mod tests {
         assert!(artifact.exists());
         // The local source came out of the snapshot, checksum-verified.
         assert_eq!(index.built("hello").unwrap().unwrap().version_built, "1-2");
+    }
+
+    #[test]
+    fn success_cleans_the_staging_trees_and_failure_keeps_them() {
+        let (dir, index) = seeded(Repo::Core, "1-2");
+        build_hello(&index, dir.path(), GOOD_PKGBUILD, false).unwrap();
+        let work = dir.path().join("work");
+        assert!(!work.join("src").exists());
+        assert!(!work.join("pkg").exists());
+        // Provenance survives cleanup.
+        assert!(work.join("PKGBUILD").exists());
+        assert!(work.join("build.log").exists());
+
+        // Negative: a failed build leaves the whole tree for inspection.
+        let (dir, index) = seeded(Repo::Core, "1-2");
+        const BAD: &str = concat!(
+            "pkgname=hello\npkgver=1\npkgrel=2\narch=(any)\n",
+            "build() { mkdir -p \"$srcdir/half\"; false; }\npackage() { :; }\n",
+        );
+        build_hello(&index, dir.path(), BAD, false).unwrap_err();
+        assert!(dir.path().join("work/src/half").exists());
     }
 
     #[test]
