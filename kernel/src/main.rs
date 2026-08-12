@@ -15,7 +15,9 @@ mod process;
 mod sched;
 mod smp;
 mod syscall;
+mod block;
 mod task;
+mod virtio;
 mod thread;
 mod vmspace;
 mod testing;
@@ -48,6 +50,10 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // after `preempt` would let this processor pick its next thread while the
     // one this tick released was still parked.
     crate::task::expire_timers(now);
+    // After the timers, so a tick that both expires a sleep and reaches the
+    // deadline reports the sleep as woken rather than as stuck.
+    #[cfg(test)]
+    crate::testing::watchdog_check(now);
     // EOI before any switch. Switching first would leave the LAPIC waiting for
     // an EOI that only arrives when this thread runs again, so the CPU would
     // take no further timer interrupts until then -- which, if the thread is
@@ -62,7 +68,7 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
 /// protocol allows it to span the low 4 GiB; either way the mapping this
 /// installs is the only one with guaranteed-uncacheable flags.
 pub fn map_lapic() {
-    use qunix_hal_x86_64::paging::{AddressSpace, PageFlags};
+    use qunix_hal_x86_64::paging::AddressSpace;
 
     // Idempotency is tracked explicitly rather than inferred from the page
     // being present. `translate` reports presence, not cacheability, so an
@@ -77,37 +83,17 @@ pub fn map_lapic() {
     let phys = qunix_hal_x86_64::apic::phys_base();
     let va = hhdm + phys;
     let mut space = unsafe { AddressSpace::active(hhdm) };
-    // The Limine protocol permits the HHDM to span the low 4 GiB, which covers
-    // the LAPIC at 0xFEE0_0000, so a pre-existing mapping is a legal bootloader
-    // configuration rather than an error. It is still unusable as-is --
-    // `translate` reports presence, not cacheability, and a write-back mapping
-    // of the LAPIC silently corrupts register access -- so replace it instead
-    // of trusting it. `unmap`, not `unmap_and_prune`: these tables are the
-    // bootloader's, and pruning would hand firmware-owned frames to our
-    // allocator.
-    if space.translate(va).is_some() {
-        // SAFETY: nothing in the kernel has touched the LAPIC yet -- apic::init
-        // runs after this function -- so no reference derived from `va` exists.
-        unsafe {
-            space.unmap(va).expect(
-                "LAPIC page is covered by a huge HHDM mapping; cannot make it uncacheable \
-                 without splitting the parent entry",
-            );
-        }
-    }
-    unsafe {
-        space
-            .map(
-                va,
-                phys,
-                PageFlags::PRESENT
-                    | PageFlags::WRITABLE
-                    | PageFlags::NO_CACHE
-                    | PageFlags::NO_EXECUTE,
-                &mut || frames::alloc(0),
-            )
-            .expect("failed to map the local APIC");
-    }
+    // Why an existing mapping is replaced rather than trusted is on
+    // `map_device_page`; the LAPIC at 0xFEE0_0000 is inside the low 4 GiB the
+    // Limine HHDM is permitted to span, so a pre-existing mapping here is a
+    // legal bootloader configuration rather than an error.
+    // SAFETY: nothing in the kernel has touched the LAPIC yet -- `apic::init`
+    // runs after this function -- so no reference derived from `va` exists, and
+    // `phys` is the LAPIC's register window rather than RAM.
+    unsafe { crate::vmspace::map_device_page(&mut space, va, phys) }.expect(
+        "failed to map the local APIC uncacheable; it may be covered by a huge HHDM mapping, \
+         which cannot be made uncacheable without splitting the parent entry",
+    );
     LAPIC_MAPPED.store(true, Ordering::Release);
 }
 
@@ -128,11 +114,27 @@ extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
     qunix_hal_x86_64::apic::eoi();
 }
 
+/// A virtio-blk completion. Drains the used ring and unparks whoever waited.
+///
+/// EOI before the work, for the reason the timer handler documents: signalling
+/// after would leave the LAPIC waiting for an acknowledgement that only arrives
+/// once this handler returns, and `unpark` can take locks another processor
+/// holds.
+extern "x86-interrupt" fn block_handler(_frame: InterruptStackFrame) {
+    // Before anything reads `gs:`. This can land while ring 3 is running, and
+    // ring 3 can zero the hidden GS base with `mov gs, ax`; `unpark` reaches
+    // per-CPU state through it.
+    // SAFETY: this CPU's per-CPU block was installed during boot.
+    unsafe { qunix_hal_x86_64::percpu::restore_gs_base() };
+    qunix_hal_x86_64::apic::eoi();
+    crate::block::handle_completion();
+}
+
 /// Registers the interrupt vectors that are this CPU's own.
 ///
-/// Both are per-CPU because the IDT is: `idt::set_handler` writes the table of
-/// the CPU it is called on, so every CPU must run this or it triple-faults on
-/// the first timer tick or wakeup IPI it is sent.
+/// All three are per-CPU because the IDT is: `idt::set_handler` writes the table
+/// of the CPU it is called on, so every CPU must run this or it triple-faults on
+/// the first timer tick, wakeup IPI, or block completion it is sent.
 ///
 /// Separate from `apic::init` so tests can install the handlers before enabling
 /// interrupts.
@@ -140,6 +142,7 @@ pub fn install_local_vectors() {
     unsafe {
         qunix_hal_x86_64::idt::set_handler(qunix_hal_x86_64::apic::TIMER_VECTOR, timer_handler);
         qunix_hal_x86_64::idt::set_handler(WAKE_VECTOR, wake_handler);
+        qunix_hal_x86_64::idt::set_handler(crate::block::COMPLETION_VECTOR, block_handler);
     };
 }
 
@@ -1177,6 +1180,94 @@ mod tests {
         crate::sched::exit_current();
     }
 
+    /// Mismatches seen by [`identity_worker`], as a bitmap of CPU indices.
+    static GS_FREE_ID_MISMATCH: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    /// Which CPUs ran [`identity_worker`].
+    static GS_FREE_ID_SEEN: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    /// How many processors the workers wait to see before exiting.
+    static GS_FREE_ID_TARGET: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    extern "C" fn identity_worker(_arg: u64) -> ! {
+        use core::sync::atomic::Ordering;
+        // Masked across the comparison. Otherwise a preemption between the two
+        // reads can move this thread to another processor, and the test would
+        // report a mismatch that is really a migration.
+        use qunix_sync::IrqControl as _;
+        let irq = qunix_hal_x86_64::Irq::disable_and_save();
+        let through_gs = qunix_hal_x86_64::percpu::cpu_id();
+        let gs_free = qunix_hal_x86_64::percpu::cpu_id_without_gs();
+        if gs_free != Some(through_gs) {
+            GS_FREE_ID_MISMATCH.fetch_or(1u64 << through_gs, Ordering::SeqCst);
+        }
+        GS_FREE_ID_SEEN.fetch_or(1u64 << through_gs, Ordering::SeqCst);
+        qunix_hal_x86_64::Irq::restore(irq);
+        // Held here, unmasked, until every processor has checked in. A worker
+        // that exits immediately is dispatched again on whichever CPU is
+        // free -- two of them serviced all twelve on the first attempt -- and
+        // the mapping then goes unverified on the processors that never ran
+        // one, which is precisely where a wrong entry would hide.
+        let mut budget = 50_000_000u64;
+        while (GS_FREE_ID_SEEN.load(Ordering::SeqCst).count_ones() as u64)
+            < GS_FREE_ID_TARGET.load(Ordering::SeqCst)
+            && budget > 0
+        {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        crate::sched::exit_current();
+    }
+
+    #[test_case]
+    fn every_cpu_names_itself_the_same_way_with_and_without_gs() {
+        use core::sync::atomic::Ordering;
+        use qunix_sched::Priority;
+
+        // The whole point of `cpu_id_without_gs` is that a spinlock wait can
+        // service a TLB shootdown, and it services it *by index*. An index one
+        // out acknowledges on behalf of a processor that has not invalidated
+        // anything, and the initiator then frees a frame that CPU still
+        // resolves an address through -- silent memory corruption, reported as
+        // a successful shootdown. So the mapping is asserted on every
+        // processor rather than assumed from the one that built it.
+        crate::frames::init();
+        crate::heap::init();
+        crate::sched::init();
+        let cpus = crate::smp::cpu_count() as u64;
+        assert!(
+            crate::smp::wait_for_all(200_000_000),
+            "application processors did not come online"
+        );
+
+        GS_FREE_ID_MISMATCH.store(0, Ordering::SeqCst);
+        GS_FREE_ID_SEEN.store(0, Ordering::SeqCst);
+        GS_FREE_ID_TARGET.store(cpus, Ordering::SeqCst);
+        let workers = cpus * 3;
+        assert!(workers <= 64, "the seen bitmap is a u64");
+        for i in 0..workers {
+            crate::sched::spawn_kernel(identity_worker, i, Priority::Normal);
+        }
+        wait_until(
+            || GS_FREE_ID_SEEN.load(Ordering::SeqCst).count_ones() as u64 >= cpus,
+            WAIT_BUDGET,
+        );
+
+        let seen = GS_FREE_ID_SEEN.load(Ordering::SeqCst);
+        assert_eq!(
+            seen.count_ones() as u64,
+            cpus,
+            "only {} of {cpus} processors ran the check, so the mapping is unverified on the rest",
+            seen.count_ones()
+        );
+        assert_eq!(
+            GS_FREE_ID_MISMATCH.load(Ordering::SeqCst),
+            0,
+            "a processor's apic-derived index disagrees with its own `GS` block"
+        );
+    }
+
     #[test_case]
     fn work_queued_on_one_cpu_is_stolen_by_another_when_the_owner_never_dispatches() {
         use core::sync::atomic::Ordering;
@@ -1984,6 +2075,30 @@ mod tests {
     /// for it is the fix, and it does not weaken the assertion — a genuine
     /// leak never satisfies this, so the budget expires and the caller's
     /// assertion reports the shortfall exactly as before.
+    /// Whether building a process's address space consumes frames, measured
+    /// without racing the process.
+    ///
+    /// Asserting this of a *spawned* process races the process itself: on a
+    /// busy machine it can load, run and exit between two reads of the counter,
+    /// and the counter is then back where it started -- a true observation of a
+    /// finished process, reported as "loading consumed nothing". Building the
+    /// space here consumes frames with nothing able to free them until the
+    /// probe is dropped.
+    ///
+    /// Extracted because both callers had it inline and the file already
+    /// establishes the helper convention next door.
+    fn loading_consumes_frames(image: &[u8], before: u64) -> bool {
+        let probe = crate::process::Process::from_elf(image).expect("the image failed to load");
+        let with_probe = crate::frames::free_bytes();
+        drop(probe);
+        assert_eq!(
+            crate::frames::free_bytes(),
+            before,
+            "dropping a loaded process did not return its frames"
+        );
+        with_probe < before
+    }
+
     fn wait_until_frames_return(target: u64) -> bool {
         wait_until(|| crate::frames::free_bytes() == target, WAIT_BUDGET)
     }
@@ -2025,11 +2140,9 @@ mod tests {
         // another processor would move the baseline under this measurement.
         quiesce();
         let before = crate::frames::free_bytes();
+        let consumed = loading_consumes_frames(image, before);
         let id = crate::process::spawn_elf(image).expect("init failed to load");
-        assert!(
-            crate::frames::free_bytes() < before,
-            "loading a process consumed no frames; the measurement below proves nothing"
-        );
+        assert!(consumed, "loading a process consumed no frames; the measurement below proves nothing");
         assert!(wait_until_reaped(id), "{id:?} never exited and was never reaped");
 
         // The negative direction, and the whole of Deviation D7: an address
@@ -2073,11 +2186,9 @@ mod tests {
 
         quiesce();
         let before = crate::frames::free_bytes();
+        let consumed = loading_consumes_frames(&image, before);
         let id = crate::process::spawn_elf(&image).expect("the faulting image failed to load");
-        assert!(
-            crate::frames::free_bytes() < before,
-            "loading a process consumed no frames; the measurement below proves nothing"
-        );
+        assert!(consumed, "loading a process consumed no frames; the measurement below proves nothing");
         assert!(wait_until_reaped(id), "{id:?} survived its fault, or was never reaped");
 
         // Waited for, not sampled — see `wait_until_frames_return`. This is

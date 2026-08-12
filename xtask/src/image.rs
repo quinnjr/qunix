@@ -143,6 +143,90 @@ fn copy_if_changed(src: &Path, dst: &Path, stamps: &Path) -> Result<()> {
 /// The tree is not torn down between runs; instead every file it should contain
 /// is refreshed only when stale, and anything else present is removed. That
 /// keeps VVFAT from serving leftovers while avoiding a full re-copy each run.
+/// Sectors in the test disk. 2048 × 512 B = 1 MiB, which is more than any test
+/// reads and small enough to regenerate in a blink.
+const TEST_DISK_SECTORS: u64 = 2048;
+
+/// Creates the guest's block device, if it is not already there.
+///
+/// **Every sector begins with its own LBA**, little-endian, and the rest is
+/// filled with a byte derived from it. That is the whole point: a read of the
+/// wrong sector is then *detectable* rather than plausible. A disk of zeros, or
+/// of one repeated pattern, would let an off-by-one in the descriptor chain
+/// return data that looks exactly like success.
+///
+/// Written only when absent. Regenerating it every run would erase whatever a
+/// write test had just put there, so a read-after-write test could never fail
+/// for the right reason -- and it would also make the two boots of
+/// `cargo xtask test` disagree about the disk's contents.
+pub fn build_test_disk(target_dir: &Path) -> Result<PathBuf> {
+    let disk = target_dir.join("qunix-test-disk.img");
+    // Regenerated when the *size* is wrong, not merely when the file is
+    // missing. A write interrupted by a full disk or a killed run leaves a
+    // truncated image that would then be served to the guest forever, and the
+    // kernel's read tests only notice if they happen to read past its end --
+    // which they mostly do not. The same check invalidates an image from an
+    // older `TEST_DISK_SECTORS`.
+    if disk.exists()
+        && std::fs::metadata(&disk).map(|m| m.len()).unwrap_or(0) == TEST_DISK_SECTORS * 512
+    {
+        return Ok(disk);
+    }
+    std::fs::create_dir_all(target_dir)?;
+    let image = generate_test_disk();
+    std::fs::write(&disk, &image)
+        .with_context(|| format!("failed to write the test disk at {}", disk.display()))?;
+    Ok(disk)
+}
+
+/// The image's contents, without touching the filesystem.
+///
+/// Separated so the shape the kernel asserts from inside the emulator can be
+/// asserted here too. Those two statements of one format live in different
+/// crates and were checked against each other by nothing.
+fn generate_test_disk() -> Vec<u8> {
+    const SECTOR_BYTES: usize = 512;
+    let mut image = vec![0u8; TEST_DISK_SECTORS as usize * SECTOR_BYTES];
+    for lba in 0..TEST_DISK_SECTORS {
+        let base = lba as usize * SECTOR_BYTES;
+        image[base..base + 8].copy_from_slice(&lba.to_le_bytes());
+        // A filler that also depends on the LBA, so a read returning the right
+        // first eight bytes and the wrong tail is caught too.
+        for (i, byte) in image[base + 8..base + SECTOR_BYTES].iter_mut().enumerate() {
+            *byte = (lba as u8).wrapping_add(i as u8);
+        }
+    }
+    image
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    #[test]
+    fn every_sector_identifies_itself() {
+        // The kernel's block tests assert this exact shape from the other side
+        // of the emulator, and nothing connected the two statements. This is
+        // the half that can be checked on the host.
+        let image = generate_test_disk();
+        assert_eq!(image.len(), TEST_DISK_SECTORS as usize * 512);
+        for lba in [0u64, 1, 7, 11, TEST_DISK_SECTORS - 1] {
+            let s = &image[lba as usize * 512..][..512];
+            assert_eq!(
+                u64::from_le_bytes(s[0..8].try_into().unwrap()),
+                lba,
+                "sector {lba} does not begin with its own LBA"
+            );
+            assert_eq!(s[8], lba as u8, "the filler does not start at the LBA");
+            assert_eq!(s[9], (lba as u8).wrapping_add(1), "the filler does not advance");
+        }
+        // And no two sectors are identical, which is what makes reading the
+        // wrong one detectable rather than plausible -- the property the whole
+        // generator exists for.
+        assert_ne!(&image[0..512], &image[512..1024]);
+    }
+}
+
 pub fn build_esp(root: &Path, target_dir: &Path, kernel: &Path) -> Result<PathBuf> {
     let limine = ensure_limine(root)?;
     let esp = target_dir.join("esp");

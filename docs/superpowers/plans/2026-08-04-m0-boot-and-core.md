@@ -88,6 +88,24 @@ these; read the real files for current truth.
     kernel text base at -2 GiB, so validating RBP against the text base rejected
     every frame. RBP is checked against the higher-half boundary; only return
     addresses are checked against the text base.
+17. **Task 1 Step 6's linker script was skipped, and that was wrong.** Two LLD
+    flags (`--image-base`, `--entry`) stood in for it, which satisfied the only
+    requirement anyone checked — the kernel starts in the higher half — while
+    leaving every section an *orphan*, placed by name in whatever order that
+    produced. The Limine request markers were therefore omitted, because orphan
+    placement puts `.requests_end_marker` *before* `.requests_start_marker` with
+    `.requests` outside the pair entirely; the bootloader fell back to scanning
+    the whole image for request magic. That fallback is not a guarantee the
+    protocol makes, and it stopped working during M2 T4: a release build failed
+    `kmain`'s base-revision assertion while the same source booted in debug, and
+    a bisect named a commit of renames and doc comments — the signature of a
+    layout dependency. `kernel/linker.ld` now exists as this plan specified,
+    passed by `kernel/build.rs`, and the flags it replaced are gone from
+    `.cargo/config.toml`. It also fixed a permission bug the flags had hidden:
+    the requests must be writable (the bootloader writes each response pointer),
+    so with a single orphan-placed data segment the kernel's entire `.rodata`
+    was writable. There are now four segments — RX, RW requests, R rodata, RW
+    data — and `readelf -l` shows the boundaries.
 
 ## File Structure
 

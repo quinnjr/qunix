@@ -209,6 +209,15 @@ LeakSanitizer.
   mapped and must be mapped explicitly, uncacheable.
 - Limine's stack has **no guard page**. Stack overflow scribbles through memory
   instead of faulting, so recursion in the panic path is unbounded by default.
+- **`kernel/linker.ld` owns the image layout**, and `kernel/build.rs` is what
+  passes it — not `.cargo/config.toml`, whose rustflags resolve relative paths
+  against cargo's invocation directory. Before it existed, `--image-base` and
+  `--entry` did the same job badly: every section was an orphan, so the request
+  markers could not be used and Limine scanned the whole image for request
+  magic instead. That scan is not part of the protocol and it stopped finding
+  them once the image grew — a *release-only* failure of `kmain`'s base-revision
+  assertion that bisected to a commit of renames. If a boot ever fails there
+  again, look at `readelf -l` before looking at the code.
 - `-cpu host` is rejected under TCG. Gate it on `/dev/kvm` being *openable*, not
   merely present — the `accel=kvm:tcg` fallback is silent.
 - **A git worktree must live outside the repository directory.** Cargo merges

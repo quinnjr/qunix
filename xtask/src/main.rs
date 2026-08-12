@@ -179,7 +179,8 @@ fn main() -> Result<()> {
         Some("run") => {
             let elf = build_kernel(release)?;
             let esp = image::build_esp(&root, &target_dir(), &elf)?;
-            match qemu::run_esp(&esp, false)? {
+            let disk = image::build_test_disk(&target_dir())?;
+            match qemu::run_esp(&esp, &disk, false)? {
                 // A passing kernel exits QEMU with 33, which a shell would read
                 // as failure; translate the harness statuses back into the
                 // conventions a caller of `xtask run` actually expects.
@@ -201,7 +202,8 @@ fn main() -> Result<()> {
             // Invoked by cargo as the custom-target runner, with the test ELF path.
             let elf = PathBuf::from(args.get(1).context("runner requires an ELF path")?);
             let esp = image::build_esp(&root, &target_dir(), &elf)?;
-            match qemu::run_esp(&esp, true)? {
+            let disk = image::build_test_disk(&target_dir())?;
+            match qemu::run_esp(&esp, &disk, true)? {
                 qemu::Exit::Code(HOST_STATUS_SUCCESS) => Ok(()),
                 qemu::Exit::Code(HOST_STATUS_FAILURE) => bail!("kernel tests failed"),
                 qemu::Exit::Code(other) => bail!("qemu exited with unexpected status {other}"),
@@ -228,6 +230,12 @@ fn main() -> Result<()> {
                 let mut cmd = Command::new(env!("CARGO"));
                 cmd.current_dir(&root);
                 cmd.args(["test", "--package", "qunix-kernel"]);
+                // Both boots, not only the invariant one. A lock nobody will
+                // release stops every processor with interrupts masked, so the
+                // kernel cannot report it and the harness sees only a timeout
+                // naming no test. The boot that wedged on CI was, of course,
+                // the one that had this turned off.
+                cmd.args(["--features", "deadlock-panic"]);
                 if invariants {
                     cmd.args(["--features", "sched-invariants"]);
                     // Its own target directory, which is not tidiness.
@@ -277,6 +285,8 @@ fn main() -> Result<()> {
                 "--target",
                 "x86_64-unknown-linux-musl",
                 "-p",
+                "qunix-virtio",
+                "-p",
                 "qunix-sync",
                 "-p",
                 "qunix-mm",
@@ -289,7 +299,7 @@ fn main() -> Result<()> {
                 "-p",
                 "xtask",
                 "--features",
-                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std",
+                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std,qunix-virtio/std",
             ]);
             if release {
                 host.arg("--release");

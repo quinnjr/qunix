@@ -22,11 +22,17 @@ test = true
 # with and without it.
 sched-invariants = []
 
+# Bounds every spinlock wait so a lock that will never be released panics with
+# a backtrace instead of stopping the machine in silence. `cargo xtask test`
+# turns this on for both boots; the shipped kernel keeps the unbounded wait.
+deadlock-panic = ["qunix-sync/deadlock-panic"]
+
 [dependencies]
 limine.workspace = true
 qunix-abi.workspace = true
 qunix-elf.workspace = true
 qunix-sched.workspace = true
+qunix-virtio.workspace = true
 qunix-hal-x86_64.workspace = true
 qunix-sync.workspace = true
 x86_64.workspace = true

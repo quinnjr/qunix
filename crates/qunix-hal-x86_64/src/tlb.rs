@@ -37,6 +37,38 @@ use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::percpu::MAX_CPUS;
 
+/// How many irq-masking locks each processor holds.
+///
+/// Indexed by CPU rather than kept in the per-CPU block, because every reader
+/// and writer here is on a path that must not touch `GS`.
+static LOCK_DEPTH: [core::sync::atomic::AtomicU32; MAX_CPUS as usize] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS as usize];
+
+/// Records a lock acquisition on this processor.
+pub fn enter_lock() {
+    if let Some(cpu) = crate::percpu::cpu_id_without_gs() {
+        LOCK_DEPTH[cpu as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Records a lock release on this processor.
+pub fn leave_lock() {
+    if let Some(cpu) = crate::percpu::cpu_id_without_gs() {
+        LOCK_DEPTH[cpu as usize].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Locks this processor currently holds.
+///
+/// Read before code re-enables interrupts by hand. A handler that then takes a
+/// lock the interrupted frame owns deadlocks the processor against itself, and
+/// the report blames the handler rather than the frame that left the lock held.
+pub fn lock_depth() -> u32 {
+    crate::percpu::cpu_id_without_gs()
+        .map(|cpu| LOCK_DEPTH[cpu as usize].load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// Vector the shootdown IPI is delivered on.
 ///
 /// One above the timer. Installed by `idt::build_and_load` rather than by the
@@ -158,6 +190,11 @@ fn shootdown(target: u64) {
     // from never having sent the IPI: the caller frees the frame while a remote
     // CPU still resolves the address through it.
     while PENDING.load(Ordering::Acquire) != 0 {
+        // The initiator's own bit is never in `remote`, so this services
+        // nothing of its own. It is here for the same reason the acquire loop
+        // above has it: a second initiator can be waiting on this processor
+        // while this one waits on it.
+        service_pending();
         core::hint::spin_loop();
     }
 
@@ -169,8 +206,16 @@ fn shootdown(target: u64) {
 /// Idempotent: called both from the IPI handler and from the spin loop above,
 /// and the IPI routinely arrives after the spin loop has already cleared the
 /// bit.
-fn service_pending() {
-    let cpu = crate::percpu::cpu_id();
+pub fn service_pending() {
+    // `cpu_id_without_gs`, not `cpu_id`. Every spinlock wait polls this now,
+    // from every processor and in whatever address space happens to be
+    // active, and `cpu_id` reads `gs:[0x20]` -- which is linear address 0x20
+    // whenever ring 3 has zeroed the hidden `GS.base`. Reading it from a lock
+    // wait faults with interrupts masked, which is a triple fault rather than
+    // a diagnosis. `CPUID` touches no memory.
+    let Some(cpu) = crate::percpu::cpu_id_without_gs() else {
+        return;
+    };
     if cpu >= MAX_CPUS {
         return;
     }

@@ -1,0 +1,457 @@
+# M2 T5 — Buffer Cache Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** A page-granular buffer cache over virtio-blk, keyed by `(dev, block)`, with dirty tracking and writeback that never calls the general allocator.
+
+**Architecture:** The pure logic — the slot table, its keying, its state machine and its eviction policy — lives in a host-tested `no_std` crate with no I/O and no allocator. The kernel half owns a pool of frames reserved at init, and drives `block::read_at`/`write_at` to fill and flush them. This is the same split as `qunix-virtio` / `kernel::virtio`, and for the same reason: the failure mode here is a *wrong answer* — a slot returning another block's bytes — which is an assertion about arithmetic, and arithmetic is testable on the host.
+
+**Tech Stack:** Rust 2024, `no_std`, `qunix-virtio`-style pure crate + kernel glue, the async runtime from T3, the block driver from T4.
+
+## Global Constraints
+
+Every task's requirements implicitly include these. Values are copied from the
+spec and from `CLAUDE.md`.
+
+- **`no_std`** in both new crate and kernel code. No `std`, no floating point.
+- **The writeback path must not call the general allocator.** From the spec's
+  Risks: "The buffer cache must be able to write back without calling the
+  general allocator." Memory pressure triggers writeback, writeback needs I/O,
+  I/O needs the allocation that is already waiting. Every buffer, every slot and
+  every future on the flush path comes from storage reserved at init.
+- **No `dyn` in the I/O path.** The spec rejects `dyn Vnode` because
+  `async fn` in a trait needs `Pin<Box<dyn Future>>`, which is an allocation per
+  read. The cache's futures must stay concrete state machines.
+- **Block size is 4096 bytes**, one page and exactly `block::MAX_SECTORS`
+  sectors. The block driver refuses anything larger, so a cache block is the
+  largest transfer the device layer will carry in one request.
+- **Edition 2024 unsafe attributes**: `#[unsafe(no_mangle)]`,
+  `#[unsafe(link_section = "…")]`.
+- **Licensing:** permissive, `qunix-*` zone. This is clean-roomed from the
+  design above, not from any kernel's source.
+- **Every commit leaves `cargo xtask test` green**, both boots.
+
+---
+
+## File Structure
+
+| Path | Responsibility |
+| --- | --- |
+| `crates/qunix-bcache/Cargo.toml` | New workspace member, permissive licence, `std` feature for host tests |
+| `crates/qunix-bcache/src/lib.rs` | `BlockKey`, `SlotState`, `Cache` — the slot table, its lookup, its state machine and its eviction choice. No I/O, no allocation. |
+| `kernel/src/bcache.rs` | The frames reserved at init, and the async fill/flush that drives `crate::block` |
+| `kernel/src/main.rs` | `mod bcache;` and its init call |
+| `Cargo.toml` | Workspace member and dependency entry |
+
+The split is where the reasoning lives: the crate answers "which slot, and may
+it be reused", the kernel answers "what is in it".
+
+---
+
+### Task 1: The slot table and its keying
+
+**Files:**
+- Create: `crates/qunix-bcache/Cargo.toml`, `crates/qunix-bcache/src/lib.rs`
+- Modify: `Cargo.toml` (workspace `members` and `[workspace.dependencies]`)
+- Test: in-crate `#[cfg(test)] mod tests`
+
+**Interfaces:**
+- Produces: `BlockKey { dev: u32, block: u64 }`, `Cache::new(capacity)`,
+  `Cache::lookup(key) -> Option<usize>`, `Cache::CAPACITY`.
+- Consumes: nothing.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[test]
+fn two_devices_with_the_same_block_number_are_different_blocks() {
+    // The key is a pair, and collapsing it to the block number alone returns
+    // one device's data for another's -- a wrong answer, reported as a hit.
+    let mut cache = Cache::new(4);
+    let a = cache.insert(BlockKey { dev: 0, block: 7 }).expect("a fresh cache has slots");
+    let b = cache.insert(BlockKey { dev: 1, block: 7 }).expect("a fresh cache has slots");
+    assert_ne!(a, b, "two devices' block 7 landed in one slot");
+    assert_eq!(cache.lookup(BlockKey { dev: 0, block: 7 }), Some(a));
+    assert_eq!(cache.lookup(BlockKey { dev: 1, block: 7 }), Some(b));
+}
+
+#[test]
+fn a_block_that_was_never_inserted_is_a_miss() {
+    // The direction that matters: a spurious *hit* hands out a slot holding
+    // some other block's bytes, and nothing downstream re-checks.
+    let cache = Cache::new(4);
+    assert_eq!(cache.lookup(BlockKey { dev: 0, block: 0 }), None);
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cargo test -p qunix-bcache --features std --target x86_64-unknown-linux-musl`
+Expected: FAIL — `Cache` does not exist.
+
+- [ ] **Step 3: Implement**
+
+```rust
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+
+/// Which block, on which device.
+///
+/// A pair, not a block number: two devices' block 7 are different blocks, and
+/// keying on the number alone returns one device's bytes for the other's --
+/// a wrong answer reported as a cache hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockKey {
+    pub dev: u32,
+    pub block: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotState {
+    /// Holds no block.
+    Free,
+    /// Contents match the device.
+    Clean,
+    /// Contents differ from the device and must be written before reuse.
+    Dirty,
+    /// An I/O is outstanding against this slot.
+    InFlight,
+}
+
+pub struct Slot {
+    key: BlockKey,
+    state: SlotState,
+    /// Callers currently holding this slot.
+    pins: u32,
+}
+
+pub struct Cache {
+    slots: [Slot; Self::CAPACITY],
+    used: usize,
+}
+```
+
+Use a fixed array, not a `Vec`: the writeback path may not allocate, and a
+table that can grow is a table that can allocate while flushing.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo test -p qunix-bcache --features std --target x86_64-unknown-linux-musl`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml crates/qunix-bcache
+git commit -m "feat(bcache): the slot table, keyed by device and block"
+```
+
+---
+
+### Task 2: The state machine, and what may not be evicted
+
+**Files:**
+- Modify: `crates/qunix-bcache/src/lib.rs`
+- Test: same module
+
+**Interfaces:**
+- Produces: `Cache::mark_dirty(slot)`, `Cache::mark_clean(slot)`,
+  `Cache::begin_io(slot)`, `Cache::end_io(slot)`, `Cache::pin`/`unpin`,
+  `Cache::victim() -> Option<usize>`, `Cache::dirty_slots()`.
+
+This is the task that carries the milestone's risk, so its tests are written in
+the refusing direction first.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn a_dirty_slot_is_never_chosen_as_a_victim() {
+    // Evicting a dirty slot silently discards a write the caller believes
+    // succeeded. Nothing downstream can notice: the block simply has its old
+    // contents the next time it is read.
+    let mut cache = Cache::new(2);
+    let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+    let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+    cache.mark_dirty(a);
+    cache.mark_dirty(b);
+    assert_eq!(cache.victim(), None, "a dirty slot was offered for reuse");
+}
+
+#[test]
+fn a_slot_with_io_outstanding_is_never_chosen_as_a_victim() {
+    // The device owns the buffer until it completes. Reusing it here is the
+    // driver's own bug one layer up: the device writes one block's data into
+    // another block's buffer, and every operation returns success.
+    let mut cache = Cache::new(2);
+    let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+    cache.begin_io(a);
+    assert_eq!(cache.victim(), Some(1), "the only reusable slot was not offered");
+    let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+    cache.begin_io(b);
+    assert_eq!(cache.victim(), None, "a slot with io outstanding was offered for reuse");
+}
+
+#[test]
+fn a_pinned_slot_is_never_chosen_as_a_victim() {
+    // A pin means somebody holds a reference to the buffer.
+    let mut cache = Cache::new(2);
+    let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+    cache.pin(a);
+    let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+    cache.pin(b);
+    assert_eq!(cache.victim(), None, "a pinned slot was offered for reuse");
+}
+
+#[test]
+fn every_dirty_slot_is_reported_for_writeback() {
+    // `sync` writes what this reports. A dirty slot missing from it is a write
+    // that is acknowledged and never reaches the disk.
+    let mut cache = Cache::new(4);
+    let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+    let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+    cache.insert(BlockKey { dev: 0, block: 3 }).unwrap();
+    cache.mark_dirty(a);
+    cache.mark_dirty(b);
+    let mut reported = cache.dirty_slots().collect::<alloc::vec::Vec<_>>();
+    reported.sort_unstable();
+    assert_eq!(reported, alloc::vec![a, b], "the dirty set does not match what was dirtied");
+}
+```
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `cargo test -p qunix-bcache --features std --target x86_64-unknown-linux-musl`
+Expected: FAIL — the methods do not exist.
+
+- [ ] **Step 3: Implement**
+
+`victim` returns a slot only when `state` is `Free` or `Clean` **and** `pins == 0`.
+Record why in a comment at the guard: each of the three refusals corresponds to
+a different corruption, and they are not interchangeable.
+
+- [ ] **Step 4: Run the tests**
+
+Expected: PASS
+
+- [ ] **Step 5: Mutation-check the guard**
+
+Delete the `Dirty` arm of the refusal, re-run, and require
+`a_dirty_slot_is_never_chosen_as_a_victim` to fail. Restore it. Repeat for the
+`InFlight` and pin arms. A guard that no test can falsify is not guarded.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/qunix-bcache/src/lib.rs
+git commit -m "feat(bcache): the slot state machine, and the three things it refuses to evict"
+```
+
+---
+
+### Task 3: Frames reserved at init, and a cached read
+
+**Files:**
+- Create: `kernel/src/bcache.rs`
+- Modify: `kernel/src/main.rs` (`mod bcache;`)
+
+**Interfaces:**
+- Consumes: `qunix_bcache::{BlockKey, Cache}`, `crate::block::{read_at, MAX_SECTORS}`,
+  `crate::frames`, `crate::boot::hhdm_offset`.
+- Produces: `pub async fn read_block(key: BlockKey) -> Result<&'static [u8], BcacheError>`,
+  `pub fn init()`.
+
+- [ ] **Step 1: Reserve the frames at init**
+
+One frame per slot, allocated once in `init` and never returned. Say so at the
+allocation: this is the whole reason the writeback path cannot allocate, and a
+future reader who "fixes" it into an on-demand allocation reintroduces the
+deadlock the spec names.
+
+- [ ] **Step 2: Write the failing in-QEMU test**
+
+```rust
+#[test_case]
+fn a_cached_read_returns_the_bytes_the_disk_holds() {
+    // The test disk's every sector begins with its own LBA, so a slot holding
+    // the wrong block is visible in the data rather than only in the bookkeeping.
+    crate::bcache::init();
+    let block = block_on(crate::bcache::read_block(BlockKey { dev: 0, block: 1 }))
+        .expect("a cached read of a live block failed");
+    // Block 1 is sectors 8..16, so the first eight bytes are LBA 8.
+    assert_eq!(u64::from_le_bytes(block[0..8].try_into().unwrap()), 8);
+}
+
+#[test_case]
+fn a_second_read_of_the_same_block_does_no_further_io() {
+    // The point of the cache. Asserted against the driver's own counter rather
+    // than against timing, which would pass on any machine slow enough.
+    crate::bcache::init();
+    let key = BlockKey { dev: 0, block: 2 };
+    block_on(crate::bcache::read_block(key)).expect("the first read failed");
+    let completions = crate::block::completions();
+    block_on(crate::bcache::read_block(key)).expect("the second read failed");
+    assert_eq!(
+        crate::block::completions(),
+        completions,
+        "a cache hit still went to the device"
+    );
+}
+```
+
+- [ ] **Step 3: Run and watch them fail**
+
+Run: `cargo xtask test`
+Expected: FAIL — `bcache` does not exist.
+
+- [ ] **Step 4: Implement `read_block`**
+
+Look up; on a hit, return the slot. On a miss, take a victim, `begin_io`, await
+`block::read_at` into that slot's frame, `end_io`, mark `Clean`.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `cargo xtask test`
+Expected: PASS, both boots.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add kernel/src/bcache.rs kernel/src/main.rs
+git commit -m "feat(bcache): cached reads over frames reserved at init"
+```
+
+---
+
+### Task 4: Dirty tracking and writeback
+
+**Files:**
+- Modify: `kernel/src/bcache.rs`
+
+**Interfaces:**
+- Produces: `pub async fn write_block(key, &[u8]) -> Result<(), BcacheError>`,
+  `pub async fn sync() -> Result<(), BcacheError>`.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[test_case]
+fn a_written_block_reaches_the_disk_only_after_sync() {
+    // Both halves. A write that reaches the disk immediately is not a cache;
+    // a write that never reaches it is data loss, and the acknowledgement the
+    // caller already has makes it silent.
+    crate::bcache::init();
+    let key = BlockKey { dev: 0, block: 3 };
+    let mut payload = alloc::vec![0u8; BLOCK_BYTES];
+    payload[0..8].copy_from_slice(&0xfeed_face_u64.to_le_bytes());
+
+    block_on(crate::bcache::write_block(key, &payload)).expect("the write was refused");
+    let before = read_through_the_device(key);
+    assert_ne!(&before[0..8], &payload[0..8], "the write reached the disk before sync");
+
+    block_on(crate::bcache::sync()).expect("sync failed");
+    let after = read_through_the_device(key);
+    assert_eq!(&after[0..8], &payload[0..8], "sync did not write the block back");
+}
+```
+
+`read_through_the_device` bypasses the cache with `block::read_at` into a local
+buffer, because reading through the cache would return the dirty slot and
+assert nothing about the disk.
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `cargo xtask test`
+Expected: FAIL — `write_block` does not exist.
+
+- [ ] **Step 3: Implement**
+
+`write_block` fills the slot and marks it `Dirty`. `sync` walks `dirty_slots`,
+`begin_io`, awaits `block::write_at`, `end_io`, marks `Clean`.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo xtask test`
+Expected: PASS, both boots.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add kernel/src/bcache.rs
+git commit -m "feat(bcache): dirty tracking and writeback"
+```
+
+---
+
+### Task 5: Eviction under pressure
+
+**Files:**
+- Modify: `kernel/src/bcache.rs`
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[test_case]
+fn evicting_a_dirty_slot_writes_it_back_first() {
+    // The failure this exists to prevent is silent: the slot is reused, the
+    // write is discarded, and the block reads as its old contents forever.
+    crate::bcache::init();
+    let victim = BlockKey { dev: 0, block: 4 };
+    let mut payload = alloc::vec![0u8; BLOCK_BYTES];
+    payload[0..8].copy_from_slice(&0x0bad_cafe_u64.to_le_bytes());
+    block_on(crate::bcache::write_block(victim, &payload)).expect("the write was refused");
+
+    // Read enough distinct blocks to force every slot to turn over.
+    for block in 100..(100 + CAPACITY as u64 + 1) {
+        block_on(crate::bcache::read_block(BlockKey { dev: 0, block }))
+            .expect("a read failed while filling the cache");
+    }
+
+    let on_disk = read_through_the_device(victim);
+    assert_eq!(
+        &on_disk[0..8],
+        &payload[0..8],
+        "a dirty slot was evicted without being written back"
+    );
+}
+```
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `cargo xtask test`
+Expected: FAIL — the dirty block's old contents are still on disk.
+
+- [ ] **Step 3: Implement**
+
+When `victim()` returns `None` because every reusable slot is dirty, flush
+before retrying. The flush uses the same reserved frames and the same concrete
+futures — no allocation on this path, which is the constraint the whole design
+exists to satisfy.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo xtask test`
+Expected: PASS, both boots.
+
+- [ ] **Step 5: Verify the allocator is not on the path**
+
+Read `read_block`, `write_block`, `sync` and the eviction path and confirm no
+`Box`, `Vec`, `format!` or `alloc::` call appears in any of them. This is a
+review step rather than an assertion because the check is "no allocation
+reachable", which no single test can state — say what was checked in the commit
+message.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add kernel/src/bcache.rs
+git commit -m "feat(bcache): write a dirty slot back before reusing it"
+```
+
+---
+
+## Execution Deviations
+
+Recorded during execution. A plan written before the code is a hypothesis; the
+deviations are the result.
+
+*(none yet)*

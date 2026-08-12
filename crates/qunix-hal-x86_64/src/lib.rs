@@ -8,6 +8,7 @@ pub mod context;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
+pub mod pci;
 pub mod percpu;
 pub mod port;
 pub mod serial;
@@ -27,5 +28,36 @@ impl qunix_sync::IrqControl for Irq {
         if was_enabled {
             x86_64::instructions::interrupts::enable();
         }
+    }
+
+    /// Answers a TLB shootdown while spinning for a lock.
+    ///
+    /// The IPI cannot be delivered here -- taking the lock masked interrupts --
+    /// and the initiator does not return until this processor acknowledges. So
+    /// a CPU that masks and spins for a lock the initiator holds stops the
+    /// machine: every processor halted with `IF` clear, no timer, and nothing
+    /// left running that could report it.
+    ///
+    /// Polling the same idempotent function the IPI handler runs is what
+    /// breaks that cycle.
+    fn service_while_waiting() {
+        crate::tlb::service_pending();
+    }
+
+    /// This processor's index, without touching `GS`.
+    ///
+    /// Reached from a lock wait, so it must not read `gs:[0x20]` -- that is
+    /// linear address 0x20 whenever ring 3 has zeroed the hidden base, and a
+    /// fault there with interrupts masked is a triple fault.
+    fn cpu_index() -> u32 {
+        crate::percpu::cpu_id_without_gs().unwrap_or(u32::MAX)
+    }
+
+    fn entered_lock() {
+        crate::tlb::enter_lock();
+    }
+
+    fn left_lock() {
+        crate::tlb::leave_lock();
     }
 }

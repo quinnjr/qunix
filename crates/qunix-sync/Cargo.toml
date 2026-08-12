@@ -9,6 +9,11 @@ publish.workspace = true
 [features]
 default = []
 std = []
+# Turns a wedged lock into a panic with a backtrace instead of a silent,
+# machine-wide spin with interrupts masked. Test builds only: the shipped
+# kernel must not abandon a lock, and the check costs a counter in the wait
+# loop.
+deadlock-panic = []
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

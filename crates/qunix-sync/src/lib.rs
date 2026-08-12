@@ -3,8 +3,18 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+
+/// Spins a `deadlock-panic` build tolerates before calling a lock wedged.
+///
+/// Generous on purpose. Real contention here is a handful of critical sections
+/// tens of instructions long, so twenty million iterations is several orders
+/// of magnitude beyond anything a live holder can take -- even under TCG, where
+/// every guest instruction is translated. Set low enough to fire on genuine
+/// contention it would turn a slow machine into a failing one.
+#[cfg(feature = "deadlock-panic")]
+const DEADLOCK_SPINS: u64 = 20_000_000;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
@@ -39,11 +49,36 @@ impl<T: ?Sized> SpinLock<T> {
     /// can be asserted.
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        // Bounded under `deadlock-panic`, unbounded otherwise.
+        //
+        // An unbounded spin is the right shipped behaviour and the worst
+        // possible test behaviour: a lock that is never released -- taken
+        // twice by one CPU, or with its word overwritten -- stops every
+        // processor here with interrupts masked, so no timer fires, no
+        // watchdog runs and no panic prints. The whole machine goes quiet and
+        // the harness reports only that QEMU never exited. That is exactly how
+        // this was found, and it cost a day of bisecting environments.
+        //
+        // The bound is not a timeout to recover from. It converts silence into
+        // a panic, and the panic's backtrace names the waiter -- including, for
+        // a recursive acquisition, the outer frame that already holds it.
+        #[cfg(feature = "deadlock-panic")]
+        let mut spins: u64 = 0;
         loop {
             if let Some(guard) = self.try_lock() {
                 return guard;
             }
             while self.locked.load(Ordering::Relaxed) {
+                #[cfg(feature = "deadlock-panic")]
+                {
+                    spins += 1;
+                    assert!(
+                        spins < DEADLOCK_SPINS,
+                        "spinlock still held after {DEADLOCK_SPINS} spins; nothing is going to \
+                         release it. Either this processor already holds it, or its word was \
+                         overwritten."
+                    );
+                }
                 core::hint::spin_loop();
             }
         }
@@ -125,21 +160,65 @@ impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
 pub trait IrqControl {
     fn disable_and_save() -> bool;
     fn restore(was_enabled: bool);
+
+    /// Work this processor must keep doing while it waits with interrupts
+    /// masked.
+    ///
+    /// Masking to take a lock makes the waiter deaf to every interrupt --
+    /// including one another processor is waiting on it to answer. A TLB
+    /// shootdown is exactly that: the initiator does not return until every
+    /// other CPU acknowledges, so a CPU that masks and spins for a lock the
+    /// initiator holds deadlocks the machine.
+    ///
+    /// Defaulted to nothing, so the host tests -- which have no interrupts to
+    /// be deaf to -- are unaffected.
+    fn service_while_waiting() {}
+
+    /// Records that this processor has taken an irq-masking lock.
+    ///
+    /// Paired with [`Self::left_lock`]. The arch layer keeps the depth so that
+    /// code which re-enables interrupts by hand -- `sti; hlt` in the idle and
+    /// park loops -- can refuse to do so while a lock is held. Enabling
+    /// interrupts there lets a handler take a lock the interrupted frame owns,
+    /// on the same processor, which no amount of masking discipline elsewhere
+    /// can save.
+    fn entered_lock() {}
+    /// Pairs with [`Self::entered_lock`].
+    fn left_lock() {}
+
+    /// This processor's index, for reporting who holds a wedged lock.
+    ///
+    /// Must not read per-CPU state through a segment base a running process
+    /// could have zeroed; see the arch implementation. `u32::MAX` means
+    /// "unknown", which is what the host tests report.
+    fn cpu_index() -> u32 {
+        u32::MAX
+    }
 }
 
 pub struct IrqSpinLock<T: ?Sized, I: IrqControl> {
     // PhantomData is zero-sized but must precede `inner`: `SpinLock<T>` is
     // `?Sized`, so it has to be the final field.
     _irq: PhantomData<I>,
+    /// Which processor holds this, or `NO_OWNER`.
+    ///
+    /// Diagnostic only, and it earns its place: "the lock is held and nobody is
+    /// running" and "this processor already holds it" are the same silent
+    /// machine-wide stop, and they need opposite fixes. One relaxed store on a
+    /// line this processor has just taken exclusively.
+    owner: AtomicU32,
     inner: SpinLock<T>,
 }
+
+/// `owner` value meaning the lock is free.
+const NO_OWNER: u32 = u32::MAX - 1;
 
 unsafe impl<T: ?Sized + Send, I: IrqControl> Send for IrqSpinLock<T, I> {}
 unsafe impl<T: ?Sized + Send, I: IrqControl> Sync for IrqSpinLock<T, I> {}
 
 impl<T, I: IrqControl> IrqSpinLock<T, I> {
     pub const fn new(value: T) -> Self {
-        Self { _irq: PhantomData, inner: SpinLock::new(value) }
+        Self { _irq: PhantomData, owner: AtomicU32::new(NO_OWNER), inner: SpinLock::new(value) }
     }
 }
 
@@ -149,9 +228,44 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
     #[inline]
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T, I> {
         let was_enabled = I::disable_and_save();
-        let guard = self.inner.lock();
+        // Not `inner.lock()`, which spins and does nothing else. Interrupts
+        // are masked from the line above, so this processor cannot answer the
+        // shootdown whose initiator may be holding the very lock being waited
+        // for; see `IrqControl::service_while_waiting`.
+        #[cfg(feature = "deadlock-panic")]
+        let mut spins: u64 = 0;
+        let guard = loop {
+            if let Some(guard) = self.inner.try_lock() {
+                break guard;
+            }
+            I::service_while_waiting();
+            #[cfg(feature = "deadlock-panic")]
+            {
+                spins += 1;
+                if spins >= DEADLOCK_SPINS {
+                    let owner = self.owner.load(Ordering::Relaxed);
+                    let me = I::cpu_index();
+                    // Reported rather than merely detected. "Held by this same
+                    // processor" is a recursive acquisition; "held by another"
+                    // with every processor spinning means the holder is not
+                    // running at all, which is a lock kept across a context
+                    // switch. Those are different bugs and the message has to
+                    // say which.
+                    panic!(
+                        "irq spinlock wedged after {DEADLOCK_SPINS} spins: cpu {me} is waiting, \
+                         owner is cpu {owner}. Same cpu means a recursive acquisition; a \
+                         different one, with every processor here, means the owner is not on any \
+                         processor -- the lock was held across a context switch."
+                    );
+                }
+            }
+            core::hint::spin_loop();
+        };
+        self.owner.store(I::cpu_index(), Ordering::Relaxed);
+        I::entered_lock();
         IrqSpinLockGuard {
             guard: ManuallyDrop::new(guard),
+            owner: &self.owner,
             was_enabled,
             _irq: PhantomData,
             _not_send: PhantomData,
@@ -164,12 +278,17 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T, I>> {
         let was_enabled = I::disable_and_save();
         match self.inner.try_lock() {
-            Some(guard) => Some(IrqSpinLockGuard {
-                guard: ManuallyDrop::new(guard),
-                was_enabled,
-                _irq: PhantomData,
-                _not_send: PhantomData,
-            }),
+            Some(guard) => {
+                self.owner.store(I::cpu_index(), Ordering::Relaxed);
+                I::entered_lock();
+                Some(IrqSpinLockGuard {
+                    guard: ManuallyDrop::new(guard),
+                    owner: &self.owner,
+                    was_enabled,
+                    _irq: PhantomData,
+                    _not_send: PhantomData,
+                })
+            }
             None => {
                 I::restore(was_enabled);
                 None
@@ -196,6 +315,7 @@ pub struct IrqSpinLockGuard<'a, T: ?Sized, I: IrqControl> {
     // unwrap-failed call on every deref -- which is now every Box/Vec op,
     // every frame allocation, and every console byte.
     guard: ManuallyDrop<SpinLockGuard<'a, T>>,
+    owner: &'a AtomicU32,
     was_enabled: bool,
     _irq: PhantomData<I>,
     // `!Send` for a sharper reason than the plain guard: dropping this on a
@@ -225,6 +345,11 @@ impl<T: ?Sized, I: IrqControl> DerefMut for IrqSpinLockGuard<'_, T, I> {
 
 impl<T: ?Sized, I: IrqControl> Drop for IrqSpinLockGuard<'_, T, I> {
     fn drop(&mut self) {
+        // Cleared before the release, not after: between the two the lock is
+        // free, and a processor that took it in that gap would have its own
+        // owner store overwritten by this one.
+        self.owner.store(NO_OWNER, Ordering::Relaxed);
+        I::left_lock();
         // Release the spinlock before restoring interrupts, so an interrupt
         // handler that takes the same lock cannot deadlock against us.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
@@ -411,6 +536,56 @@ mod tests {
             assert!(lock.try_lock().is_none(), "try_lock succeeded while the lock was held");
         }
         assert_eq!(*lock.lock(), 6, "the write through the guard was lost");
+    }
+
+    /// An `IrqControl` that reports a fixed processor index.
+    struct CpuSeven;
+    impl IrqControl for CpuSeven {
+        fn disable_and_save() -> bool {
+            false
+        }
+        fn restore(_: bool) {}
+        fn cpu_index() -> u32 {
+            7
+        }
+    }
+
+    #[test]
+    fn a_held_lock_names_its_owner_and_a_free_one_names_nobody() {
+        // The owner is what distinguishes a recursive acquisition from a lock
+        // kept across a context switch, and those need opposite fixes. A field
+        // that stayed at its initial value would report "held by nobody" for
+        // every wedged lock -- the least useful of the two answers, and
+        // indistinguishable from the bug it is meant to identify.
+        let lock: IrqSpinLock<u32, CpuSeven> = IrqSpinLock::new(0);
+        assert_eq!(lock.owner.load(Ordering::Relaxed), NO_OWNER, "a fresh lock claims an owner");
+        {
+            let _guard = lock.lock();
+            assert_eq!(
+                lock.owner.load(Ordering::Relaxed),
+                7,
+                "a held lock does not name the processor holding it"
+            );
+        }
+        assert_eq!(
+            lock.owner.load(Ordering::Relaxed),
+            NO_OWNER,
+            "the owner outlived the guard, so the next wedge would blame a processor that had \
+             already released"
+        );
+    }
+
+    #[test]
+    fn try_lock_records_the_owner_too() {
+        // The path a panic handler takes. An owner recorded only by `lock`
+        // leaves every `try_lock` acquisition invisible, so a wedge against one
+        // reports "held by nobody" -- which reads as corruption rather than as
+        // the contention it is.
+        let lock: IrqSpinLock<u32, CpuSeven> = IrqSpinLock::new(0);
+        let guard = lock.try_lock().expect("an uncontended try_lock failed");
+        assert_eq!(lock.owner.load(Ordering::Relaxed), 7, "try_lock did not record its owner");
+        drop(guard);
+        assert_eq!(lock.owner.load(Ordering::Relaxed), NO_OWNER);
     }
 
     // Thread-local, not global: the counters are read as a baseline and then
