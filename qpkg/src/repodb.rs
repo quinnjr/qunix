@@ -93,44 +93,7 @@ fn parse_desc(text: &str, repo: Repo) -> Option<PackageRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    fn desc(fields: &[(&str, &[&str])]) -> String {
-        let mut out = String::new();
-        for (key, values) in fields {
-            out.push_str(&format!("%{key}%\n"));
-            for v in *values {
-                out.push_str(v);
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    /// A synthetic repository tar: no binary fixture in git, the tests build
-    /// the archive with the same crates the parser reads it with.
-    fn tar_bytes(entries: &[(&str, &str)]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for (path, content) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, content.as_bytes()).unwrap();
-        }
-        builder.into_inner().unwrap()
-    }
-
-    fn gzipped(bytes: &[u8]) -> Vec<u8> {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        enc.write_all(bytes).unwrap();
-        enc.finish().unwrap()
-    }
-
-    fn zstded(bytes: &[u8]) -> Vec<u8> {
-        zstd::encode_all(bytes, 1).unwrap()
-    }
+    use crate::testutil::{desc, gzipped, tar_bytes, zstded};
 
     fn sample_tar() -> Vec<u8> {
         let zsh = desc(&[
