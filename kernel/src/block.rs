@@ -359,36 +359,36 @@ unsafe fn install_msix(transport: &mut Transport) -> Result<(), BlockError> {
 
 /// Reads `buf.len()` bytes starting at sector `lba`.
 pub async fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    // The deadline first. See `reserve_deadline`: once `submit` returns, the
+    // device owns the chain, and there is no correct way to take it back.
+    let deadline = reserve_deadline()?;
     let head = submit(lba, buf.len(), None)?;
-    let status = Completion { head, deadline: deadline_for(head)? }.await;
-    let result = finish(head, status, Some(buf));
-    result
+    let status = Completion { head, deadline }.await;
+    finish(head, status, Some(buf))
 }
 
 /// Writes `buf` starting at sector `lba`.
 pub async fn write_at(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let deadline = reserve_deadline()?;
     let head = submit(lba, buf.len(), Some(buf))?;
-    let status = Completion { head, deadline: deadline_for(head)? }.await;
+    let status = Completion { head, deadline }.await;
     finish(head, status, None)
 }
 
 /// A timer that fires if the request is still outstanding at the deadline.
 ///
-/// The chain is released if no timer slot is free, so a request that cannot be
-/// bounded is refused rather than submitted unbounded — an unbounded request is
-/// the hang this whole mechanism exists to prevent.
-fn deadline_for(head: u16) -> Result<crate::task::Sleep, BlockError> {
-    match crate::task::try_sleep_ticks(REQUEST_TIMEOUT_TICKS) {
-        Ok(sleep) => Ok(sleep),
-        Err(_) => {
-            let mut guard = DEVICE.lock();
-            if let Some(blk) = guard.as_mut() {
-                blk.queue.free_chain(head);
-                blk.slots[head as usize] = None;
-            }
-            Err(BlockError::QueueFull)
-        }
-    }
+/// Taken **before** the request is published, and that order is the whole
+/// point. Reserving it afterwards meant a full timer table had to undo a chain
+/// the device already owned -- `submit` publishes the available ring and
+/// notifies before returning -- so the driver freed descriptors and a bounce
+/// buffer while the device was reading them, and the next request reused the
+/// same head and the same physical addresses. The device then wrote one
+/// request's data into another's buffer, and every operation returned success.
+///
+/// Reserving first cannot fail that way: nothing has been published yet, and a
+/// `Sleep` dropped on the way out releases its slot.
+fn reserve_deadline() -> Result<crate::task::Sleep, BlockError> {
+    crate::task::try_sleep_ticks(REQUEST_TIMEOUT_TICKS).map_err(|_| BlockError::QueueFull)
 }
 
 /// Validates, builds and publishes a request chain. Returns its head.
@@ -855,6 +855,58 @@ mod tests {
             1,
             "a multi-sector read did not advance the LBA across sectors"
         );
+    }
+
+    #[test_case]
+    fn a_request_refused_for_want_of_a_timer_is_never_shown_to_the_device() {
+        // The deadline is reserved before the chain is published, and this is
+        // what that ordering buys. Reserving it afterwards left the only
+        // failure path having to retract a request the device already owned:
+        // `submit` publishes the available ring and notifies before it
+        // returns, so freeing the chain handed the device's descriptors and
+        // bounce buffer to the next caller while it was still reading them.
+        //
+        // Asserted as "the device never heard about it", not as "the counts
+        // came back", because the old code restored the counts too -- after
+        // the notify.
+        ready();
+        let free_before = { DEVICE.lock().as_ref().unwrap().queue.free_count() };
+        let completions_before = completions();
+        let faults_before = device_faults();
+
+        // Hold every timer slot, so the reservation must fail.
+        let mut held = alloc::vec![];
+        while let Ok(sleep) = crate::task::try_sleep_ticks(1_000_000) {
+            held.push(sleep);
+        }
+        assert_eq!(crate::task::free_timer_slots_for_test(), 0, "the timer table did not fill");
+
+        let mut buf = [0u8; SECTOR_BYTES];
+        assert_eq!(
+            block_on(read_at(1, &mut buf)),
+            Err(BlockError::QueueFull),
+            "a request with no deadline available was accepted"
+        );
+        assert_eq!(
+            { DEVICE.lock().as_ref().unwrap().queue.free_count() },
+            free_before,
+            "the refused request left descriptors allocated"
+        );
+        drop(held);
+
+        // Nothing was published, so nothing can complete. A completion here
+        // would be the device acting on a chain the driver had taken back.
+        let mut budget = 5_000_000u64;
+        while budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        assert_eq!(
+            completions(),
+            completions_before,
+            "the device completed a request the driver refused, so it had been notified"
+        );
+        assert_eq!(device_faults(), faults_before, "the refusal produced a device fault");
     }
 
     #[test_case]
