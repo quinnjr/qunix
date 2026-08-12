@@ -8,6 +8,7 @@ mod pkgbuild;
 mod repodb;
 mod sources;
 mod sync;
+mod toolchain;
 #[cfg(test)]
 mod testutil;
 mod vercmp;
