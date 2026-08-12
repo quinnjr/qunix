@@ -297,6 +297,21 @@ fn main() -> Result<()> {
             if !host.status()?.success() {
                 bail!("host tests failed");
             }
+            // qpkg is a host tool, not kernel code: it runs on the developer's
+            // machine and links C (zstd) — so it tests on the host triple, not
+            // musl, and cannot join the invocation above without dragging a
+            // musl cross C toolchain into the test prerequisites.
+            let mut qpkg = Command::new(env!("CARGO"));
+            qpkg.current_dir(&root);
+            // The explicit glibc triple overrides .cargo/config.toml's kernel
+            // JSON target default, same as the musl triple does above.
+            qpkg.args(["test", "-p", "qpkg", "--target", "x86_64-unknown-linux-gnu"]);
+            if release {
+                qpkg.arg("--release");
+            }
+            if !qpkg.status()?.success() {
+                bail!("qpkg tests failed");
+            }
             // Cheap, and it is the only thing standing between a future
             // Linux-compatibility crate and silently inheriting a permissive
             // licence from the workspace.
