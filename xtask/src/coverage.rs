@@ -26,6 +26,8 @@ const MEASURED: &[(&str, Option<&str>)] = &[
     ("qunix-hal-x86_64", Some("qunix-hal-x86_64/std")),
     ("qunix-sched", Some("qunix-sched/std")),
     ("qunix-elf", Some("qunix-elf/std")),
+    ("qunix-virtio", Some("qunix-virtio/std")),
+    ("qunix-bcache", Some("qunix-bcache/std")),
     ("xtask", None),
 ];
 
@@ -682,6 +684,31 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A crate that builds for the host but is not in `MEASURED` is not
+    /// ratcheted, and nothing says so -- the run prints success for the crates
+    /// it did measure and never mentions the one it skipped. `qunix-virtio`
+    /// sat outside the ratchet for a whole milestone that way.
+    ///
+    /// The `std` feature is the signal: it exists precisely so a `no_std`
+    /// kernel crate can be built and tested on the host, so a crate that has
+    /// one is a crate this can measure.
+    #[test]
+    fn every_host_testable_crate_is_measured() {
+        let root = crate::workspace_root();
+        for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+            let dir = entry.unwrap().path();
+            let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            if !manifest.lines().any(|line| line.trim_start().starts_with("std = ")) {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                MEASURED.iter().any(|(measured, _)| *measured == name),
+                "{name} has a `std` feature but is not in MEASURED, so nothing ratchets it"
+            );
+        }
+    }
     use super::*;
     use std::path::PathBuf;
 

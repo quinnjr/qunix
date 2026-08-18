@@ -48,3 +48,16 @@ qunix-sync = 98.64
 # reach: it needs `QUNIX_OVMF` set to a nonexistent path, and mutating the
 # environment from a test races every other test in the process.
 xtask = 54.05
+
+# 98.37. Two accessors, `size` and `ring_bytes`, that only the kernel calls:
+# the host tests construct queues at a known size and never ask, and the DMA
+# window `ring_bytes` sizes exists only in the kernel. The queue arithmetic
+# itself -- descriptor chaining, the free-running avail index, used-ring
+# ingestion -- is fully covered, which is what this number is for.
+#
+# This crate went a whole milestone unratcheted because it was never added to
+# `MEASURED`; `every_host_testable_crate_is_measured` is what stops the next
+# one doing the same.
+qunix-virtio = 98.37
+
+qunix-bcache = 100.00
