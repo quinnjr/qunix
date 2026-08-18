@@ -63,7 +63,7 @@ fn bench_admission(c: &mut Criterion) {
     // is what evicting block 0 does -- makes the free-slot scan hit on its
     // first element, so the measurement is one pass and a bit, and a regression
     // in that scan would not show up here at all.
-    group.bench_function("insert into a nearly full table", |b| {
+    group.bench_function("insert+end_io+evict, nearly full table", |b| {
         let mut cache = full();
         let slot = cache.lookup(BlockKey { dev: 0, block: SLOTS as u64 - 1 }).unwrap();
         cache.evict(slot);
@@ -78,13 +78,15 @@ fn bench_admission(c: &mut Criterion) {
         })
     });
 
-    // Under pressure the table is full and the scan runs to the first reusable
-    // slot; with every slot clean that is slot 0, which is the cheap case.
+    // The table is full and every slot is clean. `victim` scans all `SLOTS`
+    // looking for a *free* slot, finds none, and then hits slot 0 on its second
+    // scan -- so this is one full pass plus one element, not the "cheap case"
+    // an earlier comment here claimed. The pair below still means something,
+    // just not a 2x ratio: it is one full pass against two.
     let cache = full();
     group.bench_function("victim, full table", |b| b.iter(|| black_box(cache.victim())));
 
-    // The expensive case: only the last slot is reusable, so the scan runs the
-    // whole table twice -- once looking for a free slot, once for a clean one.
+    // Two full passes: no free slot, and the only clean unpinned one is last.
     let mut pressured = full();
     for block in 0..SLOTS as u64 - 1 {
         let slot = pressured.lookup(BlockKey { dev: 0, block }).unwrap();

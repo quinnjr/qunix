@@ -27,7 +27,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use qunix_bcache::{BlockKey, Cache, InsertError, SlotState};
+use qunix_bcache::{BlockKey, Cache, EvictError, InsertError, IoToken, SlotState};
 use std::collections::HashMap;
 
 const SLOTS: usize = 16;
@@ -66,16 +66,24 @@ fn pick(slots: &[usize], which: u8) -> Option<usize> {
 fuzz_target!(|ops: Vec<Op>| {
     let mut cache = Cache::<SLOTS>::new();
     let mut model: HashMap<usize, Occupant> = HashMap::new();
+    // The outstanding `IoToken` for every slot with io in flight. `end_io`
+    // consumes one, so this is also the model's record of which slots owe one.
+    let mut tokens: HashMap<usize, IoToken> = HashMap::new();
 
     // Anchors the run. Without it a `Cache` that refused everything would make
     // every op below a no-op and the run would still pass.
-    let probe = cache.insert(BlockKey { dev: 0, block: 0 }).expect("a fresh table refused a block");
+    let probe_token = cache.insert(BlockKey { dev: 0, block: 0 }).expect("a fresh table refused a block");
+    let probe = probe_token.slot();
     // Stated as a refusal, not as a disjunction: `a || b` short-circuits, so a
     // version where `evict` wrongly accepted an unfilled slot would satisfy the
     // assert and then fail somewhere else, reporting the wrong thing.
-    assert!(!cache.evict(probe), "a slot still being filled was evicted");
-    cache.end_io(probe, SlotState::Clean);
-    assert!(cache.evict(probe), "a clean unpinned slot refused eviction");
+    assert_eq!(
+        cache.evict(probe),
+        Err(EvictError::IoOutstanding),
+        "a slot still being filled was evicted"
+    );
+    cache.end_io(probe_token, SlotState::Clean);
+    assert!(cache.evict(probe).is_ok(), "a clean unpinned slot refused eviction");
 
     for op in ops {
         // Slots grouped by what the model says may legally be done to them.
@@ -93,7 +101,14 @@ fuzz_target!(|ops: Vec<Op>| {
                 let resident_already = model.values().any(|o| o.key == key);
                 let full = model.len() == SLOTS;
                 match cache.insert(key) {
-                    Ok(slot) => {
+                    Ok(token) => {
+                        let slot = token.slot();
+                        // The token is held, not resolved: a claimed slot is
+                        // `InFlight` and owes an `end_io`, and holding it is
+                        // what lets `Op::EndIo` resolve exactly the claims that
+                        // exist. A model that dropped it could not tell an
+                        // outstanding io from a resolved one.
+                        assert!(tokens.insert(slot, token).is_none(), "slot {slot} had a live token");
                         assert!(!resident_already, "{key:?} was given a second slot");
                         assert!(!full, "a full table handed out a slot");
                         assert!(model.insert(slot, Occupant {
@@ -133,7 +148,10 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::BeginIo { which } => {
                 let Some(slot) = pick(&resident, which) else { continue };
                 let occupant = model.get_mut(&slot).unwrap();
-                assert_eq!(cache.begin_io(slot), occupant.state, "begin_io lost the prior state");
+                let token = cache.begin_io(slot);
+                assert_eq!(token.prior(), occupant.state, "begin_io lost the prior state");
+                assert_eq!(token.slot(), slot, "begin_io's token names the wrong slot");
+                assert!(tokens.insert(slot, token).is_none(), "slot {slot} had a live token");
                 occupant.state = SlotState::InFlight;
             }
 
@@ -141,7 +159,8 @@ fuzz_target!(|ops: Vec<Op>| {
                 let Some(slot) = pick(&in_flight, which) else { continue };
                 let occupant = model.get_mut(&slot).unwrap();
                 let asked = if ok { SlotState::Clean } else { SlotState::Dirty };
-                cache.end_io(slot, asked);
+                let token = tokens.remove(&slot).expect("an in-flight slot with no token");
+                cache.end_io(token, asked);
                 // A write that landed during the io survives it, whatever the
                 // io itself concluded -- otherwise the write is lost and no
                 // read through the cache can reveal it.
@@ -181,13 +200,24 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::Evict { which } => {
                 let Some(slot) = pick(&occupied, which) else { continue };
                 let occupant = *model.get(&slot).unwrap();
-                let reusable = occupant.state == SlotState::Clean && occupant.pins == 0;
+                // The model predicts *which* refusal, not merely that one
+                // happened: three different corruptions share the refusal, and
+                // a version that reported the wrong one would still refuse.
+                let expected = if occupant.pins != 0 {
+                    Err(EvictError::Pinned)
+                } else {
+                    match occupant.state {
+                        SlotState::Dirty => Err(EvictError::Dirty),
+                        SlotState::InFlight => Err(EvictError::IoOutstanding),
+                        _ => Ok(()),
+                    }
+                };
                 assert_eq!(
                     cache.evict(slot),
-                    reusable,
+                    expected,
                     "evict disagreed with the model about slot {slot}: {occupant:?}"
                 );
-                if reusable {
+                if expected.is_ok() {
                     model.remove(&slot);
                 }
             }
@@ -202,11 +232,11 @@ fuzz_target!(|ops: Vec<Op>| {
         for _ in 0..occupant.pins {
             cache.unpin(slot);
         }
-        if cache.state_of(slot) == Some(SlotState::InFlight) {
-            cache.end_io(slot, SlotState::Clean);
+        if let Some(token) = tokens.remove(&slot) {
+            cache.end_io(token, SlotState::Clean);
         }
         cache.mark_clean(slot);
-        assert!(cache.evict(slot), "slot {slot} could not be released after being quiesced");
+        assert!(cache.evict(slot).is_ok(), "slot {slot} could not be released after being quiesced");
         model.remove(&slot);
     }
     for slot in 0..SLOTS {
@@ -214,7 +244,8 @@ fuzz_target!(|ops: Vec<Op>| {
     }
     // And an emptied table is a usable one, not merely an empty-looking one.
     for block in 0..SLOTS as u64 {
-        assert!(cache.insert(BlockKey { dev: 0, block }).is_ok(), "the drained table refused");
+        let token = cache.insert(BlockKey { dev: 0, block }).expect("the drained table refused");
+        cache.end_io(token, SlotState::Clean);
     }
 });
 

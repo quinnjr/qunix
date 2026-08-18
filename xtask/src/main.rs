@@ -553,16 +553,16 @@ mod tests {
         // plausible optimisation being a 9-17% regression, so a benchmark that
         // does not run is a regression that ships.
         let root = workspace_root();
+        // Package name -> directory, built once and used in both directions.
+        // The reverse check used to re-derive a path from the package name,
+        // assuming the two are the same -- inside the very test that parses the
+        // package name precisely because they need not be.
+        let mut directories = std::collections::BTreeMap::new();
         for entry in std::fs::read_dir(root.join("crates")).unwrap() {
             let dir = entry.unwrap().path();
-            if !dir.join("benches").is_dir() {
+            let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
                 continue;
-            }
-            // The package name, not the directory name, for the same reason
-            // `every_crate_in_the_workspace_is_measured` parses it: cargo
-            // dispatches `-p` on the former, so a crate whose two names differ
-            // would pass this check and still never be benchmarked.
-            let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            };
             let name = manifest
                 .lines()
                 .find_map(|line| line.trim().strip_prefix("name = "))
@@ -570,6 +570,12 @@ mod tests {
                 .trim()
                 .trim_matches('"')
                 .to_string();
+            directories.insert(name, dir);
+        }
+        for (name, dir) in &directories {
+            if !dir.join("benches").is_dir() {
+                continue;
+            }
             assert!(
                 BENCHED_CRATES.contains(&name.as_str()),
                 "{name} has benches/ but is not in bench_args, so nothing runs them"
@@ -577,10 +583,8 @@ mod tests {
         }
         let args = bench_args(&[]);
         for name in BENCHED_CRATES {
-            assert!(
-                root.join("crates").join(name).join("benches").is_dir(),
-                "{name} is benched but has no benches/ directory"
-            );
+            let dir = directories.get(*name).unwrap_or_else(|| panic!("{name} is not a crate"));
+            assert!(dir.join("benches").is_dir(), "{name} is benched but has no benches/");
             assert!(args.iter().any(|a| a == name), "{name} is missing from bench_args");
         }
     }

@@ -49,7 +49,7 @@
 
 use core::ops::Deref;
 
-use qunix_bcache::{BlockKey, Cache, InsertError, SlotState};
+use qunix_bcache::{BlockKey, Cache, InsertError, IoToken, SlotState};
 use qunix_hal_x86_64::Irq;
 use qunix_sync::IrqSpinLock;
 use qunix_virtio::blk::SECTOR_BYTES;
@@ -198,6 +198,15 @@ fn lba_of(key: BlockKey) -> Result<u64, BcacheError> {
 /// is a change to this constant rather than a silent misfill.
 const ONLY_DEVICE: u32 = 0;
 
+/// Reachable only through `CACHE`, an `IrqSpinLock`, so every access to it is
+/// serialised; the addresses it holds name HHDM mappings of frames, which are
+/// equally valid from any processor.
+///
+/// Deliberately *not* an `unsafe impl Send`. Every field is `Send` already, so
+/// the impl asserted nothing -- and it would silently bless the natural next
+/// change, holding `*mut u8` per slot instead of a `u64` address. That day the
+/// compiler's `!Send` diagnostic is the one thing that would force this
+/// argument to be re-derived, and an impl written today suppresses it.
 struct Bcache {
     table: Cache<SLOTS>,
     /// Virtual address of each slot's frame, through the HHDM.
@@ -220,11 +229,6 @@ struct Bcache {
     /// cache never recovers, and nothing says why.
     writeback_failed: [bool; SLOTS],
 }
-
-// SAFETY: `Bcache` is reachable only through `CACHE`, an `IrqSpinLock`, so
-// every access is serialised. The addresses it holds name HHDM mappings of
-// frames, which are equally valid from any processor.
-unsafe impl Send for Bcache {}
 
 static CACHE: IrqSpinLock<Option<Bcache>, Irq> = IrqSpinLock::new(None);
 
@@ -284,11 +288,29 @@ impl Deref for BlockRef {
 impl Drop for BlockRef {
     fn drop(&mut self) {
         let mut guard = CACHE.lock();
-        if let Some(cache) = guard.as_mut() {
-            cache.table.unpin(self.slot);
-        }
+        // Loud, not silent. `Cache::unpin` argues at length that unbalanced pin
+        // accounting must fail rather than be swallowed, and skipping the unpin
+        // here is exactly that: the slot's count never returns to zero, `victim`
+        // refuses it for good, and nothing reports the lost capacity. The
+        // `Fill`/`Writeback` guards may return quietly because they hold no
+        // reference into the frame; a `BlockRef` does.
+        let cache = guard.as_mut().expect("a BlockRef outlived the cache that issued it");
+        cache.table.unpin(self.slot);
     }
 }
+
+// `BlockRef`'s pin is a count in a table behind an `IrqSpinLock`, not
+// thread-owned state, so dropping it on a different processor than the one that
+// pinned it is sound. Stated rather than left to the auto trait, the way
+// `qunix_sync`'s guards state theirs: a later change to this module's locking
+// could make cross-processor `Drop` unsound while the derive silently kept
+// saying `Send`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+    assert_send::<BlockRef>();
+    assert_sync::<BlockRef>();
+};
 
 /// What the lock said to do about a key.
 enum Claim {
@@ -309,27 +331,27 @@ enum Claim {
 /// and fails. A leak that only costs capacity is exactly the kind nothing
 /// notices, so it is released here rather than documented as a caveat.
 struct Fill {
-    slot: usize,
+    /// `None` once the fill has been resolved, so `Drop` does not release a
+    /// slot that is now legitimately in use.
+    ///
+    /// The `Option` replaces a `settled` flag: the token is the proof the slot
+    /// is still owed an `end_io`, so taking it and having taken it are the same
+    /// fact rather than two that can disagree.
+    token: Option<IoToken>,
     virt: u64,
-    /// Set once the fill has been resolved by [`finish_fill`], so `Drop` does
-    /// not release a slot that is now legitimately in use.
-    settled: bool,
 }
 
 impl Drop for Fill {
     fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
+        let Some(token) = self.token.take() else { return };
+        let slot = token.slot();
         let mut guard = CACHE.lock();
         let Some(cache) = guard.as_mut() else { return };
-        cache.filling[self.slot] = false;
-        cache.table.end_io(self.slot, SlotState::Clean);
-        assert!(
-            cache.table.evict(self.slot),
-            "an abandoned fill left slot {} unreleasable",
-            self.slot
-        );
+        cache.filling[slot] = false;
+        cache.table.end_io(token, SlotState::Clean);
+        cache.table.evict(slot).unwrap_or_else(|why| {
+            panic!("an abandoned fill left slot {slot} unreleasable: {why:?}")
+        });
     }
 }
 
@@ -351,9 +373,10 @@ fn claim(key: BlockKey) -> Result<Claim, BcacheError> {
         return Ok(Claim::Hit(BlockRef { slot, virt: cache.frames[slot] }));
     }
 
-    let slot = claim_free_slot(cache, key)?;
+    let token = claim_free_slot(cache, key)?;
+    let slot = token.slot();
     cache.filling[slot] = true;
-    Ok(Claim::Fill(Fill { slot, virt: cache.frames[slot], settled: false }))
+    Ok(Claim::Fill(Fill { token: Some(token), virt: cache.frames[slot] }))
 }
 
 /// Ends a fill, leaving the slot readable or free.
@@ -362,11 +385,13 @@ fn claim(key: BlockKey) -> Result<Claim, BcacheError> {
 /// buffer holds nothing the disk agreed to, so keeping the key would serve
 /// whatever the frame contained to every later reader of that block, with the
 /// read reported as a hit.
-fn finish_fill(slot: usize, ok: bool) -> Option<BlockRef> {
+fn finish_fill(mut fill: Fill, ok: bool) -> Option<BlockRef> {
+    let token = fill.token.take().expect("a fill was resolved twice");
+    let slot = token.slot();
     let mut guard = CACHE.lock();
     let cache = guard.as_mut().expect("a fill completed after the cache was torn down");
     cache.filling[slot] = false;
-    cache.table.end_io(slot, SlotState::Clean);
+    cache.table.end_io(token, SlotState::Clean);
     if !ok {
         // `end_io` resolves to `Dirty` if the slot was written while the io
         // ran, which would make the eviction below refuse. It cannot happen to
@@ -379,7 +404,7 @@ fn finish_fill(slot: usize, ok: bool) -> Option<BlockRef> {
             Some(SlotState::Clean),
             "slot {slot} was written to while it was being filled, so no reader ever saw it"
         );
-        assert!(cache.table.evict(slot), "a failed fill left a slot that could not be released");
+        cache.table.evict(slot).expect("a failed fill left a slot that could not be released");
         return None;
     }
     cache.table.pin(slot);
@@ -426,8 +451,8 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
                 }
                 wait_a_tick().await;
             }
-            Claim::Fill(mut fill) => {
-                let (slot, virt) = (fill.slot, fill.virt);
+            Claim::Fill(fill) => {
+                let virt = fill.virt;
                 // SAFETY: the slot is `InFlight` and marked as filling, so no
                 // other thread may read or reuse it until `finish_fill` runs.
                 // The frame is reserved for the life of the kernel.
@@ -437,10 +462,9 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
                 // this function rather than a condition the caller can cause.
                 let lba = lba_of(key).expect("an unvalidated key reached the fill");
                 let outcome = block::read_at(lba, buf).await;
-                // From here the slot's fate is `finish_fill`'s, not the
-                // guard's.
-                fill.settled = true;
-                match finish_fill(slot, outcome.is_ok()) {
+                // The guard is handed over rather than disarmed: `finish_fill`
+                // takes the token out of it, so the two cannot both resolve.
+                match finish_fill(fill, outcome.is_ok()) {
                     Some(block) => return Ok(block),
                     None => return Err(BcacheError::Device(outcome.unwrap_err())),
                 }
@@ -458,20 +482,18 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
 /// with nothing left to say it existed. So it goes back to `Dirty` and the next
 /// [`sync`] tries again.
 struct Writeback {
-    slot: usize,
+    /// `None` once [`finish_writeback`] has taken responsibility. See [`Fill`].
+    token: Option<IoToken>,
     virt: u64,
     key: BlockKey,
-    settled: bool,
 }
 
 impl Drop for Writeback {
     fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
+        let Some(token) = self.token.take() else { return };
         let mut guard = CACHE.lock();
         let Some(cache) = guard.as_mut() else { return };
-        cache.table.end_io(self.slot, SlotState::Dirty);
+        cache.table.end_io(token, SlotState::Dirty);
     }
 }
 
@@ -496,7 +518,7 @@ enum Blocked {
 /// Returns `Err(Blocked)` when the caller must wait. The whole operation runs
 /// under the lock and issues nothing: a full-block write has no need to read
 /// the block it replaces.
-fn store(key: BlockKey, data: &[u8]) -> Result<Result<(), Blocked>, BcacheError> {
+fn store(key: BlockKey, data: &[u8; BLOCK_BYTES]) -> Result<Result<(), Blocked>, BcacheError> {
     let mut guard = CACHE.lock();
     let cache = guard.as_mut().ok_or(BcacheError::Uninitialised)?;
 
@@ -525,20 +547,22 @@ fn store(key: BlockKey, data: &[u8]) -> Result<Result<(), Blocked>, BcacheError>
             slot
         }
         None => {
-            let slot = claim_free_slot(cache, key)?;
+            let token = claim_free_slot(cache, key)?;
+            let slot = token.slot();
             // `insert` hands the slot back `InFlight`, which is right for a
             // fill and wrong here: nothing is being read into it and the copy
             // below fills it completely. Resolved without releasing the lock,
             // so no reader can observe a slot that is `InFlight` while not
             // being filled -- which `claim` would read as a writeback and pin.
-            cache.table.end_io(slot, SlotState::Clean);
+            cache.table.end_io(token, SlotState::Clean);
             slot
         }
     };
 
     // SAFETY: `virt` is the HHDM mapping of a frame reserved for the life of
-    // the kernel, `data` is a separate buffer of exactly `BLOCK_BYTES`, and the
-    // lock held here excludes every other access to the slot.
+    // the kernel, `data` is a separate buffer of exactly `BLOCK_BYTES` -- by
+    // its type, not by a check one function away -- and the lock held here
+    // excludes every other access to the slot.
     unsafe {
         core::ptr::copy_nonoverlapping(data.as_ptr(), cache.frames[slot] as *mut u8, BLOCK_BYTES);
     }
@@ -558,18 +582,20 @@ fn store(key: BlockKey, data: &[u8]) -> Result<Result<(), Blocked>, BcacheError>
 /// again, get `None` again, and report `Exhausted` -- a wrong error and a
 /// cached block thrown away for nothing. Both callers look the key up first
 /// under this same lock; the assertion is what says so to the third.
-fn claim_free_slot(cache: &mut Bcache, key: BlockKey) -> Result<usize, BcacheError> {
+fn claim_free_slot(cache: &mut Bcache, key: BlockKey) -> Result<IoToken, BcacheError> {
     match cache.table.insert(key) {
-        Ok(slot) => Ok(slot),
+        Ok(token) => Ok(token),
         // Structural rather than asserted: both callers look the key up under
         // this same lock first, and `insert` now says which refusal it made, so
         // reading a resident key as a full table is no longer expressible.
-        Err(InsertError::AlreadyResident(slot)) => Ok(slot),
+        Err(InsertError::AlreadyResident(_)) => {
+            unreachable!("both callers rule out residency under this same lock")
+        }
         Err(InsertError::Full) => {
             // Evicting is the whole point of `victim` refusing, so a refusal
             // here is reported rather than worked around.
             let victim = cache.table.victim().ok_or(BcacheError::Exhausted)?;
-            assert!(cache.table.evict(victim), "victim offered a slot evict refused");
+            cache.table.evict(victim).expect("victim offered a slot evict refused");
             // The flag belongs to the block, not the slot: a fresh occupant
             // inherits nothing from the one it replaced.
             cache.writeback_failed[victim] = false;
@@ -583,9 +609,13 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
     if key.dev != ONLY_DEVICE {
         return Err(BcacheError::UnknownDevice);
     }
-    if data.len() != BLOCK_BYTES {
-        return Err(BcacheError::PartialBlock);
-    }
+    // Converted here rather than checked here: `store` copies a fixed
+    // `BLOCK_BYTES` from this pointer, and carrying that invariant across a
+    // function boundary in a comment is what lets a second caller -- the
+    // read-modify-write `PartialBlock` already anticipates -- read past the end
+    // of a shorter slice and put kernel memory on the disk.
+    let data: &[u8; BLOCK_BYTES] =
+        data.try_into().map_err(|_| BcacheError::PartialBlock)?;
     lba_of(key)?;
     // One deadline per reason. Shared, a reader arriving after a long wait on
     // io is refused on its *first* tick against a bound already spent waiting
@@ -698,19 +728,22 @@ fn begin_writeback(slot: usize) -> Option<Writeback> {
     // The prior state is `Dirty` by the check above; `begin_io` returning
     // anything else means the table and this function disagree about what a
     // dirty slot is.
-    assert_eq!(cache.table.begin_io(slot), SlotState::Dirty);
-    Some(Writeback { slot, virt: cache.frames[slot], key, settled: false })
+    let token = cache.table.begin_io(slot);
+    assert_eq!(token.prior(), SlotState::Dirty);
+    Some(Writeback { token: Some(token), virt: cache.frames[slot], key })
 }
 
 /// Ends a writeback. A write that failed leaves the block dirty.
-fn finish_writeback(slot: usize, ok: bool) {
+fn finish_writeback(mut writeback: Writeback, ok: bool) {
+    let token = writeback.token.take().expect("a writeback was resolved twice");
+    let slot = token.slot();
     let mut guard = CACHE.lock();
     let cache = guard.as_mut().expect("a writeback completed after the cache was torn down");
     // `Dirty` on failure, not `Clean`. The caller was told the write succeeded,
     // so a slot resolved clean here drops the data with nothing left to record
     // that it ever existed -- and a later read is answered from that same slot,
     // so it reads as the write having worked.
-    cache.table.end_io(slot, if ok { SlotState::Clean } else { SlotState::Dirty });
+    cache.table.end_io(token, if ok { SlotState::Clean } else { SlotState::Dirty });
     cache.writeback_failed[slot] = !ok;
 }
 
@@ -720,7 +753,7 @@ fn finish_writeback(slot: usize, ok: bool) {
 /// what a writeback leaves behind -- the failure arm in particular, where the
 /// difference between `Clean` and `Dirty` is whether the data still exists.
 async fn write_back(slot: usize) -> Option<Result<(), BlockError>> {
-    let mut writeback = begin_writeback(slot)?;
+    let writeback = begin_writeback(slot)?;
     let (virt, key) = (writeback.virt, writeback.key);
     // SAFETY: the slot is `InFlight`, so nothing may write to or reuse it until
     // `finish_writeback` runs, and the frame is reserved for the life of the
@@ -732,9 +765,7 @@ async fn write_back(slot: usize) -> Option<Result<(), BlockError>> {
     // leave a dirty slot no writeback could ever resolve.
     let lba = lba_of(key).expect("an unvalidated key reached a writeback");
     let outcome = block::write_at(lba, buf).await;
-    // From here the slot's fate is `finish_writeback`'s, not the guard's.
-    writeback.settled = true;
-    finish_writeback(slot, outcome.is_ok());
+    finish_writeback(writeback, outcome.is_ok());
     Some(outcome)
 }
 
@@ -813,6 +844,12 @@ pub async fn sync() -> Result<(), BcacheError> {
 /// Pinned slots are skipped: writing one back is harmless, but it would not
 /// make room, so choosing one turns a table under pressure into a stream of
 /// writebacks that free nothing.
+/// The state of one slot, for callers that already hold its index.
+fn state_of_slot(slot: usize) -> Option<SlotState> {
+    let guard = CACHE.lock();
+    guard.as_ref()?.table.state_of(slot)
+}
+
 fn flushable_slot() -> Option<usize> {
     let guard = CACHE.lock();
     let cache = guard.as_ref()?;
@@ -844,15 +881,31 @@ fn flushable_slot() -> Option<usize> {
 async fn make_room() -> Result<bool, BcacheError> {
     let Some(slot) = flushable_slot() else { return Ok(false) };
     match write_back(slot).await {
-        // Raced with another writer; the slot is no longer dirty, which is
-        // progress from this caller's point of view.
-        None => Ok(true),
+        // Two reasons, and they are not the same. The slot may have been
+        // cleaned by another writeback that completed -- progress. Or another
+        // processor's writeback may still be outstanding against it, in which
+        // case nothing has been freed and returning immediately burns one of
+        // the caller's retries against a table that is about to have room. The
+        // wait is what makes the retry land after that writeback rather than
+        // ahead of it.
+        None => {
+            if !matches!(state_of_slot(slot), Some(SlotState::Clean) | None) {
+                wait_a_tick().await;
+            }
+            Ok(true)
+        }
         Some(Ok(())) => Ok(true),
         Some(Err(error)) => Err(BcacheError::Device(error)),
     }
 }
 
-/// Slots currently holding a block. For tests and diagnostics.
+/// Slots currently holding a block.
+///
+/// `#[cfg(test)]` like `state_of_for_test` beside it, rather than left public
+/// with a doc comment saying it is for tests: a "diagnostic" API with no caller
+/// reads as production surface and outlives the trimming pass that would
+/// otherwise remove it.
+#[cfg(test)]
 pub fn resident() -> usize {
     let guard = CACHE.lock();
     match guard.as_ref() {
@@ -864,6 +917,7 @@ pub fn resident() -> usize {
 }
 
 /// Slots holding a block that has not reached the disk.
+#[cfg(test)]
 pub fn dirty_count() -> usize {
     let guard = CACHE.lock();
     match guard.as_ref() {
@@ -902,7 +956,7 @@ pub fn reset_for_test() {
             continue;
         }
         if cache.table.state_of(slot) == Some(SlotState::InFlight) {
-            cache.table.end_io(slot, SlotState::Clean);
+            cache.table.force_end_io(slot, SlotState::Clean);
         }
         cache.filling[slot] = false;
         // A dirty slot refuses eviction, which is the point of `evict`. Between
@@ -911,7 +965,7 @@ pub fn reset_for_test() {
         // already, and flushing here would write a test's payload over a
         // sector another test reads.
         cache.table.mark_clean(slot);
-        assert!(cache.table.evict(slot), "a slot could not be released between tests");
+        cache.table.evict(slot).expect("a slot could not be released between tests");
     }
 }
 
@@ -1452,6 +1506,12 @@ mod tests {
     /// Half-polling is how the states that need a second thread are reached
     /// without one: a future polled once and then left alone holds its slot in
     /// exactly the state a parked peer would.
+    /// A whole-block view of a test payload, for the tests that call `store`
+    /// directly rather than through `write_block`.
+    fn block_sized(data: &[u8]) -> &[u8; BLOCK_BYTES] {
+        data.try_into().expect("a test payload that is not a whole block")
+    }
+
     fn poll_context() -> core::task::Waker {
         crate::task::waker_for(crate::sched::current_id())
     }
@@ -1553,7 +1613,7 @@ mod tests {
         // A writer meets the same slot and is told to wait for the io.
         let payload = alloc::vec![0u8; BLOCK_BYTES];
         assert!(
-            matches!(store(key, &payload), Ok(Err(Blocked::Filling))),
+            matches!(store(key, block_sized(&payload)), Ok(Err(Blocked::Filling))),
             "a write during a fill was not blocked on the fill"
         );
 
@@ -1593,7 +1653,7 @@ mod tests {
 
         let other = altered(&payload);
         assert!(
-            matches!(store(key, &other), Ok(Err(Blocked::WritingBack))),
+            matches!(store(key, block_sized(&other)), Ok(Err(Blocked::WritingBack))),
             "a write during a writeback was allowed to tear the buffer"
         );
         // A *reader* is not blocked: the device is only reading it too.
@@ -1687,6 +1747,40 @@ mod tests {
         // And the cache still works afterwards, so the test left nothing behind.
         assert!(block_on(read_block(key)).is_ok(), "the restored cache is unusable");
         reset_for_test();
+    }
+
+    #[test_case]
+    fn a_full_timer_table_does_not_stop_the_machine() {
+        // `wait_a_tick` falls back to `yield_now` when no timer slot is free.
+        // That fallback was a bug fix -- the infallible `sleep_ticks` panics,
+        // and a full timer table is a transient condition under load, not a
+        // reason to halt -- and it had no regression test, so the arm was
+        // reachable only by a condition nothing in the suite produced.
+        //
+        // Forced rather than raced: the table is filled deliberately, because a
+        // path that only runs under pressure is a property of the machine's
+        // timing rather than of the code unless the pressure is made to happen.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 5 };
+        let original = read_through_the_device(key);
+        let payload = altered(&original);
+        block_on(write_block(key, &payload)).expect("the write was refused");
+        let held = block_on(read_block(key)).expect("the read failed");
+
+        let taken = crate::task::fill_timer_table_for_test();
+        assert_eq!(crate::task::free_timer_slots_for_test(), 0, "the timer table is not full");
+        // A write blocked on a reader, with no timer available: it must report
+        // the pin rather than panic on the missing slot.
+        let outcome = block_on(write_block(key, &payload));
+        crate::task::release_timer_slots_for_test(&taken);
+        assert!(
+            matches!(outcome, Err(BcacheError::Pinned)),
+            "a full timer table did not fall back to yielding"
+        );
+
+        drop(held);
+        reset_for_test();
+        assert_eq!(read_through_the_device(key), original, "the discarded write reached the disk");
     }
 
     #[test_case]
