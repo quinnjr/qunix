@@ -381,13 +381,51 @@ unsafe fn install_msix(transport: &mut Transport) -> Result<(), BlockError> {
     Ok(())
 }
 
+/// A submitted request, quarantined if the caller never waits for it.
+///
+/// `read_at`/`write_at` `await` a completion, and a future may be dropped
+/// before it resolves -- a thread torn down mid-`block_on`, or the request
+/// composed into a timeout. The chain is *not* freed on that path, for the
+/// same reason the deadline does not free it: the device may still be reading
+/// those descriptors and writing that bounce buffer, so handing them to the
+/// next request lets a late completion mark somebody else's request done from
+/// a status byte written for this one.
+///
+/// So it is quarantined exactly as a timeout is, and `handle_completion`
+/// reclaims it when the completion arrives. Without this the chain is neither
+/// freed nor quarantined: one of 21 in-flight slots is consumed per abandoned
+/// request, and the queue drains into `QueueFull` errors in code with nothing
+/// to do with the cause.
+struct Request {
+    head: u16,
+    /// Set once `finish` has taken responsibility for the chain.
+    settled: bool,
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut guard = DEVICE.lock();
+        let Some(blk) = guard.as_mut() else { return };
+        if let Some(slot) = blk.slots[self.head as usize].as_mut() {
+            slot.abandoned = true;
+        }
+        ABANDONED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Reads `buf.len()` bytes starting at sector `lba`.
 pub async fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
     // The deadline first. See `reserve_deadline`: once `submit` returns, the
     // device owns the chain, and there is no correct way to take it back.
     let deadline = reserve_deadline()?;
     let head = submit(lba, buf.len(), None)?;
+    let mut request = Request { head, settled: false };
     let status = Completion { head, deadline }.await;
+    // From here the chain is `finish`'s responsibility, not the guard's.
+    request.settled = true;
     finish(head, status, Some(buf))
 }
 
@@ -395,7 +433,10 @@ pub async fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
 pub async fn write_at(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let deadline = reserve_deadline()?;
     let head = submit(lba, buf.len(), Some(buf))?;
+    let mut request = Request { head, settled: false };
     let status = Completion { head, deadline }.await;
+    // From here the chain is `finish`'s responsibility, not the guard's.
+    request.settled = true;
     finish(head, status, None)
 }
 

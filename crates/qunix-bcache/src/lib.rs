@@ -83,6 +83,22 @@ impl Slot {
     }
 }
 
+/// Why [`Cache::insert`] could not claim a slot.
+///
+/// Two variants rather than one `None`, because the two call for opposite
+/// responses: a full table wants a victim evicted, and a resident key wants the
+/// slot that already holds it. A caller that reads the second as the first
+/// evicts an innocent clean block, inserts again, is refused again, and reports
+/// exhaustion -- which is exactly the bug this crate's own consumer shipped
+/// while the distinction lived in a doc comment and a `debug_assert!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertError {
+    /// `key` already occupies this slot. No second slot was claimed.
+    AlreadyResident(usize),
+    /// Every slot is occupied.
+    Full,
+}
+
 /// Whether a slot's memory may be taken for another block.
 ///
 /// One predicate, used by both [`Cache::victim`] and [`Cache::evict`]. Written
@@ -131,11 +147,10 @@ impl<const N: usize> Cache<N> {
             .position(|slot| slot.state != SlotState::Free && slot.key == key)
     }
 
-    /// Claims a free slot for `key`, or `None` if none is free or `key` is
-    /// already resident.
+    /// Claims a free slot for `key`.
     ///
     /// The claimed slot is `InFlight`, not `Clean`. Nothing has been read into
-    /// it yet, so `Clean` — "these contents match the device" — would be a
+    /// it yet, so `Clean` -- "these contents match the device" -- would be a
     /// lie for as long as the fill takes, and the fill is an `await`. A second
     /// caller looking the key up in that window would take the hit and read a
     /// buffer holding whatever the frame held before, with every operation
@@ -144,17 +159,20 @@ impl<const N: usize> Cache<N> {
     /// Refusing a resident key is the other half of the same guarantee. Two
     /// slots for one block diverge the moment either is written: `lookup`
     /// answers from one, writeback flushes the other, and a read afterwards
-    /// serves bytes that were overwritten. The two refusals share a return
-    /// value because a caller reaches `insert` only after `lookup` missed, so
-    /// it already knows which one it got.
-    pub fn insert(&mut self, key: BlockKey) -> Option<usize> {
-        if self.lookup(key).is_some() {
-            return None;
+    /// serves bytes that were overwritten. The refusal names the slot that
+    /// already holds it, so a caller cannot mistake it for a full table.
+    pub fn insert(&mut self, key: BlockKey) -> Result<usize, InsertError> {
+        if let Some(slot) = self.lookup(key) {
+            return Err(InsertError::AlreadyResident(slot));
         }
-        let index = self.slots.iter().position(|slot| slot.state == SlotState::Free)?;
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.state == SlotState::Free)
+            .ok_or(InsertError::Full)?;
         self.slots[index] =
             Slot { key, state: SlotState::InFlight, pins: 0, dirtied_during_io: false };
-        Some(index)
+        Ok(index)
     }
 
     /// The key a slot holds.
@@ -347,12 +365,16 @@ mod tests {
         // The window between claiming a slot and the read landing in it is an
         // `await`. A slot marked `Clean` there is a hit on a buffer holding
         // whatever the frame held before, and every operation returns success.
-        let mut cache = Cache::<2>::new();
+        // A one-slot table, deliberately. With two slots `victim` answers with
+        // the *free* one whether or not it refuses the in-flight one, so the
+        // assertion below would hold with the `InFlight` refusal deleted.
+        let mut cache = Cache::<1>::new();
         let key = BlockKey { dev: 0, block: 1 };
         let slot = cache.insert(key).unwrap();
         assert_eq!(cache.state_of(slot), Some(SlotState::InFlight), "an unfilled slot read clean");
-        // And it is not evictable while the read into it is outstanding.
-        assert_eq!(cache.victim(), Some(1), "the slot being filled was offered for reuse");
+        // And it is not reusable while the read into it is outstanding.
+        assert_eq!(cache.victim(), None, "the slot being filled was offered for reuse");
+        assert!(!cache.evict(slot), "the slot being filled was evicted");
         cache.end_io(slot, SlotState::Clean);
         assert_eq!(cache.state_of(slot), Some(SlotState::Clean));
     }
@@ -365,11 +387,18 @@ mod tests {
         let mut cache = Cache::<4>::new();
         let key = BlockKey { dev: 0, block: 1 };
         let first = filled(&mut cache, 0, 1);
-        assert_eq!(cache.insert(key), None, "a resident block was given a second slot");
+        assert_eq!(
+            cache.insert(key),
+            Err(InsertError::AlreadyResident(first)),
+            "a resident block was given a second slot, or refused as a full table"
+        );
         // Including while the first is still being filled -- the window a
         // second caller is most likely to arrive in.
         let other = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
-        assert_eq!(cache.insert(BlockKey { dev: 0, block: 2 }), None);
+        assert_eq!(
+            cache.insert(BlockKey { dev: 0, block: 2 }),
+            Err(InsertError::AlreadyResident(other))
+        );
         assert_eq!(cache.lookup(BlockKey { dev: 0, block: 2 }), Some(other));
         assert_eq!(cache.lookup(key), Some(first));
     }
@@ -503,6 +532,71 @@ mod tests {
         cache.mark_clean(a);
     }
 
+    // Each refusal below has its own test because the assertions are *executed*
+    // by the positive tests and pass there, so the crate reports full line
+    // coverage while no refusal is ever tripped. That is verbatim the gap
+    // CLAUDE.md records two memory-corruption bugs surviving inside.
+
+    #[test]
+    #[should_panic(expected = "a slot holding no block was dirtied")]
+    fn a_slot_holding_nothing_cannot_be_dirtied() {
+        // Dirtying an empty slot queues a writeback of whatever the frame held,
+        // addressed to the stale key still sitting in it.
+        Cache::<2>::new().mark_dirty(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "only a resident slot")]
+    fn a_slot_holding_nothing_cannot_be_marked_clean() {
+        // "Clean" means the contents match the device. An empty slot's do not.
+        Cache::<2>::new().mark_clean(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot begin another")]
+    fn a_slot_the_device_already_owns_cannot_begin_a_second_io() {
+        // The dangerous one: a second `begin_io` lets `sync` issue a concurrent
+        // write against a buffer the device is already reading.
+        let mut cache = Cache::<2>::new();
+        let a = filled(&mut cache, 0, 1);
+        cache.begin_io(a);
+        cache.begin_io(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot begin another")]
+    fn a_slot_holding_nothing_cannot_begin_io() {
+        Cache::<2>::new().begin_io(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "no io was outstanding")]
+    fn a_slot_with_no_io_cannot_end_one() {
+        // An unpaired `end_io` resolves a state nothing set, so a slot that was
+        // `Dirty` silently becomes whatever the caller passed.
+        let mut cache = Cache::<2>::new();
+        let a = filled(&mut cache, 0, 1);
+        cache.end_io(a, SlotState::Clean);
+    }
+
+    #[test]
+    #[should_panic(expected = "ending io does not release a slot")]
+    fn ending_io_cannot_free_a_slot() {
+        // `Free` through `end_io` would leave the key and the pins behind,
+        // which is a released slot nothing can account for. `evict` is the only
+        // way out.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        cache.end_io(a, SlotState::Free);
+    }
+
+    #[test]
+    #[should_panic(expected = "a slot holding no block was pinned")]
+    fn a_slot_holding_nothing_cannot_be_pinned() {
+        // A pin on an empty slot keeps a free slot out of `victim` forever.
+        Cache::<2>::new().pin(0);
+    }
+
     #[test]
     #[should_panic(expected = "not pinned")]
     fn an_unbalanced_unpin_is_a_bug_rather_than_a_no_op() {
@@ -593,7 +687,7 @@ mod tests {
         filled(&mut cache, 0, 2);
         assert_eq!(
             cache.insert(BlockKey { dev: 0, block: 3 }),
-            None,
+            Err(InsertError::Full),
             "a full table handed out a slot that was already occupied"
         );
         // And the occupants are still there.
@@ -608,7 +702,7 @@ mod tests {
         let mut cache = Cache::<8>::new();
         for block in 0..8u64 {
             assert!(
-                cache.insert(BlockKey { dev: 0, block }).is_some(),
+                cache.insert(BlockKey { dev: 0, block }).is_ok(),
                 "the table refused block {block} with capacity 8"
             );
         }

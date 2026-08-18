@@ -27,7 +27,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use qunix_bcache::{BlockKey, Cache, SlotState};
+use qunix_bcache::{BlockKey, Cache, InsertError, SlotState};
 use std::collections::HashMap;
 
 const SLOTS: usize = 16;
@@ -93,7 +93,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 let resident_already = model.values().any(|o| o.key == key);
                 let full = model.len() == SLOTS;
                 match cache.insert(key) {
-                    Some(slot) => {
+                    Ok(slot) => {
                         assert!(!resident_already, "{key:?} was given a second slot");
                         assert!(!full, "a full table handed out a slot");
                         assert!(model.insert(slot, Occupant {
@@ -105,9 +105,21 @@ fuzz_target!(|ops: Vec<Op>| {
                             dirtied_during_io: false,
                         }).is_none(), "slot {slot} was handed out while occupied");
                     }
-                    None => assert!(
-                        resident_already || full,
-                        "{key:?} was refused by a table that was neither full nor holding it"
+                    // The refusal names itself now, so the model asserts *which*
+                    // one rather than reconstructing it from its own state --
+                    // a caller that could not tell the two apart is the bug
+                    // this signature exists to prevent.
+                    Err(InsertError::AlreadyResident(slot)) => {
+                        assert!(!full || resident_already, "a full table reported residency");
+                        assert_eq!(
+                            model.get(&slot).map(|o| o.key),
+                            Some(key),
+                            "insert named a slot that does not hold {key:?}"
+                        );
+                    }
+                    Err(InsertError::Full) => assert!(
+                        full && !resident_already,
+                        "{key:?} was refused as full by a table that was not full"
                     ),
                 }
             }
@@ -202,7 +214,7 @@ fuzz_target!(|ops: Vec<Op>| {
     }
     // And an emptied table is a usable one, not merely an empty-looking one.
     for block in 0..SLOTS as u64 {
-        assert!(cache.insert(BlockKey { dev: 0, block }).is_some(), "the drained table refused");
+        assert!(cache.insert(BlockKey { dev: 0, block }).is_ok(), "the drained table refused");
     }
 });
 
