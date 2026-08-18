@@ -543,3 +543,46 @@ whose fixed size is the reason the flush path cannot allocate, and the thing
 being waited for is a disk read. The bound (`FILL_WAIT_LIMIT`) is what stops a
 lost completion becoming a stopped machine instead of a failed request.
 
+### D7: the test disk persists, so the plan's writeback test cannot work
+
+Task 4's test as written asserts `assert_ne!(&before[0..8], &payload[0..8], "the
+write reached the disk before sync")` against a fixed payload. But
+`xtask::image::build_test_disk` writes the image *only when absent*, deliberately
+— its own doc says regenerating per run "would erase whatever a write test had
+just put there". So the first boot leaves `0xfeed_face` on block 3 and the second
+boot's copy of the same test finds it already there and fails the `assert_ne`.
+`cargo xtask test` runs the suite twice, so this would have failed on its first
+green run.
+
+The test derives its payload from whatever the disk currently holds (every byte
+inverted), asserts both halves against that, and then restores the original and
+asserts the restore. It is repeatable from any starting state and leaves the
+image as it found it. The write tests own blocks 240..248 so a payload left
+behind by a failure cannot change what another test reads.
+
+### D8: `write_block` refuses a partial block, and issues no read
+
+A full-block write has no need to read the block it replaces, so `write_block`
+does no I/O at all: it copies under the lock and marks the slot dirty. Which
+means a write that does *not* cover the block cannot be served — padding invents
+bytes the caller never supplied and puts them on the disk, and merging is a
+read-modify-write, a different operation with a different failure mode.
+`BcacheError::PartialBlock` refuses it, with a test.
+
+`store` waits on *any* outstanding I/O, not just a fill. Task 3's read path
+proceeds through a writeback because the device is only reading the buffer; a
+writer must not, because it would hand the device a torn mixture of the block it
+was told to write and the one written over it — successfully.
+
+### D9: the whole-block assertion was not whole-block
+
+Mutation-testing the writeback length found the test suite passing with `sync`
+sending one sector instead of eight. The payload helper inverted only the first
+sector, so the remaining seven equalled what was already on the disk and the
+`assert_eq!(read_through_the_device(key), payload)` comparison was satisfied by a
+one-sector write. It inverts every byte now.
+
+This is the failure mode `CLAUDE.md` warns about — an assertion that reads as
+comprehensive and is not — and it was invisible to every other check. The only
+thing that surfaced it was mutating the length and finding the suite still green.
+

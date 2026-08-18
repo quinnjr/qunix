@@ -24,6 +24,16 @@
 //! evicted and refilled with another block: the read succeeds, the bytes are
 //! wrong, and nothing between here and the program that asked is in a position
 //! to notice. The pin is what makes eviction refuse while a reader is live.
+//!
+//! # A write is acknowledged before it reaches the disk
+//!
+//! [`write_block`] copies into the slot and marks it dirty; [`sync`] is what
+//! puts it on the disk. That is the point of a buffer cache and it is also the
+//! one place it can lose data silently: the caller has already been told the
+//! write succeeded, so a dirty slot that never reaches the device is a loss no
+//! later read can reveal — the cache answers that read from the same slot.
+//! Every path that can take a slot out of `Dirty` therefore either wrote it or
+//! leaves it dirty, including the ones that fail.
 
 use core::ops::Deref;
 
@@ -77,6 +87,14 @@ pub enum BcacheError {
     Exhausted,
     /// Another thread's fill of this block did not finish in time.
     FillStalled,
+    /// A write did not cover the whole block.
+    ///
+    /// Refused rather than padded or merged. Padding invents bytes the caller
+    /// never supplied and writes them to the disk; merging is a
+    /// read-modify-write, which is a different operation with a different
+    /// failure mode, and doing it silently under a `write_block` call would
+    /// turn one refused request into two issued ones.
+    PartialBlock,
     /// The key names a device this kernel has no driver for.
     ///
     /// Refused here rather than ignored. `dev` is half the cache key, so a
@@ -222,16 +240,7 @@ fn claim(key: BlockKey) -> Result<Claim, BcacheError> {
         return Ok(Claim::Hit(BlockRef { slot, virt: cache.frames[slot] }));
     }
 
-    let slot = match cache.table.insert(key) {
-        Some(slot) => slot,
-        None => {
-            // Full. Evicting is the whole point of `victim` refusing, so a
-            // refusal here is reported rather than worked around.
-            let victim = cache.table.victim().ok_or(BcacheError::Exhausted)?;
-            assert!(cache.table.evict(victim), "victim offered a slot evict refused");
-            cache.table.insert(key).ok_or(BcacheError::Exhausted)?
-        }
-    };
+    let slot = claim_free_slot(cache, key)?;
     cache.filling[slot] = true;
     Ok(Claim::Fill(Fill { slot, virt: cache.frames[slot], settled: false }))
 }
@@ -286,16 +295,7 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
                 if waited > FILL_WAIT_LIMIT {
                     return Err(BcacheError::FillStalled);
                 }
-                // Fallible, because the infallible form panics when the timer
-                // table is full and a full timer table is a transient
-                // condition, not a reason to stop the machine. Several threads
-                // missing at once is exactly when it happens. Yielding instead
-                // still makes progress and is still bounded by the count
-                // above.
-                match crate::task::try_sleep_ticks(FILL_WAIT_TICKS) {
-                    Ok(sleep) => sleep.await,
-                    Err(_) => crate::sched::yield_now(),
-                }
+                wait_a_tick().await;
             }
             Claim::Fill(mut fill) => {
                 let (slot, virt) = (fill.slot, fill.virt);
@@ -317,6 +317,200 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
     }
 }
 
+/// A slot whose writeback is outstanding, left dirty if the write never happens.
+///
+/// The mirror of [`Fill`], with the opposite recovery. An abandoned fill has
+/// nothing worth keeping, so it releases the slot; an abandoned writeback still
+/// holds the caller's data, and the caller has already been told the write
+/// succeeded. Releasing it -- or resolving it clean -- would drop that data
+/// with nothing left to say it existed. So it goes back to `Dirty` and the next
+/// [`sync`] tries again.
+struct Writeback {
+    slot: usize,
+    virt: u64,
+    key: BlockKey,
+    settled: bool,
+}
+
+impl Drop for Writeback {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut guard = CACHE.lock();
+        let Some(cache) = guard.as_mut() else { return };
+        cache.table.end_io(self.slot, SlotState::Dirty);
+    }
+}
+
+/// Copies `data` into `key`'s slot and marks it dirty.
+///
+/// Returns `false` when the slot has I/O outstanding and the caller must wait.
+/// The whole operation runs under the lock and issues nothing: a full-block
+/// write has no need to read the block it replaces.
+fn store(key: BlockKey, data: &[u8]) -> Result<bool, BcacheError> {
+    let mut guard = CACHE.lock();
+    let cache = guard.as_mut().expect("the buffer cache was used before init");
+
+    let slot = match cache.table.lookup(key) {
+        Some(slot) => {
+            // Any outstanding I/O, not just a fill. A fill would be overwritten
+            // by the read it is waiting for, and a writeback would hand the
+            // device a torn mixture of the block it was told to write and the
+            // one written over it -- which lands on the disk successfully.
+            if cache.table.state_of(slot) == Some(SlotState::InFlight) {
+                return Ok(false);
+            }
+            slot
+        }
+        None => {
+            let slot = claim_free_slot(cache, key)?;
+            // `insert` hands the slot back `InFlight`, which is right for a
+            // fill and wrong here: nothing is being read into it and the copy
+            // below fills it completely. Resolved without releasing the lock,
+            // so no reader can observe a slot that is `InFlight` while not
+            // being filled -- which `claim` would read as a writeback and pin.
+            cache.table.end_io(slot, SlotState::Clean);
+            slot
+        }
+    };
+
+    // SAFETY: `virt` is the HHDM mapping of a frame reserved for the life of
+    // the kernel, `data` is a separate buffer of exactly `BLOCK_BYTES`, and the
+    // lock held here excludes every other access to the slot.
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), cache.frames[slot] as *mut u8, BLOCK_BYTES);
+    }
+    cache.table.mark_dirty(slot);
+    Ok(true)
+}
+
+/// A free slot for `key`, evicting a reusable one if the table is full.
+fn claim_free_slot(cache: &mut Bcache, key: BlockKey) -> Result<usize, BcacheError> {
+    if let Some(slot) = cache.table.insert(key) {
+        return Ok(slot);
+    }
+    // Full. Evicting is the whole point of `victim` refusing, so a refusal here
+    // is reported rather than worked around.
+    let victim = cache.table.victim().ok_or(BcacheError::Exhausted)?;
+    assert!(cache.table.evict(victim), "victim offered a slot evict refused");
+    cache.table.insert(key).ok_or(BcacheError::Exhausted)
+}
+
+/// Copies a block into the cache. It reaches the disk at the next [`sync`].
+pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> {
+    if key.dev != ONLY_DEVICE {
+        return Err(BcacheError::UnknownDevice);
+    }
+    if data.len() != BLOCK_BYTES {
+        return Err(BcacheError::PartialBlock);
+    }
+    let mut waited = 0u32;
+    loop {
+        if store(key, data)? {
+            return Ok(());
+        }
+        waited += 1;
+        if waited > FILL_WAIT_LIMIT {
+            return Err(BcacheError::FillStalled);
+        }
+        wait_a_tick().await;
+    }
+}
+
+/// Yields for one tick, or just yields if no timer slot is free.
+///
+/// The infallible `sleep_ticks` panics when the timer table is full, and a full
+/// timer table is a transient condition rather than a reason to stop the
+/// machine -- several threads waiting at once is exactly when it happens.
+async fn wait_a_tick() {
+    match crate::task::try_sleep_ticks(FILL_WAIT_TICKS) {
+        Ok(sleep) => sleep.await,
+        Err(_) => crate::sched::yield_now(),
+    }
+}
+
+/// Every dirty slot, as a bitmask.
+///
+/// A mask rather than a list because [`sync`] must not allocate: it runs when
+/// memory pressure is what triggered it, and a `Vec` of slot indices is an
+/// allocation on the one path that may not make one. `SLOTS` is checked against
+/// the mask's width so growing the table cannot silently drop the slots past
+/// the thirty-second.
+fn dirty_mask() -> u32 {
+    const _: () = assert!(SLOTS <= u32::BITS as usize, "the dirty mask cannot address every slot");
+    let guard = CACHE.lock();
+    match guard.as_ref() {
+        Some(cache) => cache.table.dirty_slots().fold(0u32, |mask, slot| mask | (1 << slot)),
+        None => 0,
+    }
+}
+
+/// Takes a slot for writeback, or `None` if it is no longer dirty.
+fn begin_writeback(slot: usize) -> Option<Writeback> {
+    let mut guard = CACHE.lock();
+    let cache = guard.as_mut()?;
+    if cache.table.state_of(slot) != Some(SlotState::Dirty) {
+        return None;
+    }
+    let key = cache.table.key_of(slot)?;
+    assert!(!cache.filling[slot], "slot {slot} is dirty and being filled at once");
+    // The prior state is `Dirty` by the check above; `begin_io` returning
+    // anything else means the table and this function disagree about what a
+    // dirty slot is.
+    assert_eq!(cache.table.begin_io(slot), SlotState::Dirty);
+    Some(Writeback { slot, virt: cache.frames[slot], key, settled: false })
+}
+
+/// Ends a writeback. A write that failed leaves the block dirty.
+fn finish_writeback(slot: usize, ok: bool) {
+    let mut guard = CACHE.lock();
+    let cache = guard.as_mut().expect("a writeback completed after the cache was torn down");
+    // `Dirty` on failure, not `Clean`. The caller was told the write succeeded,
+    // so a slot resolved clean here drops the data with nothing left to record
+    // that it ever existed -- and a later read is answered from that same slot,
+    // so it reads as the write having worked.
+    cache.table.end_io(slot, if ok { SlotState::Clean } else { SlotState::Dirty });
+}
+
+/// Writes every block that was dirty when this was called.
+///
+/// A block dirtied *while* this runs is not covered: `end_io` leaves such a
+/// slot dirty and the next `sync` writes it. The alternative -- looping until
+/// nothing is dirty -- lets a steady writer keep `sync` from ever returning,
+/// which is a hang rather than a stronger guarantee.
+///
+/// One failing block does not abandon the rest. Stopping at the first error
+/// would leave later blocks dirty for a reason that has nothing to do with
+/// them, so every slot in the snapshot is attempted and the first error is
+/// what is reported.
+pub async fn sync() -> Result<(), BcacheError> {
+    let mut pending = dirty_mask();
+    let mut failure = None;
+    while pending != 0 {
+        let slot = pending.trailing_zeros() as usize;
+        pending &= !(1 << slot);
+        let Some(mut writeback) = begin_writeback(slot) else { continue };
+        let (virt, key) = (writeback.virt, writeback.key);
+        // SAFETY: the slot is `InFlight`, so nothing may write to or reuse it
+        // until `finish_writeback` runs, and the frame is reserved for the life
+        // of the kernel. A reader may hold it concurrently, which is why this
+        // is a shared reference: the device only reads it too.
+        let buf = unsafe { core::slice::from_raw_parts(virt as *const u8, BLOCK_BYTES) };
+        let outcome = block::write_at(key.block * SECTORS_PER_BLOCK, buf).await;
+        // From here the slot's fate is `finish_writeback`'s, not the guard's.
+        writeback.settled = true;
+        finish_writeback(slot, outcome.is_ok());
+        if let Err(error) = outcome {
+            failure.get_or_insert(BcacheError::Device(error));
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Slots currently holding a block. For tests and diagnostics.
 pub fn resident() -> usize {
     let guard = CACHE.lock();
@@ -326,6 +520,22 @@ pub fn resident() -> usize {
         }
         None => 0,
     }
+}
+
+/// Slots holding a block that has not reached the disk.
+pub fn dirty_count() -> usize {
+    let guard = CACHE.lock();
+    match guard.as_ref() {
+        Some(cache) => cache.table.dirty_slots().count(),
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+fn state_of_for_test(key: BlockKey) -> Option<SlotState> {
+    let guard = CACHE.lock();
+    let cache = guard.as_ref()?;
+    cache.table.state_of(cache.table.lookup(key)?)
 }
 
 #[cfg(test)]
@@ -340,6 +550,12 @@ pub fn reset_for_test() {
             cache.table.end_io(slot, SlotState::Clean);
         }
         cache.filling[slot] = false;
+        // A dirty slot refuses eviction, which is the point of `evict`. Between
+        // tests the data is deliberately discarded rather than written -- the
+        // test that left it dirty asserted what it needed to about the disk
+        // already, and flushing here would write a test's payload over a
+        // sector another test reads.
+        cache.table.mark_clean(slot);
         assert!(cache.table.evict(slot), "a slot could not be released between tests");
     }
 }
@@ -438,6 +654,181 @@ mod tests {
             40,
             "the pinned block's bytes changed while it was held"
         );
+    }
+
+    /// Blocks the write tests own. Nothing else reads them, so a payload left
+    /// on the disk cannot change what another test sees.
+    ///
+    /// The image is deliberately *not* regenerated per run (see
+    /// `xtask::image::build_test_disk`), so every write test also restores what
+    /// it found. A test that asserted "the disk does not yet hold the payload"
+    /// against a fixed payload would pass on the first boot and fail on the
+    /// second, having been left holding that payload by the first.
+    const WRITE_BLOCKS: core::ops::Range<u64> = 240..248;
+
+    /// Reads a block from the device, bypassing the cache.
+    ///
+    /// Reading *through* the cache would return the dirty slot and assert
+    /// nothing at all about the disk, which is the only thing these tests are
+    /// about.
+    fn read_through_the_device(key: BlockKey) -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec![0u8; BLOCK_BYTES];
+        block_on(block::read_at(key.block * SECTORS_PER_BLOCK, &mut buf))
+            .expect("reading the block back from the device failed");
+        buf
+    }
+
+    /// `original` with **every** byte inverted, so it differs from whatever the
+    /// disk currently holds whatever that is.
+    ///
+    /// Every byte, not just the first sector's. The first version inverted only
+    /// the leading sector, which left the rest of the payload equal to what was
+    /// already on the disk -- so a writeback that sent one sector instead of
+    /// eight produced exactly the right disk contents and every assertion here
+    /// passed. Mutation-testing the writeback length is what found that; the
+    /// comparison looked whole-block and was not.
+    fn altered(original: &[u8]) -> alloc::vec::Vec<u8> {
+        original.iter().map(|byte| !byte).collect()
+    }
+
+    #[test_case]
+    fn a_written_block_reaches_the_disk_only_after_sync() {
+        // Both halves. A write that reaches the disk immediately is not a
+        // cache; a write that never reaches it is data loss, and the
+        // acknowledgement the caller already has is what makes it silent.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start };
+        let original = read_through_the_device(key);
+        let payload = altered(&original);
+
+        block_on(write_block(key, &payload)).expect("the write was refused");
+        assert_eq!(dirty_count(), 1, "the write did not leave the block dirty");
+        assert_eq!(
+            read_through_the_device(key),
+            original,
+            "the write reached the disk before sync"
+        );
+
+        block_on(sync()).expect("sync failed");
+        assert_eq!(dirty_count(), 0, "sync left the block dirty");
+        // The whole block, not its first bytes: a writeback that wrote only the
+        // first sector would satisfy any shorter comparison.
+        assert_eq!(read_through_the_device(key), payload, "sync did not write the block back");
+
+        // Restored, because the image outlives the run. Asserted, because a
+        // restore that silently failed would leave the next boot's copy of this
+        // test starting from the payload.
+        block_on(write_block(key, &original)).expect("the restoring write was refused");
+        block_on(sync()).expect("the restoring sync failed");
+        assert_eq!(read_through_the_device(key), original, "the block was not restored");
+    }
+
+    #[test_case]
+    fn sync_writes_every_dirty_block_and_not_only_the_first() {
+        // A `sync` that stopped after one slot would pass the test above. The
+        // blocks are deliberately not adjacent in slot order either: they are
+        // claimed in ascending order, so a loop that ran once would leave the
+        // later ones dirty and on-disk unchanged.
+        ready();
+        let keys: alloc::vec::Vec<BlockKey> =
+            WRITE_BLOCKS.clone().map(|block| BlockKey { dev: 0, block }).collect();
+        let originals: alloc::vec::Vec<_> =
+            keys.iter().map(|key| read_through_the_device(*key)).collect();
+        let payloads: alloc::vec::Vec<_> = originals.iter().map(|o| altered(o)).collect();
+
+        for (key, payload) in keys.iter().zip(&payloads) {
+            block_on(write_block(*key, payload)).expect("the write was refused");
+        }
+        assert_eq!(dirty_count(), keys.len(), "not every write left its block dirty");
+
+        block_on(sync()).expect("sync failed");
+        assert_eq!(dirty_count(), 0, "sync left a block dirty");
+        for (key, payload) in keys.iter().zip(&payloads) {
+            assert_eq!(
+                &read_through_the_device(*key),
+                payload,
+                "block {} did not reach the disk",
+                key.block
+            );
+        }
+
+        for (key, original) in keys.iter().zip(&originals) {
+            block_on(write_block(*key, original)).expect("the restoring write was refused");
+        }
+        block_on(sync()).expect("the restoring sync failed");
+        for (key, original) in keys.iter().zip(&originals) {
+            assert_eq!(&read_through_the_device(*key), original, "block {} was not restored", key.block);
+        }
+    }
+
+    #[test_case]
+    fn a_read_after_a_write_sees_the_write_without_touching_the_device() {
+        // The dirty slot is the truth until it is flushed. A read that went to
+        // the device would return the block's *old* contents and report them as
+        // this block -- a stale answer, successfully.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 1 };
+        let original = read_through_the_device(key);
+        let payload = altered(&original);
+
+        block_on(write_block(key, &payload)).expect("the write was refused");
+        let completions = block::completions();
+        let cached = block_on(read_block(key)).expect("the read after the write failed");
+        assert_eq!(&cached[..], &payload[..], "the read did not see the write");
+        assert_eq!(block::completions(), completions, "the read went to the device");
+        drop(cached);
+
+        // Discarded rather than flushed: the point of this test is the cache,
+        // and leaving the payload on the disk would perturb the others.
+        reset_for_test();
+        assert_eq!(read_through_the_device(key), original, "the discarded write reached the disk");
+    }
+
+    #[test_case]
+    fn a_failed_writeback_leaves_the_block_dirty() {
+        // The direction that loses data. The caller has already been told the
+        // write succeeded, so a slot resolved clean here drops it with nothing
+        // left to say it existed -- and a later read is answered from that same
+        // slot, so it reads as though the write worked.
+        ready();
+        // Past the end of the disk, so the *device* refuses the writeback. The
+        // block number is what makes this fail, not the payload.
+        let key = BlockKey { dev: 0, block: 4096 };
+        let payload = alloc::vec![0xA5u8; BLOCK_BYTES];
+        block_on(write_block(key, &payload)).expect("the write into the cache was refused");
+        assert_eq!(dirty_count(), 1, "the write did not leave the block dirty");
+
+        let outcome = block_on(sync());
+        assert!(outcome.is_err(), "a writeback the device refused was reported as a success");
+        assert_eq!(dirty_count(), 1, "a failed writeback dropped the block");
+        assert!(
+            matches!(state_of_for_test(key), Some(SlotState::Dirty)),
+            "a failed writeback left the slot in some other state"
+        );
+        // A second sync tries again rather than treating it as done.
+        assert!(block_on(sync()).is_err(), "the second sync did not retry the block");
+        assert_eq!(dirty_count(), 1, "the retry dropped the block");
+    }
+
+    #[test_case]
+    fn a_write_that_does_not_cover_the_block_is_refused() {
+        // Padding invents bytes the caller never supplied and puts them on the
+        // disk; merging is a read-modify-write, a different operation with a
+        // different failure mode. Neither happens silently under this name.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 2 };
+        let short = alloc::vec![0u8; BLOCK_BYTES - 1];
+        let long = alloc::vec![0u8; BLOCK_BYTES + 1];
+        assert!(
+            matches!(block_on(write_block(key, &short)), Err(BcacheError::PartialBlock)),
+            "a short write was accepted"
+        );
+        assert!(
+            matches!(block_on(write_block(key, &long)), Err(BcacheError::PartialBlock)),
+            "an oversized write was accepted"
+        );
+        assert_eq!(dirty_count(), 0, "a refused write still dirtied a slot");
+        assert_eq!(resident(), 0, "a refused write still claimed a slot");
     }
 
     #[test_case]
