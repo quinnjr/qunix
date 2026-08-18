@@ -272,6 +272,11 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
                 spins += 1;
                 if spins >= DEADLOCK_SPINS && owner != NO_OWNER {
                     let me = I::cpu_index();
+                    // The lock's own address, so the report names *which* lock
+                    // rather than leaving the reader to guess from a backtrace
+                    // that optimisation has rearranged. Resolve it against the
+                    // kernel's symbol table.
+                    let which = core::ptr::from_ref(self).cast::<()>() as usize;
                     // Reported rather than merely detected. "Held by this same
                     // processor" is a recursive acquisition; "held by another"
                     // with every processor spinning means the holder is not
@@ -279,10 +284,10 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
                     // switch. Those are different bugs and the message has to
                     // say which.
                     panic!(
-                        "irq spinlock wedged: cpu {me} waited {DEADLOCK_SPINS} spins while cpu \
-                         {owner} held it without ever releasing it. Same cpu means a recursive \
-                         acquisition; a different one means the owner is not on any processor -- \
-                         the lock was held across a context switch."
+                        "irq spinlock at {which:#x} wedged: cpu {me} waited {DEADLOCK_SPINS} \
+                         spins while cpu {owner} held it without ever releasing it. Same cpu \
+                         means a recursive acquisition; a different one means the owner is not \
+                         on any processor -- the lock was held across a context switch."
                     );
                 }
             }
