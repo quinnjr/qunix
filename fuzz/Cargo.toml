@@ -22,6 +22,14 @@ arbitrary = { version = "1", features = ["derive"] }
 path = "../crates/qunix-mm"
 features = ["std"]
 
+[dependencies.qunix-bcache]
+path = "../crates/qunix-bcache"
+features = ["std"]
+
+[dependencies.qunix-virtio]
+path = "../crates/qunix-virtio"
+features = ["std"]
+
 [[bin]]
 name = "buddy"
 path = "fuzz_targets/buddy.rs"
@@ -32,6 +40,20 @@ bench = false
 [[bin]]
 name = "slab"
 path = "fuzz_targets/slab.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bcache"
+path = "fuzz_targets/bcache.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtio_queue"
+path = "fuzz_targets/virtio_queue.rs"
 test = false
 doc = false
 bench = false

@@ -38,7 +38,7 @@
 /// keying on the number alone returns one device's bytes for the other's — a
 /// wrong answer, reported as a cache hit, with nothing downstream in a position
 /// to notice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockKey {
     pub dev: u32,
     pub block: u64,

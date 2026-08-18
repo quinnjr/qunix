@@ -98,8 +98,12 @@ fn bench_args(extra: &[String]) -> Vec<String> {
         "qunix-mm",
         "-p",
         "qunix-hal-x86_64",
+        "-p",
+        "qunix-bcache",
+        "-p",
+        "qunix-virtio",
         "--features",
-        "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std",
+        "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-bcache/std,qunix-virtio/std",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -140,7 +144,14 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
 }
 
 /// Fuzz targets run by a bare `xtask fuzz`.
-const FUZZ_TARGETS: &[&str] = &["buddy", "slab"];
+/// Crates with a `benches/` directory. A crate that grows one and is not added
+/// to `bench_args` is simply never benchmarked, and `cargo xtask bench` reports
+/// success without it -- the same silent omission the coverage ratchet had.
+/// `every_crate_with_benches_is_benched` fails when the two disagree.
+#[cfg(test)]
+const BENCHED_CRATES: &[&str] = &["qunix-sync", "qunix-mm", "qunix-hal-x86_64", "qunix-bcache", "qunix-virtio"];
+
+const FUZZ_TARGETS: &[&str] = &["buddy", "slab", "bcache", "virtio_queue"];
 
 /// Resolves `xtask fuzz` arguments into (targets, seconds, libFuzzer passthrough).
 ///
@@ -389,7 +400,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FUZZ_TARGETS, HOST_CRATES, bench_args, fuzz_args, fuzz_selection, host_crate_args, workspace_root};
+    use super::{BENCHED_CRATES, FUZZ_TARGETS, HOST_CRATES, bench_args, fuzz_args, fuzz_selection, host_crate_args, workspace_root};
 
     /// A crate missing from the invocation is a suite that never runs, and the
     /// run still prints success -- there is no line saying which crates were
@@ -413,7 +424,7 @@ mod tests {
     #[test]
     fn bench_selects_only_host_buildable_crates() {
         let args = bench_args(&[]);
-        for name in ["qunix-sync", "qunix-mm", "qunix-hal-x86_64"] {
+        for name in BENCHED_CRATES {
             assert!(args.iter().any(|a| a == name), "missing {name}: {args:?}");
         }
         // criterion needs std; the kernel is no_std running in QEMU.
@@ -424,7 +435,7 @@ mod tests {
     fn bench_enables_the_std_feature_of_every_selected_crate() {
         let args = bench_args(&[]);
         let features = args.iter().find(|a| a.contains("/std")).expect("no --features value");
-        for name in ["qunix-sync", "qunix-mm", "qunix-hal-x86_64"] {
+        for name in BENCHED_CRATES {
             assert!(features.contains(&format!("{name}/std")), "missing {name}/std in {features}");
         }
     }
@@ -509,6 +520,35 @@ mod tests {
         let sep = args.iter().position(|a| a == "--").expect("no -- separator");
         // Anything before `--` is consumed by cargo-fuzz, never by libFuzzer.
         assert!(args[sep + 1..].iter().any(|a| a == "-runs=1"));
+    }
+
+    #[test]
+    fn every_crate_with_benches_is_benched() {
+        // A crate that grows a `benches/` directory and is not added to
+        // `bench_args` is never benchmarked, and the run still prints success.
+        // Criterion's change detection is the only thing that caught a
+        // plausible optimisation being a 9-17% regression, so a benchmark that
+        // does not run is a regression that ships.
+        let root = workspace_root();
+        for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+            let dir = entry.unwrap().path();
+            if !dir.join("benches").is_dir() {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                BENCHED_CRATES.contains(&name.as_str()),
+                "{name} has benches/ but is not in bench_args, so nothing runs them"
+            );
+        }
+        let args = bench_args(&[]);
+        for name in BENCHED_CRATES {
+            assert!(
+                root.join("crates").join(name).join("benches").is_dir(),
+                "{name} is benched but has no benches/ directory"
+            );
+            assert!(args.iter().any(|a| a == name), "{name} is missing from bench_args");
+        }
     }
 
     #[test]
