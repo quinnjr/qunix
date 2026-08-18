@@ -210,6 +210,20 @@ pub fn device_faults() -> u64 {
 /// executes — while every assertion about the data still holds.
 static PENDING_POLLS: AtomicU64 = AtomicU64::new(0);
 
+/// Descriptors currently on the queue's free list.
+///
+/// Exposed so a test that abandons a request can wait for the driver to have
+/// the chain back before it returns. An abandoned request's chain comes back
+/// either immediately -- the device had already finished -- or when the
+/// completion arrives, and a test that does not wait leaves the queue
+/// transiently short for whatever runs next.
+pub fn free_descriptors() -> u16 {
+    DEVICE.lock().as_ref().map(|blk| blk.queue.free_count()).unwrap_or(0)
+}
+
+/// Descriptors the queue has in total.
+pub const QUEUE_DESCRIPTORS: u16 = QUEUE_SIZE;
+
 pub fn pending_polls() -> u64 {
     PENDING_POLLS.load(Ordering::Acquire)
 }
@@ -429,9 +443,26 @@ impl Drop for Request {
         }
         let mut guard = DEVICE.lock();
         let Some(blk) = guard.as_mut() else { return };
-        if let Some(slot) = blk.slots[self.head as usize].as_mut() {
-            slot.abandoned = true;
+        let Some(slot) = blk.slots[self.head as usize].as_mut() else { return };
+        if slot.done {
+            // The completion already landed. Quarantining here would leak the
+            // chain for good: `handle_completion` consumed the used-ring entry
+            // when it marked this slot done, so nothing will ever look at it
+            // again and nothing would ever reclaim it. The device has finished
+            // with the descriptors, which is exactly the condition under which
+            // freeing them is safe.
+            //
+            // Reachable whenever the device is faster than the code between
+            // the poll and the drop, which under an emulated host with fewer
+            // processors than guests is most of the time.
+            blk.queue.free_chain(self.head);
+            blk.slots[self.head as usize] = None;
+            return;
         }
+        // Still outstanding: the device may be reading the descriptors and
+        // writing the bounce buffer, so the chain is quarantined and
+        // `handle_completion` reclaims it when the completion arrives.
+        slot.abandoned = true;
         ABANDONED.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -930,7 +961,22 @@ mod tests {
         let before = completions();
         let polls_before = pending_polls();
         let mut buf = [0u8; SECTOR_BYTES];
-        block_on(read_at(3, &mut buf)).expect("the read failed");
+        // The first poll is taken with interrupts masked, so the completion
+        // cannot be recorded before it and the future *must* park. Without the
+        // mask this asserts that the device is slower than the poller, which is
+        // a property of the host: it held under KVM and failed on CI and on any
+        // host running fewer processors than the guest has.
+        {
+            use qunix_sync::IrqControl;
+            let waker = crate::task::waker_for(crate::sched::current_id());
+            let mut cx = core::task::Context::from_waker(&waker);
+            let mut read = core::pin::pin!(read_at(3, &mut buf));
+            let was_enabled = qunix_hal_x86_64::Irq::disable_and_save();
+            let first = read.as_mut().poll(&mut cx);
+            qunix_hal_x86_64::Irq::restore(was_enabled);
+            assert!(first.is_pending(), "the request did not park with interrupts masked");
+            block_on(read).expect("the read failed");
+        }
         // Exactly one, not "more than before". A handler that counted twice per
         // entry, or re-drained an already-consumed slot, satisfies a `>`.
         assert_eq!(
@@ -1096,17 +1142,29 @@ mod tests {
         let abandoned_before = abandoned();
         let reclaimed_before = reclaimed();
 
-        let head = submit(0, SECTOR_BYTES, None).expect("the queue refused a lone request");
-        assert_eq!(
-            finish(head, STATUS_TIMED_OUT, None),
-            Err(BlockError::Timeout),
-            "a timed-out request did not report a timeout"
-        );
+        // Masked across the whole transient. `finish` quarantines the chain and
+        // the *interrupt handler* reclaims it, so on a host where the
+        // completion lands between these two statements the chain is already
+        // back and the assertion below fails -- reporting "the chain was freed
+        // while the device still owned it" for a driver that did exactly the
+        // right thing. It held on every KVM run and failed on CI, which runs
+        // TCG with fewer host processors than guest ones.
+        //
+        // With interrupts masked the handler cannot run, so the state this
+        // asserts is the state `finish` left rather than whatever survived the
+        // race to read it.
+        let (verdict, quarantined) = {
+            use qunix_sync::IrqControl;
+            let was_enabled = qunix_hal_x86_64::Irq::disable_and_save();
+            let head = submit(0, SECTOR_BYTES, None).expect("the queue refused a lone request");
+            let verdict = finish(head, STATUS_TIMED_OUT, None);
+            let quarantined = { DEVICE.lock().as_ref().unwrap().queue.free_count() };
+            qunix_hal_x86_64::Irq::restore(was_enabled);
+            (verdict, quarantined)
+        };
+        assert_eq!(verdict, Err(BlockError::Timeout), "a timed-out request did not report a timeout");
         assert_eq!(abandoned(), abandoned_before + 1, "the timeout was not recorded");
-        assert!(
-            { DEVICE.lock().as_ref().unwrap().queue.free_count() } < free_before,
-            "the chain was freed while the device still owned it"
-        );
+        assert!(quarantined < free_before, "the chain was freed while the device still owned it");
 
         // The device completes it regardless; the handler is what reclaims it.
         let mut budget = 200_000_000u64;

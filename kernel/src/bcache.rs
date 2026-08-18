@@ -1516,6 +1516,32 @@ mod tests {
         crate::task::waker_for(crate::sched::current_id())
     }
 
+    /// Waits until the driver has every descriptor back.
+    ///
+    /// Abandoning a request leaves its chain with the driver in one of two
+    /// states: freed at once, because the device had already completed it, or
+    /// quarantined until the completion arrives. Which one depends on whether
+    /// the device beat the code between the poll and the drop, so a test cannot
+    /// assert either -- but it can require the queue to be whole again before
+    /// it returns.
+    ///
+    /// It has to. A test that leaves the queue short makes the *next* test to
+    /// assert a full queue fail, in a file with nothing to do with the cause.
+    /// Under a host with fewer processors than the guest has, that is not a
+    /// hypothetical.
+    fn wait_for_queue_drain() {
+        let mut budget = 200_000_000u64;
+        while block::free_descriptors() != block::QUEUE_DESCRIPTORS && budget > 0 {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        assert_eq!(
+            block::free_descriptors(),
+            block::QUEUE_DESCRIPTORS,
+            "an abandoned request's chain never came back, so it is leaked"
+        );
+    }
+
     /// Polls `future` once with interrupts masked, and requires it to park.
     ///
     /// The masking is the whole point. A request's completion is recorded by
@@ -1579,6 +1605,9 @@ mod tests {
             assert_eq!(resident(), 1, "the fill did not claim a slot");
         }
         assert_eq!(resident(), 0, "an abandoned fill left its slot claimed");
+        // The cache slot is released synchronously by the guard; the *driver's*
+        // chain may not be, so this test does not end until the driver has it.
+        wait_for_queue_drain();
         assert_eq!(state_of_for_test(key), None, "an abandoned fill left the key resident");
         // And the slot is genuinely reusable, not merely reported free.
         assert!(block_on(read_block(key)).is_ok(), "the abandoned slot was not reusable");
@@ -1602,6 +1631,7 @@ mod tests {
             let mut flush = core::pin::pin!(sync());
             poll_once_parked(flush.as_mut(), &mut cx, "the writeback");
         }
+        wait_for_queue_drain();
         assert_eq!(dirty_count(), 1, "an abandoned writeback dropped the block");
         assert!(
             matches!(state_of_for_test(key), Some(SlotState::Dirty)),
@@ -1626,6 +1656,11 @@ mod tests {
         // that has not been filled.
         ready();
         let key = BlockKey { dev: 0, block: 61 };
+        // Before the fill is submitted, not after. Captured later, the
+        // completion may already have landed and the baseline already include
+        // it -- which is a statement about the device's speed rather than about
+        // the fill reaching it.
+        let before_any_io = block::completions();
         let waker = poll_context();
         let mut cx = core::task::Context::from_waker(&waker);
         let mut fill = core::pin::pin!(read_block(key));
@@ -1641,18 +1676,17 @@ mod tests {
             "a write during a fill was not blocked on the fill"
         );
 
-        let completions = block::completions();
         let filled = block_on(fill).expect("the fill failed");
         drop(filled);
-        // Once the fill lands, the waiting reader is a hit: no second request.
         let after_fill = block::completions();
+        assert!(after_fill > before_any_io, "the fill never reached the device");
+        // Once the fill lands, the waiting reader is a hit: no second request.
         let second = block_on(read_block(key)).expect("the read after the fill failed");
         assert_eq!(
             block::completions(),
             after_fill,
             "the waiting reader started a second fill instead of sharing the first"
         );
-        assert!(after_fill > completions, "the fill never reached the device");
         drop(second);
         reset_for_test();
     }
