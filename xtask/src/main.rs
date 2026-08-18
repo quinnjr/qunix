@@ -45,8 +45,6 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
     Ok(target_dir().join("x86_64-qunix-kernel").join(profile).join("qunix-kernel"))
 }
 
-/// Cargo arguments for `xtask bench`, with any extra flags appended.
-///
 /// Every crate that builds for the host, and the feature each needs to do it.
 ///
 /// One list, read by `xtask test` and by the coverage ratchet. They were two
@@ -84,6 +82,8 @@ fn host_crate_args() -> Vec<String> {
     args
 }
 
+/// Cargo arguments for `xtask bench`, with any extra flags appended.
+///
 /// Split out from the spawn so the crate/feature selection is testable. Only
 /// host-buildable crates appear: criterion needs `std`, and the kernel is
 /// `no_std` running in QEMU, so it cannot be linked against at all.
@@ -143,7 +143,6 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
     args
 }
 
-/// Fuzz targets run by a bare `xtask fuzz`.
 /// Crates with a `benches/` directory. A crate that grows one and is not added
 /// to `bench_args` is simply never benchmarked, and `cargo xtask bench` reports
 /// success without it -- the same silent omission the coverage ratchet had.
@@ -151,6 +150,7 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
 #[cfg(test)]
 const BENCHED_CRATES: &[&str] = &["qunix-sync", "qunix-mm", "qunix-hal-x86_64", "qunix-bcache", "qunix-virtio"];
 
+/// Fuzz targets run by a bare `xtask fuzz`.
 const FUZZ_TARGETS: &[&str] = &["buddy", "slab", "bcache", "virtio_queue"];
 
 /// Resolves `xtask fuzz` arguments into (targets, seconds, libFuzzer passthrough).
@@ -535,7 +535,18 @@ mod tests {
             if !dir.join("benches").is_dir() {
                 continue;
             }
-            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            // The package name, not the directory name, for the same reason
+            // `every_crate_in_the_workspace_is_measured` parses it: cargo
+            // dispatches `-p` on the former, so a crate whose two names differ
+            // would pass this check and still never be benchmarked.
+            let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            let name = manifest
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("name = "))
+                .expect("a crate manifest with no package name")
+                .trim()
+                .trim_matches('"')
+                .to_string();
             assert!(
                 BENCHED_CRATES.contains(&name.as_str()),
                 "{name} has benches/ but is not in bench_args, so nothing runs them"

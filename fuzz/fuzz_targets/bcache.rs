@@ -70,7 +70,10 @@ fuzz_target!(|ops: Vec<Op>| {
     // Anchors the run. Without it a `Cache` that refused everything would make
     // every op below a no-op and the run would still pass.
     let probe = cache.insert(BlockKey { dev: 0, block: 0 }).expect("a fresh table refused a block");
-    assert!(cache.evict(probe) || cache.state_of(probe) == Some(SlotState::InFlight));
+    // Stated as a refusal, not as a disjunction: `a || b` short-circuits, so a
+    // version where `evict` wrongly accepted an unfilled slot would satisfy the
+    // assert and then fail somewhere else, reporting the wrong thing.
+    assert!(!cache.evict(probe), "a slot still being filled was evicted");
     cache.end_io(probe, SlotState::Clean);
     assert!(cache.evict(probe), "a clean unpinned slot refused eviction");
 

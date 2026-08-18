@@ -77,7 +77,22 @@ pub enum BcacheError {
     Exhausted,
     /// Another thread's fill of this block did not finish in time.
     FillStalled,
+    /// The key names a device this kernel has no driver for.
+    ///
+    /// Refused here rather than ignored. `dev` is half the cache key, so a
+    /// read of device 1 that was filled from device 0's disk would be reported
+    /// as a hit for device 1 by every later lookup -- another device's bytes,
+    /// returned successfully, with nothing downstream able to notice.
+    UnknownDevice,
 }
+
+/// The only block device this kernel attaches.
+///
+/// [`crate::block`] addresses one virtio-blk device and takes an LBA, not a
+/// (device, LBA) pair. Until it takes both, a key naming any other device
+/// cannot be served, and the refusal is here so that adding a second device
+/// is a change to this constant rather than a silent misfill.
+const ONLY_DEVICE: u32 = 0;
 
 struct Bcache {
     table: Cache<SLOTS>,
@@ -151,9 +166,42 @@ enum Claim {
     /// Readable now, and already pinned.
     Hit(BlockRef),
     /// Claimed for this thread to fill.
-    Fill { slot: usize, virt: u64 },
+    Fill(Fill),
     /// Somebody else is filling it.
     Wait,
+}
+
+/// A slot claimed for a fill, released if the fill never happens.
+///
+/// The fill is an `await`, and a future may be dropped without completing --
+/// a thread torn down mid-`block_on`, or `read_block` composed into a timeout
+/// later. Without this the slot stays `InFlight` forever: `victim` refuses it
+/// for good, and every later reader of that key waits out the full retry bound
+/// and fails. A leak that only costs capacity is exactly the kind nothing
+/// notices, so it is released here rather than documented as a caveat.
+struct Fill {
+    slot: usize,
+    virt: u64,
+    /// Set once the fill has been resolved by [`finish_fill`], so `Drop` does
+    /// not release a slot that is now legitimately in use.
+    settled: bool,
+}
+
+impl Drop for Fill {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut guard = CACHE.lock();
+        let Some(cache) = guard.as_mut() else { return };
+        cache.filling[self.slot] = false;
+        cache.table.end_io(self.slot, SlotState::Clean);
+        assert!(
+            cache.table.evict(self.slot),
+            "an abandoned fill left slot {} unreleasable",
+            self.slot
+        );
+    }
 }
 
 /// Decides what to do about `key`, under the lock and without any I/O.
@@ -185,7 +233,7 @@ fn claim(key: BlockKey) -> Result<Claim, BcacheError> {
         }
     };
     cache.filling[slot] = true;
-    Ok(Claim::Fill { slot, virt: cache.frames[slot] })
+    Ok(Claim::Fill(Fill { slot, virt: cache.frames[slot], settled: false }))
 }
 
 /// Ends a fill, leaving the slot readable or free.
@@ -200,6 +248,17 @@ fn finish_fill(slot: usize, ok: bool) -> Option<BlockRef> {
     cache.filling[slot] = false;
     cache.table.end_io(slot, SlotState::Clean);
     if !ok {
+        // `end_io` resolves to `Dirty` if the slot was written while the io
+        // ran, which would make the eviction below refuse. It cannot happen to
+        // a *fill*: the only handle to a buffer is a `BlockRef`, a `BlockRef`
+        // comes only from a hit, and a slot being filled never yields one. The
+        // assertion says which of those stopped being true rather than
+        // reporting the eviction's refusal, which describes nothing.
+        assert_eq!(
+            cache.table.state_of(slot),
+            Some(SlotState::Clean),
+            "slot {slot} was written to while it was being filled, so no reader ever saw it"
+        );
         assert!(cache.table.evict(slot), "a failed fill left a slot that could not be released");
         return None;
     }
@@ -209,6 +268,9 @@ fn finish_fill(slot: usize, ok: bool) -> Option<BlockRef> {
 
 /// Reads a block, from the cache if it is there and from the disk if it is not.
 pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
+    if key.dev != ONLY_DEVICE {
+        return Err(BcacheError::UnknownDevice);
+    }
     let mut waited = 0u32;
     loop {
         match claim(key)? {
@@ -224,15 +286,28 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
                 if waited > FILL_WAIT_LIMIT {
                     return Err(BcacheError::FillStalled);
                 }
-                crate::task::sleep_ticks(FILL_WAIT_TICKS).await;
+                // Fallible, because the infallible form panics when the timer
+                // table is full and a full timer table is a transient
+                // condition, not a reason to stop the machine. Several threads
+                // missing at once is exactly when it happens. Yielding instead
+                // still makes progress and is still bounded by the count
+                // above.
+                match crate::task::try_sleep_ticks(FILL_WAIT_TICKS) {
+                    Ok(sleep) => sleep.await,
+                    Err(_) => crate::sched::yield_now(),
+                }
             }
-            Claim::Fill { slot, virt } => {
+            Claim::Fill(mut fill) => {
+                let (slot, virt) = (fill.slot, fill.virt);
                 // SAFETY: the slot is `InFlight` and marked as filling, so no
                 // other thread may read or reuse it until `finish_fill` runs.
                 // The frame is reserved for the life of the kernel.
                 let buf =
                     unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, BLOCK_BYTES) };
                 let outcome = block::read_at(key.block * SECTORS_PER_BLOCK, buf).await;
+                // From here the slot's fate is `finish_fill`'s, not the
+                // guard's.
+                fill.settled = true;
                 match finish_fill(slot, outcome.is_ok()) {
                     Some(block) => return Ok(block),
                     None => return Err(BcacheError::Device(outcome.unwrap_err())),
@@ -363,6 +438,25 @@ mod tests {
             40,
             "the pinned block's bytes changed while it was held"
         );
+    }
+
+    #[test_case]
+    fn a_key_naming_a_device_that_does_not_exist_is_refused() {
+        // `dev` is half the key but the driver takes only an LBA, so a read of
+        // device 1 would be filled from device 0's disk and reported as a hit
+        // for device 1 by every later lookup. Refused rather than served, and
+        // asserted rather than left to a comment.
+        ready();
+        let before = block::completions();
+        assert!(
+            matches!(
+                block_on(read_block(BlockKey { dev: 1, block: 1 })),
+                Err(BcacheError::UnknownDevice)
+            ),
+            "a read of a device with no driver was served"
+        );
+        assert_eq!(block::completions(), before, "the refused read still went to a device");
+        assert_eq!(resident(), 0, "the refused read claimed a slot");
     }
 
     #[test_case]
