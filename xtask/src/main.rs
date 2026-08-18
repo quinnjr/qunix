@@ -47,6 +47,43 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
 
 /// Cargo arguments for `xtask bench`, with any extra flags appended.
 ///
+/// Every crate that builds for the host, and the feature each needs to do it.
+///
+/// One list, read by `xtask test` and by the coverage ratchet. They were two
+/// hand-written lists and both went stale: `qunix-virtio` was absent from the
+/// ratchet for a milestone, and `qunix-bcache` was absent from the test
+/// invocation for as long as it existed -- its tests passed when run by hand
+/// and were simply never run by `cargo xtask test`, which reported success
+/// without them. Neither omission is visible in the output, because what is
+/// missing is a suite nobody sees not running.
+///
+/// `qpkg` is not here: it links C (zstd) and so tests on the host triple
+/// rather than musl, which needs its own invocation.
+pub const HOST_CRATES: &[(&str, Option<&str>)] = &[
+    ("qunix-sync", Some("qunix-sync/std")),
+    ("qunix-mm", Some("qunix-mm/std")),
+    ("qunix-hal-x86_64", Some("qunix-hal-x86_64/std")),
+    ("qunix-sched", Some("qunix-sched/std")),
+    ("qunix-elf", Some("qunix-elf/std")),
+    ("qunix-virtio", Some("qunix-virtio/std")),
+    ("qunix-bcache", Some("qunix-bcache/std")),
+    ("qunix-abi", None),
+    ("xtask", None),
+];
+
+/// `-p <name>` for every host crate, then `--features` naming each one's.
+fn host_crate_args() -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    for (name, _) in HOST_CRATES {
+        args.push("-p".to_string());
+        args.push((*name).to_string());
+    }
+    let features: Vec<&str> = HOST_CRATES.iter().filter_map(|(_, f)| *f).collect();
+    args.push("--features".to_string());
+    args.push(features.join(","));
+    args
+}
+
 /// Split out from the spawn so the crate/feature selection is testable. Only
 /// host-buildable crates appear: criterion needs `std`, and the kernel is
 /// `no_std` running in QEMU, so it cannot be linked against at all.
@@ -280,27 +317,8 @@ fn main() -> Result<()> {
             // a multi-package selection able to enable per-package features.
             let mut host = Command::new(env!("CARGO"));
             host.current_dir(&root);
-            host.args([
-                "test",
-                "--target",
-                "x86_64-unknown-linux-musl",
-                "-p",
-                "qunix-virtio",
-                "-p",
-                "qunix-sync",
-                "-p",
-                "qunix-mm",
-                "-p",
-                "qunix-hal-x86_64",
-                "-p",
-                "qunix-sched",
-                "-p",
-                "qunix-elf",
-                "-p",
-                "xtask",
-                "--features",
-                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std,qunix-virtio/std",
-            ]);
+            host.args(["test", "--target", "x86_64-unknown-linux-musl"]);
+            host.args(host_crate_args());
             if release {
                 host.arg("--release");
             }
@@ -371,7 +389,26 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FUZZ_TARGETS, bench_args, fuzz_args, fuzz_selection, workspace_root};
+    use super::{FUZZ_TARGETS, HOST_CRATES, bench_args, fuzz_args, fuzz_selection, host_crate_args, workspace_root};
+
+    /// A crate missing from the invocation is a suite that never runs, and the
+    /// run still prints success -- there is no line saying which crates were
+    /// not tested. `qunix-bcache` was absent for as long as it existed.
+    #[test]
+    fn the_host_invocation_names_every_host_crate_and_its_feature() {
+        let args = host_crate_args();
+        let features = args.last().expect("no --features value");
+        for (name, feature) in HOST_CRATES {
+            assert!(args.iter().any(|a| a == name), "missing -p {name}: {args:?}");
+            if let Some(feature) = feature {
+                assert!(features.contains(feature), "missing {feature} in {features}");
+            }
+        }
+        // `--features` is a single value, so anything after it is swallowed as
+        // part of that value rather than parsed as a flag.
+        assert_eq!(args[args.len() - 2], "--features");
+    }
+
 
     #[test]
     fn bench_selects_only_host_buildable_crates() {

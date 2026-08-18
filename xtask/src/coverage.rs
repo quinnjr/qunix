@@ -19,18 +19,10 @@ use std::process::Command;
 
 const BASELINE: &str = "coverage-baseline.toml";
 
-/// Crates measured, and the feature each needs to build for the host.
-const MEASURED: &[(&str, Option<&str>)] = &[
-    ("qunix-sync", Some("qunix-sync/std")),
-    ("qunix-mm", Some("qunix-mm/std")),
-    ("qunix-hal-x86_64", Some("qunix-hal-x86_64/std")),
-    ("qunix-sched", Some("qunix-sched/std")),
-    ("qunix-elf", Some("qunix-elf/std")),
-    ("qunix-virtio", Some("qunix-virtio/std")),
-    ("qunix-bcache", Some("qunix-bcache/std")),
-    ("qunix-abi", None),
-    ("xtask", None),
-];
+/// Crates measured. The same list `xtask test` runs, because a crate that is
+/// tested but not ratcheted loses its floor silently and a crate that is
+/// ratcheted but not tested measures zero.
+use crate::HOST_CRATES as MEASURED;
 
 /// Absorbs the sub-percent drift a pure refactor can cause when lines move
 /// between counted and uncounted forms. Wide enough not to churn, far too
