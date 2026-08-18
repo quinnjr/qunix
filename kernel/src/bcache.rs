@@ -1483,7 +1483,7 @@ mod tests {
         let mut first = core::pin::pin!(sync());
         let waker = crate::task::waker_for(crate::sched::current_id());
         let mut cx = core::task::Context::from_waker(&waker);
-        assert!(first.as_mut().poll(&mut cx).is_pending(), "the writeback did not park");
+        poll_once_parked(first.as_mut(), &mut cx, "the writeback");
         assert!(
             matches!(state_of_for_test(key), Some(SlotState::InFlight)),
             "the half-polled sync did not leave the slot under writeback"
@@ -1514,6 +1514,30 @@ mod tests {
 
     fn poll_context() -> core::task::Waker {
         crate::task::waker_for(crate::sched::current_id())
+    }
+
+    /// Polls `future` once with interrupts masked, and requires it to park.
+    ///
+    /// The masking is the whole point. A request's completion is recorded by
+    /// the MSI-X handler, and on a fast enough machine it lands *before* the
+    /// first poll -- `block::pending_polls` exists because that is a normal
+    /// outcome. A bare `poll(..).is_pending()` therefore asserts a property of
+    /// the host's timing rather than of the code: it held on every local run
+    /// and failed on the first CI one, in both profiles.
+    ///
+    /// With interrupts masked the completion cannot be delivered, so the slot
+    /// cannot be marked done and the poll must park. It lands as soon as they
+    /// are restored.
+    fn poll_once_parked<F: core::future::Future>(
+        mut future: core::pin::Pin<&mut F>,
+        cx: &mut core::task::Context<'_>,
+        what: &str,
+    ) {
+        use qunix_sync::IrqControl;
+        let was_enabled = qunix_hal_x86_64::Irq::disable_and_save();
+        let polled = future.as_mut().poll(cx);
+        qunix_hal_x86_64::Irq::restore(was_enabled);
+        assert!(polled.is_pending(), "{what} did not park with interrupts masked");
     }
 
     #[test_case]
@@ -1551,7 +1575,7 @@ mod tests {
         let mut cx = core::task::Context::from_waker(&waker);
         {
             let mut fill = core::pin::pin!(read_block(key));
-            assert!(fill.as_mut().poll(&mut cx).is_pending(), "the fill did not park");
+            poll_once_parked(fill.as_mut(), &mut cx, "the fill");
             assert_eq!(resident(), 1, "the fill did not claim a slot");
         }
         assert_eq!(resident(), 0, "an abandoned fill left its slot claimed");
@@ -1576,7 +1600,7 @@ mod tests {
         let mut cx = core::task::Context::from_waker(&waker);
         {
             let mut flush = core::pin::pin!(sync());
-            assert!(flush.as_mut().poll(&mut cx).is_pending(), "the writeback did not park");
+            poll_once_parked(flush.as_mut(), &mut cx, "the writeback");
         }
         assert_eq!(dirty_count(), 1, "an abandoned writeback dropped the block");
         assert!(
@@ -1605,7 +1629,7 @@ mod tests {
         let waker = poll_context();
         let mut cx = core::task::Context::from_waker(&waker);
         let mut fill = core::pin::pin!(read_block(key));
-        assert!(fill.as_mut().poll(&mut cx).is_pending(), "the fill did not park");
+        poll_once_parked(fill.as_mut(), &mut cx, "the fill");
 
         // A slot being filled: a second claim must wait, not take a hit on an
         // unfilled buffer and not start a second fill.
@@ -1649,7 +1673,7 @@ mod tests {
         let waker = poll_context();
         let mut cx = core::task::Context::from_waker(&waker);
         let mut flush = core::pin::pin!(sync());
-        assert!(flush.as_mut().poll(&mut cx).is_pending(), "the writeback did not park");
+        poll_once_parked(flush.as_mut(), &mut cx, "the writeback");
 
         let other = altered(&payload);
         assert!(
