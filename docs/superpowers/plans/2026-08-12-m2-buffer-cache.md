@@ -454,4 +454,33 @@ git commit -m "feat(bcache): write a dirty slot back before reusing it"
 Recorded during execution. A plan written before the code is a hypothesis; the
 deviations are the result.
 
-*(none yet)*
+### D1: the capacity is a const parameter, not a constructor argument
+
+The plan writes `Cache::new(capacity)` with a runtime capacity. That needs
+storage sized at runtime, which means a `Vec`, which means the flush path can
+allocate -- and the whole reason the table is fixed is that memory pressure
+triggers writeback, writeback needs I/O, and I/O needs the allocation already
+waiting.
+
+`Cache<const N: usize>` removes the possibility rather than documenting it.
+There is no `Vec` to grow and nowhere for one to appear later without the type
+changing. `Cache::CAPACITY` replaces the `capacity()` accessor the plan
+assumed.
+
+### D2: two crates were outside the coverage ratchet
+
+Not a change to the plan, but found while adding `qunix-bcache` to it:
+`xtask`'s `MEASURED` list is hand-written and `qunix-virtio` was never added
+after M2 T4, so the crate had no floor for a whole milestone. Nothing reported
+it -- the run prints success for the crates it measured and is silent about the
+one it skipped.
+
+`every_host_testable_crate_is_measured` now fails when a crate with a `std`
+feature is missing from the list. Floors: `qunix-bcache` 100.00%,
+`qunix-virtio` 98.37%.
+
+Separately, `qunix-elf` measures 99.76% against a committed floor of 100.00%.
+`TOLERANCE_PP` absorbs that on *read*, so the ratchet passes, but
+`--update` refuses to write the lower figure without a stated reason -- which
+is why the two new floors above were written by hand rather than by
+`--update`. The elf gap is pre-existing and untouched here.
