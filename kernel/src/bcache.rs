@@ -34,6 +34,18 @@
 //! later read can reveal — the cache answers that read from the same slot.
 //! Every path that can take a slot out of `Dirty` therefore either wrote it or
 //! leaves it dirty, including the ones that fail.
+//!
+//! # A write refuses a block somebody is reading
+//!
+//! [`BlockRef`] hands out a `&[u8]` over the slot's frame and does not hold the
+//! lock while the reader uses it — holding it would mask interrupts for as long
+//! as a caller chose to look at a block. So the pin is the whole exclusion:
+//! [`write_block`] copies 4096 bytes over that frame, and doing it while a
+//! reference is live both tears the block the reader is walking and is a
+//! mutation through a raw pointer aliasing a live `&[u8]`. A write therefore
+//! waits for the readers to go and reports [`BcacheError::Pinned`] if they do
+//! not. `sync` is exempt: the device only *reads* the buffer, so it may share
+//! it with any number of readers.
 
 use core::ops::Deref;
 
@@ -72,6 +84,15 @@ const _: () = assert!(BLOCK_BYTES == 4096, "a cached block must be exactly one f
 const FILL_WAIT_TICKS: u64 = 1;
 const FILL_WAIT_LIMIT: u32 = 4096;
 
+/// How long a write waits for a block's readers to release it.
+///
+/// Much shorter than [`FILL_WAIT_LIMIT`], because the thing being waited for is
+/// not I/O. A reader holds a pin only for as long as it walks the block, so a
+/// wait this long means the pin is not going away -- most likely because the
+/// caller is holding a [`BlockRef`] to the block it is trying to write, and is
+/// waiting for itself.
+const PIN_WAIT_LIMIT: u32 = 32;
+
 /// Why a cached read could not be served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BcacheError {
@@ -87,6 +108,13 @@ pub enum BcacheError {
     Exhausted,
     /// Another thread's fill of this block did not finish in time.
     FillStalled,
+    /// A write was refused because a reader still holds the block.
+    ///
+    /// Not a wait that gave up on a transient reader -- the bound is short, so
+    /// this is most often a caller holding a [`BlockRef`] to the block it is
+    /// writing. Reported rather than waited out, because that caller is waiting
+    /// for itself.
+    Pinned,
     /// A write did not cover the whole block.
     ///
     /// Refused rather than padded or merged. Padding invents bytes the caller
@@ -343,12 +371,21 @@ impl Drop for Writeback {
     }
 }
 
+/// Why a store could not proceed yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// The device or another thread owns the buffer.
+    Io,
+    /// A reader holds a reference into it.
+    Reader,
+}
+
 /// Copies `data` into `key`'s slot and marks it dirty.
 ///
-/// Returns `false` when the slot has I/O outstanding and the caller must wait.
-/// The whole operation runs under the lock and issues nothing: a full-block
-/// write has no need to read the block it replaces.
-fn store(key: BlockKey, data: &[u8]) -> Result<bool, BcacheError> {
+/// Returns `Err(Blocked)` when the caller must wait. The whole operation runs
+/// under the lock and issues nothing: a full-block write has no need to read
+/// the block it replaces.
+fn store(key: BlockKey, data: &[u8]) -> Result<Result<(), Blocked>, BcacheError> {
     let mut guard = CACHE.lock();
     let cache = guard.as_mut().expect("the buffer cache was used before init");
 
@@ -359,7 +396,16 @@ fn store(key: BlockKey, data: &[u8]) -> Result<bool, BcacheError> {
             // device a torn mixture of the block it was told to write and the
             // one written over it -- which lands on the disk successfully.
             if cache.table.state_of(slot) == Some(SlotState::InFlight) {
-                return Ok(false);
+                return Ok(Err(Blocked::Io));
+            }
+            // A pin means a `BlockRef` is live, and a `BlockRef` hands out a
+            // `&[u8]` over this very frame without holding the lock. Copying
+            // over it tears the block that reader is walking -- successfully,
+            // with nothing downstream able to notice -- and is a write through
+            // a raw pointer aliasing a live shared reference. The pin is the
+            // only thing that excludes it, so it is checked here.
+            if cache.table.pins_of(slot) != Some(0) {
+                return Ok(Err(Blocked::Reader));
             }
             slot
         }
@@ -382,11 +428,19 @@ fn store(key: BlockKey, data: &[u8]) -> Result<bool, BcacheError> {
         core::ptr::copy_nonoverlapping(data.as_ptr(), cache.frames[slot] as *mut u8, BLOCK_BYTES);
     }
     cache.table.mark_dirty(slot);
-    Ok(true)
+    Ok(Ok(()))
 }
 
 /// A free slot for `key`, evicting a reusable one if the table is full.
+///
+/// `key` must not already be resident. `Cache::insert` returns `None` both for
+/// a full table and for a key it already holds, and this reads that as the
+/// former: on a resident key it would evict an innocent clean block, insert
+/// again, get `None` again, and report `Exhausted` -- a wrong error and a
+/// cached block thrown away for nothing. Both callers look the key up first
+/// under this same lock; the assertion is what says so to the third.
 fn claim_free_slot(cache: &mut Bcache, key: BlockKey) -> Result<usize, BcacheError> {
+    debug_assert!(cache.table.lookup(key).is_none(), "claim_free_slot called for a resident key");
     if let Some(slot) = cache.table.insert(key) {
         return Ok(slot);
     }
@@ -407,12 +461,20 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
     }
     let mut waited = 0u32;
     loop {
-        if store(key, data)? {
-            return Ok(());
-        }
+        let blocked = match store(key, data)? {
+            Ok(()) => return Ok(()),
+            Err(blocked) => blocked,
+        };
         waited += 1;
-        if waited > FILL_WAIT_LIMIT {
-            return Err(BcacheError::FillStalled);
+        let limit = match blocked {
+            Blocked::Io => FILL_WAIT_LIMIT,
+            Blocked::Reader => PIN_WAIT_LIMIT,
+        };
+        if waited > limit {
+            return Err(match blocked {
+                Blocked::Io => BcacheError::FillStalled,
+                Blocked::Reader => BcacheError::Pinned,
+            });
         }
         wait_a_tick().await;
     }
@@ -440,10 +502,12 @@ async fn wait_a_tick() {
 fn dirty_mask() -> u32 {
     const _: () = assert!(SLOTS <= u32::BITS as usize, "the dirty mask cannot address every slot");
     let guard = CACHE.lock();
-    match guard.as_ref() {
-        Some(cache) => cache.table.dirty_slots().fold(0u32, |mask, slot| mask | (1 << slot)),
-        None => 0,
-    }
+    // The same refusal `claim` and `store` make, and for a sharper reason: an
+    // uninitialised cache reported as having nothing dirty makes `sync` return
+    // `Ok(())`, which tells the caller its data reached the disk. A flush that
+    // never happened is the one answer this module must never give.
+    let cache = guard.as_ref().expect("the buffer cache was synced before init");
+    cache.table.dirty_slots().fold(0u32, |mask, slot| mask | (1 << slot))
 }
 
 /// Takes a slot for writeback, or `None` if it is no longer dirty.
@@ -808,6 +872,39 @@ mod tests {
         // A second sync tries again rather than treating it as done.
         assert!(block_on(sync()).is_err(), "the second sync did not retry the block");
         assert_eq!(dirty_count(), 1, "the retry dropped the block");
+    }
+
+    #[test_case]
+    fn a_write_is_refused_while_a_reader_holds_the_block() {
+        // `BlockRef` hands out a `&[u8]` over the frame and does not hold the
+        // lock while the reader walks it, so the pin is the whole exclusion.
+        // Copying over the frame while a reference is live tears the block that
+        // reader is walking -- successfully, with nothing downstream able to
+        // notice -- and is a write through a raw pointer aliasing a live shared
+        // reference.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 3 };
+        let original = read_through_the_device(key);
+        let payload = altered(&original);
+
+        let held = block_on(read_block(key)).expect("the read failed");
+        let before: alloc::vec::Vec<u8> = held.to_vec();
+        assert!(
+            matches!(block_on(write_block(key, &payload)), Err(BcacheError::Pinned)),
+            "a block being read was overwritten"
+        );
+        // The direction that matters: not merely that the call failed, but that
+        // the reader's bytes are the ones it started with.
+        assert_eq!(&held[..], &before[..], "the held block changed under its reader");
+        assert_eq!(dirty_count(), 0, "the refused write dirtied the slot");
+
+        // And the write succeeds once the reader is gone, which is what says
+        // the refusal was about the pin rather than about the block.
+        drop(held);
+        block_on(write_block(key, &payload)).expect("the write was refused after the reader left");
+        assert_eq!(dirty_count(), 1, "the accepted write did not dirty the slot");
+        reset_for_test();
+        assert_eq!(read_through_the_device(key), original, "the discarded write reached the disk");
     }
 
     #[test_case]

@@ -167,6 +167,15 @@ impl<const N: usize> Cache<N> {
         self.slots.get(slot).map(|s| s.state)
     }
 
+    /// How many references are held to a slot's buffer.
+    ///
+    /// Exposed because a pin excludes more than eviction. A caller that hands
+    /// out references into the buffer must not overwrite it while one is live,
+    /// and the pin count is the only thing that records whether one is.
+    pub fn pins_of(&self, slot: usize) -> Option<u32> {
+        self.slots.get(slot).map(|s| s.pins)
+    }
+
     /// Records that a slot's contents no longer match the device.
     ///
     /// A slot with an I/O outstanding records the fact rather than changing
@@ -538,6 +547,23 @@ mod tests {
         let slot = filled(&mut cache, key.dev, key.block);
         assert!(cache.evict(slot), "a clean unpinned slot refused eviction");
         assert_eq!(cache.lookup(key), None, "a freed slot was reported as a hit");
+    }
+
+    #[test]
+    fn the_pin_count_is_reported_and_a_freed_slot_reports_none() {
+        // A pin excludes overwriting the buffer, not only evicting the slot, so
+        // a caller that hands out references needs to read the count rather
+        // than infer it from `victim` declining.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        cache.end_io(a, SlotState::Clean);
+        assert_eq!(cache.pins_of(a), Some(0));
+        cache.pin(a);
+        cache.pin(a);
+        assert_eq!(cache.pins_of(a), Some(2), "the second pin was not counted");
+        cache.unpin(a);
+        assert_eq!(cache.pins_of(a), Some(1), "one unpin released both pins");
+        assert_eq!(cache.pins_of(Cache::<2>::CAPACITY), None, "a slot past the end reported pins");
     }
 
     #[test]

@@ -56,11 +56,16 @@ fn bench_lookup(c: &mut Criterion) {
 fn bench_admission(c: &mut Criterion) {
     let mut group = c.benchmark_group("bcache/admission");
 
-    // Claiming a slot in a table with one free: the scan runs to the end, and
-    // `insert` also scans once for the duplicate check, so this is two passes.
+    // Claiming a slot in a table with one free. Two full passes: `insert`
+    // scans once for the duplicate check and once for a free slot.
+    //
+    // The freed slot is the *last* one, deliberately. Freeing slot 0 -- which
+    // is what evicting block 0 does -- makes the free-slot scan hit on its
+    // first element, so the measurement is one pass and a bit, and a regression
+    // in that scan would not show up here at all.
     group.bench_function("insert into a nearly full table", |b| {
         let mut cache = full();
-        let slot = cache.lookup(BlockKey { dev: 0, block: 0 }).unwrap();
+        let slot = cache.lookup(BlockKey { dev: 0, block: SLOTS as u64 - 1 }).unwrap();
         cache.evict(slot);
         let mut block = SLOTS as u64;
         b.iter(|| {

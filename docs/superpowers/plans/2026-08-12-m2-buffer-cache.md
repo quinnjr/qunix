@@ -586,3 +586,22 @@ This is the failure mode `CLAUDE.md` warns about — an assertion that reads as
 comprehensive and is not — and it was invisible to every other check. The only
 thing that surfaced it was mutating the length and finding the suite still green.
 
+### D10: a pin excludes overwriting the buffer, not only evicting the slot
+
+Review found `write_block` copying 4096 bytes over a frame while a `BlockRef`
+handed out a `&[u8]` over the same bytes. `BlockRef::deref` deliberately does
+*not* hold the lock — holding it would mask interrupts for as long as a caller
+chose to look at a block — so the pin is the entire exclusion, and `store`
+consulted only the slot's state. A reader walking a directory block would see a
+mixture of two blocks, successfully, and it is also a write through a raw
+pointer aliasing a live shared reference.
+
+`Cache::pins_of` is new so the kernel can ask. A write now waits a short bound
+for readers to leave and reports `BcacheError::Pinned` if they do not — short
+because the thing being waited for is not I/O, and because the most likely cause
+is a caller holding a `BlockRef` to the block it is writing and so waiting for
+itself. `sync` is exempt: the device only reads the buffer, so it may share it.
+
+`a_write_is_refused_while_a_reader_holds_the_block` asserts the reader's bytes
+are unchanged, not merely that the call failed.
+
