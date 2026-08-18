@@ -513,3 +513,33 @@ a crate is missing from it. The first attempt at that check used "has a `std`
 feature" as the signal and passed `qunix-abi`, reproducing the gap inside the
 check written to close it; membership is the workspace directory now.
 
+### D5: `read_block` returns a pin, not `&'static [u8]`
+
+The plan has `read_block` return `&'static [u8]`. Task 5 adds eviction under
+pressure, and a bare reference into a slot stays valid-*looking* after that slot
+is evicted and refilled: the read succeeds and the bytes are another block's,
+which is the failure this whole crate is written against.
+
+It returns a `BlockRef` instead — a guard that pins its slot on creation and
+unpins on drop. That is also what gives `pin`/`unpin` a caller; without it they
+were an API nothing used.
+`a_pinned_block_is_not_evicted_out_from_under_its_reader` fails when eviction
+ignores pins, and `a_table_of_pinned_blocks_reports_exhaustion_rather_than_evicting_one`
+asserts the refusal rather than the success.
+
+### D6: a hit on a slot with I/O outstanding is not always a wait
+
+The plan's read path treats `InFlight` as one state. It is two: a slot being
+*filled* holds nothing yet and a reader must wait, while a slot being *written
+back* holds the caller's own data and the device is only reading it, so a reader
+may proceed. Collapsing them either serves an unfilled buffer or stalls every
+reader behind every flush, and the second is invisible — it costs latency, not
+correctness. `Bcache::filling` carries the distinction, which Task 4's writeback
+needs before it exists.
+
+A second reader that does have to wait retries on a bounded timer rather than
+joining a waiter list. A per-slot waiter list is unbounded state in a table
+whose fixed size is the reason the flush path cannot allocate, and the thing
+being waited for is a disk read. The bound (`FILL_WAIT_LIMIT`) is what stops a
+lost completion becoming a stopped machine instead of a failed request.
+

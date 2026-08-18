@@ -15,6 +15,7 @@ mod process;
 mod sched;
 mod smp;
 mod syscall;
+mod bcache;
 mod block;
 mod task;
 mod virtio;
