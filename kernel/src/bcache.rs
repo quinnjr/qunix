@@ -93,6 +93,15 @@ const FILL_WAIT_LIMIT: u32 = 4096;
 /// waiting for itself.
 const PIN_WAIT_LIMIT: u32 = 32;
 
+/// How many rounds `sync` waits on writebacks other processors own.
+///
+/// Only rounds that resolved *nothing* count, so this bounds waiting on other
+/// processors rather than the work itself. Sized against the block driver's own
+/// request deadline: a writeback that has not resolved by then has already
+/// failed and put its slot back to `Dirty`, so a round after that finds work to
+/// do rather than waiting again.
+const SYNC_ROUND_LIMIT: u32 = 600;
+
 /// Why a cached read could not be served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BcacheError {
@@ -108,6 +117,23 @@ pub enum BcacheError {
     Exhausted,
     /// Another thread's fill of this block did not finish in time.
     FillStalled,
+    /// The key names a block whose sectors do not fit in an LBA.
+    ///
+    /// Refused rather than wrapped. `block * SECTORS_PER_BLOCK` has no overflow
+    /// check in release -- `[profile.release]` sets none, and only the dev
+    /// profile keeps them for workspace members -- and a wrapped product is a
+    /// *valid* sector the device accepts. So the write lands on somebody else's
+    /// block, successfully, and a `block` of 2^61 resolves to LBA 0: the boot
+    /// sector. Refused before a slot is claimed, so the cache never holds a
+    /// block it could not write back.
+    OutOfRange,
+    /// A writeback this call was waiting on never resolved.
+    ///
+    /// Distinct from [`Self::FillStalled`]: that one means another thread's
+    /// *read* of this block is stuck, which points at a lost read completion.
+    /// This one means a *write* is stuck, and the data is still only in the
+    /// cache.
+    WritebackStalled,
     /// A write was refused because a reader still holds the block.
     ///
     /// Not a wait that gave up on a transient reader -- the bound is short, so
@@ -130,6 +156,17 @@ pub enum BcacheError {
     /// as a hit for device 1 by every later lookup -- another device's bytes,
     /// returned successfully, with nothing downstream able to notice.
     UnknownDevice,
+}
+
+/// The first sector of `key`'s block, or a refusal.
+///
+/// The multiplication is checked. Unchecked, it wraps in release into a legal
+/// sector the device accepts, so a read returns another block's bytes and a
+/// write destroys another block -- both successfully. Called at the entry
+/// points, before any slot is claimed, so an unwritable key never becomes a
+/// dirty slot that eviction cannot resolve.
+fn lba_of(key: BlockKey) -> Result<u64, BcacheError> {
+    key.block.checked_mul(SECTORS_PER_BLOCK).ok_or(BcacheError::OutOfRange)
 }
 
 /// The only block device this kernel attaches.
@@ -308,6 +345,7 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
     if key.dev != ONLY_DEVICE {
         return Err(BcacheError::UnknownDevice);
     }
+    lba_of(key)?;
     let mut waited = 0u32;
     let mut flushed = 0usize;
     loop {
@@ -350,7 +388,10 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
                 // The frame is reserved for the life of the kernel.
                 let buf =
                     unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, BLOCK_BYTES) };
-                let outcome = block::read_at(key.block * SECTORS_PER_BLOCK, buf).await;
+                // Checked at the entry point, so a failure here is a bug in
+                // this function rather than a condition the caller can cause.
+                let lba = lba_of(key).expect("an unvalidated key reached the fill");
+                let outcome = block::read_at(lba, buf).await;
                 // From here the slot's fate is `finish_fill`'s, not the
                 // guard's.
                 fill.settled = true;
@@ -477,6 +518,7 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
     if data.len() != BLOCK_BYTES {
         return Err(BcacheError::PartialBlock);
     }
+    lba_of(key)?;
     let mut waited = 0u32;
     let mut flushed = 0usize;
     loop {
@@ -526,6 +568,29 @@ async fn wait_a_tick() {
 /// allocation on the one path that may not make one. `SLOTS` is checked against
 /// the mask's width so growing the table cannot silently drop the slots past
 /// the thirty-second.
+/// Slots this call owes durability for: dirty, plus already under writeback.
+///
+/// A mask of `Dirty` alone is not enough. A slot another processor is already
+/// writing back is `InFlight`, so it is absent from that mask entirely -- and
+/// `sync` returns `Ok(())` while the write is still in the air. If it then
+/// fails, `finish_writeback` puts the slot back to `Dirty` and reports to *its*
+/// caller, long after this one was told the data was on the disk. Acknowledged
+/// data loss, and no later read reveals it because the cache answers from that
+/// same slot.
+///
+/// A slot being *filled* is excluded: it holds nothing the caller wrote.
+fn unsynced_mask() -> u32 {
+    let guard = CACHE.lock();
+    let cache = guard.as_ref().expect("the buffer cache was synced before init");
+    (0..SLOTS)
+        .filter(|slot| match cache.table.state_of(*slot) {
+            Some(SlotState::Dirty) => true,
+            Some(SlotState::InFlight) => !cache.filling[*slot],
+            _ => false,
+        })
+        .fold(0u32, |mask, slot| mask | (1 << slot))
+}
+
 fn dirty_mask() -> u32 {
     const _: () = assert!(SLOTS <= u32::BITS as usize, "the dirty mask cannot address every slot");
     let guard = CACHE.lock();
@@ -588,7 +653,11 @@ async fn write_back(slot: usize) -> Option<Result<(), BlockError>> {
     // kernel. A reader may hold it concurrently, which is why this is a shared
     // reference: the device only reads it too.
     let buf = unsafe { core::slice::from_raw_parts(virt as *const u8, BLOCK_BYTES) };
-    let outcome = block::write_at(key.block * SECTORS_PER_BLOCK, buf).await;
+    // Checked at the entry point before the slot was claimed, so a failure
+    // here is a bug rather than a condition -- and one that would otherwise
+    // leave a dirty slot no writeback could ever resolve.
+    let lba = lba_of(key).expect("an unvalidated key reached a writeback");
+    let outcome = block::write_at(lba, buf).await;
     // From here the slot's fate is `finish_writeback`'s, not the guard's.
     writeback.settled = true;
     finish_writeback(slot, outcome.is_ok());
@@ -607,15 +676,57 @@ async fn write_back(slot: usize) -> Option<Result<(), BlockError>> {
 /// them, so every slot in the snapshot is attempted and the first error is
 /// what is reported.
 pub async fn sync() -> Result<(), BcacheError> {
-    let mut pending = dirty_mask();
+    // What this call is responsible for, fixed at entry. A block dirtied later
+    // is not covered -- looping until nothing is dirty lets a steady writer
+    // keep `sync` from ever returning, which is a hang rather than a stronger
+    // guarantee.
+    let owed = unsynced_mask();
+    // Slots this call already tried and the device refused. Retrying one
+    // within the same `sync` cannot help and would spin until the round bound
+    // ran out, reporting a stall for what is really a device error.
+    let mut failed = 0u32;
     let mut failure = None;
-    while pending != 0 {
-        let slot = pending.trailing_zeros() as usize;
-        pending &= !(1 << slot);
-        if let Some(Err(error)) = write_back(slot).await {
-            failure.get_or_insert(BcacheError::Device(error));
+    let mut idle_rounds = 0u32;
+
+    loop {
+        let mut pending = owed & unsynced_mask() & !failed;
+        if pending == 0 {
+            break;
+        }
+        // Whether this round resolved anything. A round that only met slots
+        // another processor owns has to wait for that processor rather than
+        // spinning on them.
+        let mut acted = false;
+        while pending != 0 {
+            let slot = pending.trailing_zeros() as usize;
+            pending &= !(1 << slot);
+            match write_back(slot).await {
+                Some(Ok(())) => acted = true,
+                Some(Err(error)) => {
+                    // One failing block does not abandon the rest: stopping
+                    // here would leave later blocks dirty for a reason that has
+                    // nothing to do with them.
+                    failed |= 1 << slot;
+                    failure.get_or_insert(BcacheError::Device(error));
+                    acted = true;
+                }
+                // Already clean, or another processor's writeback owns it. The
+                // next round re-reads the mask, so a slot that comes back
+                // `Dirty` is retried and one that comes back `Clean` is done.
+                None => {}
+            }
+        }
+        if acted {
+            idle_rounds = 0;
+        } else {
+            idle_rounds += 1;
+            if idle_rounds > SYNC_ROUND_LIMIT {
+                return Err(BcacheError::WritebackStalled);
+            }
+            wait_a_tick().await;
         }
     }
+
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
@@ -1166,6 +1277,77 @@ mod tests {
         assert_eq!(dirty_count(), 1, "the accepted write did not dirty the slot");
         reset_for_test();
         assert_eq!(read_through_the_device(key), original, "the discarded write reached the disk");
+    }
+
+    #[test_case]
+    fn a_block_number_that_would_wrap_its_lba_is_refused() {
+        // `block * SECTORS_PER_BLOCK` has no overflow check in release, and the
+        // wrapped product is a *valid* sector the device accepts. A block of
+        // 2^61 resolves to LBA 0 -- the boot sector -- so an unchecked write
+        // destroys it and reports success, while the cache files the bytes
+        // under the huge key. In a test build the same multiply panics, which
+        // is a halted machine. Refused before a slot is claimed either way.
+        ready();
+        let key = BlockKey { dev: 0, block: u64::MAX / SECTORS_PER_BLOCK + 1 };
+        let before = block::completions();
+        assert!(
+            matches!(block_on(read_block(key)), Err(BcacheError::OutOfRange)),
+            "a block number that wraps its lba was read"
+        );
+        let payload = alloc::vec![0u8; BLOCK_BYTES];
+        assert!(
+            matches!(block_on(write_block(key, &payload)), Err(BcacheError::OutOfRange)),
+            "a block number that wraps its lba was written"
+        );
+        assert_eq!(block::completions(), before, "the refused request reached the device");
+        assert_eq!(resident(), 0, "the refused request claimed a slot");
+        assert_eq!(dirty_count(), 0, "the refused write dirtied a slot");
+        // The largest block that does fit is still served, so the bound refuses
+        // the wrap rather than refusing large numbers.
+        let largest = BlockKey { dev: 0, block: u64::MAX / SECTORS_PER_BLOCK };
+        assert!(
+            !matches!(block_on(read_block(largest)), Err(BcacheError::OutOfRange)),
+            "a block whose lba fits was refused as out of range"
+        );
+        reset_for_test();
+    }
+
+    #[test_case]
+    fn sync_waits_for_a_writeback_it_did_not_start() {
+        // `dirty_mask` collects only `Dirty` slots, so a slot another processor
+        // is already writing back is absent from it and `sync` returns
+        // `Ok(())` while the write is still in the air. If that write then
+        // fails, the slot goes back to `Dirty` after this caller was told its
+        // data was durable.
+        //
+        // Driven here by half-polling a `sync` so the slot is left `InFlight`
+        // and not filling -- the state another processor's writeback produces
+        // -- and then requiring a second `sync` to still owe it.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 7 };
+        let original = read_through_the_device(key);
+        let payload = altered(&original);
+        block_on(write_block(key, &payload)).expect("the write was refused");
+
+        let mut first = core::pin::pin!(sync());
+        let waker = crate::task::waker_for(crate::sched::current_id());
+        let mut cx = core::task::Context::from_waker(&waker);
+        assert!(first.as_mut().poll(&mut cx).is_pending(), "the writeback did not park");
+        assert!(
+            matches!(state_of_for_test(key), Some(SlotState::InFlight)),
+            "the half-polled sync did not leave the slot under writeback"
+        );
+        // The slot is InFlight and not filling: exactly what a concurrent
+        // writeback looks like. A `sync` that ignores it reports success.
+        assert_ne!(unsynced_mask(), 0, "sync would report success with a write still in the air");
+
+        block_on(first);
+        assert_eq!(unsynced_mask(), 0, "the completed writeback is still owed");
+        assert_eq!(read_through_the_device(key), payload, "the writeback did not land");
+
+        block_on(write_block(key, &original)).expect("the restoring write was refused");
+        block_on(sync()).expect("the restoring sync failed");
+        assert_eq!(read_through_the_device(key), original, "the block was not restored");
     }
 
     #[test_case]
