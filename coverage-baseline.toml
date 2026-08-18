@@ -56,8 +56,10 @@ xtask = 54.05
 # ingestion -- is fully covered, which is what this number is for.
 #
 # This crate went a whole milestone unratcheted because it was never added to
-# `MEASURED`; `every_host_testable_crate_is_measured` is what stops the next
+# `MEASURED`; `every_crate_in_the_workspace_is_measured` is what stops the next
 # one doing the same.
 qunix-virtio = 98.37
 
 qunix-bcache = 100.00
+
+qunix-abi = 100.00
