@@ -605,3 +605,34 @@ itself. `sync` is exempt: the device only reads the buffer, so it may share it.
 `a_write_is_refused_while_a_reader_holds_the_block` asserts the reader's bytes
 are unchanged, not merely that the call failed.
 
+### D11: Task 5's test could not observe eviction at all
+
+The plan's test writes one block, reads `CAPACITY + 1` distinct blocks to "force
+every slot to turn over", and asserts the written block reached the disk. It
+cannot: `victim` prefers a *clean* slot, and unpinned clean slots keep being
+recycled, so the dirty one is never considered. Reading a thousand blocks would
+leave it exactly where it was — the test would fail identically with and without
+the feature, and for a reason unrelated to it.
+
+Real pressure has to be constructed. `pin_every_slot_but_one` fills the table
+and holds a `BlockRef` to every slot but the dirty one, so serving one more
+distinct block *requires* writing that block back. That is also what the two
+refusal tests need: `a_dirty_slot_the_device_refuses_is_not_evicted_anyway`
+requires the read to report the device's error rather than hide a failing disk
+behind `Exhausted`, and `a_write_under_pressure_also_flushes_rather_than_refusing`
+requires the write path to answer pressure the same way the read path does.
+
+### D12: the pin filter on the flush candidate is load-bearing
+
+`flushable_slot` skips pinned slots. Mutation testing found that removing the
+filter passed every test, because no test had a slot that was dirty *and*
+pinned — the writes all happened to unpinned slots.
+
+It is not cosmetic. Writing back a pinned block frees nothing: the pin is what
+refuses the eviction and the writeback does not remove it. So each such choice
+spends a disk write to make no room, and the retry bound (`SLOTS` attempts) then
+runs out while a reusable slot was available all along — a table reporting
+`Exhausted` with room in it.
+`a_pinned_dirty_slot_is_not_the_one_chosen_to_flush` asserts the pinned block is
+still dirty and still not on the disk, which is what states the choice.
+

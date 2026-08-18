@@ -309,8 +309,26 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
         return Err(BcacheError::UnknownDevice);
     }
     let mut waited = 0u32;
+    let mut flushed = 0usize;
     loop {
-        match claim(key)? {
+        let claimed = match claim(key) {
+            Ok(claimed) => claimed,
+            // Every slot holds something that may not simply be dropped. If any
+            // of it is merely *dirty*, writing one block back turns a refusal
+            // into a slot -- so the pressure is answered before it is reported.
+            Err(BcacheError::Exhausted) => {
+                flushed += 1;
+                // Each flush cleans one slot, so more attempts than there are
+                // slots means something else is consuming them and the loop is
+                // not converging.
+                if flushed > SLOTS || !make_room().await? {
+                    return Err(BcacheError::Exhausted);
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match claimed {
             Claim::Hit(block) => return Ok(block),
             Claim::Wait => {
                 // Retried rather than queued. A waiter list is per-slot,
@@ -460,10 +478,19 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
         return Err(BcacheError::PartialBlock);
     }
     let mut waited = 0u32;
+    let mut flushed = 0usize;
     loop {
-        let blocked = match store(key, data)? {
-            Ok(()) => return Ok(()),
-            Err(blocked) => blocked,
+        let blocked = match store(key, data) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(blocked)) => blocked,
+            Err(BcacheError::Exhausted) => {
+                flushed += 1;
+                if flushed > SLOTS || !make_room().await? {
+                    return Err(BcacheError::Exhausted);
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         waited += 1;
         let limit = match blocked {
@@ -548,30 +575,86 @@ fn finish_writeback(slot: usize, ok: bool) {
 /// would leave later blocks dirty for a reason that has nothing to do with
 /// them, so every slot in the snapshot is attempted and the first error is
 /// what is reported.
+/// Writes one slot back, or `None` if it is no longer dirty.
+///
+/// Shared by [`sync`] and by the eviction path, so the two cannot drift about
+/// what a writeback leaves behind -- the failure arm in particular, where the
+/// difference between `Clean` and `Dirty` is whether the data still exists.
+async fn write_back(slot: usize) -> Option<Result<(), BlockError>> {
+    let mut writeback = begin_writeback(slot)?;
+    let (virt, key) = (writeback.virt, writeback.key);
+    // SAFETY: the slot is `InFlight`, so nothing may write to or reuse it until
+    // `finish_writeback` runs, and the frame is reserved for the life of the
+    // kernel. A reader may hold it concurrently, which is why this is a shared
+    // reference: the device only reads it too.
+    let buf = unsafe { core::slice::from_raw_parts(virt as *const u8, BLOCK_BYTES) };
+    let outcome = block::write_at(key.block * SECTORS_PER_BLOCK, buf).await;
+    // From here the slot's fate is `finish_writeback`'s, not the guard's.
+    writeback.settled = true;
+    finish_writeback(slot, outcome.is_ok());
+    Some(outcome)
+}
+
+/// Writes every block that was dirty when this was called.
+///
+/// A block dirtied *while* this runs is not covered: `end_io` leaves such a
+/// slot dirty and the next `sync` writes it. The alternative -- looping until
+/// nothing is dirty -- lets a steady writer keep `sync` from ever returning,
+/// which is a hang rather than a stronger guarantee.
+///
+/// One failing block does not abandon the rest. Stopping at the first error
+/// would leave later blocks dirty for a reason that has nothing to do with
+/// them, so every slot in the snapshot is attempted and the first error is
+/// what is reported.
 pub async fn sync() -> Result<(), BcacheError> {
     let mut pending = dirty_mask();
     let mut failure = None;
     while pending != 0 {
         let slot = pending.trailing_zeros() as usize;
         pending &= !(1 << slot);
-        let Some(mut writeback) = begin_writeback(slot) else { continue };
-        let (virt, key) = (writeback.virt, writeback.key);
-        // SAFETY: the slot is `InFlight`, so nothing may write to or reuse it
-        // until `finish_writeback` runs, and the frame is reserved for the life
-        // of the kernel. A reader may hold it concurrently, which is why this
-        // is a shared reference: the device only reads it too.
-        let buf = unsafe { core::slice::from_raw_parts(virt as *const u8, BLOCK_BYTES) };
-        let outcome = block::write_at(key.block * SECTORS_PER_BLOCK, buf).await;
-        // From here the slot's fate is `finish_writeback`'s, not the guard's.
-        writeback.settled = true;
-        finish_writeback(slot, outcome.is_ok());
-        if let Err(error) = outcome {
+        if let Some(Err(error)) = write_back(slot).await {
             failure.get_or_insert(BcacheError::Device(error));
         }
     }
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// A dirty slot that nothing else is holding, and so could be reused once it
+/// has been written.
+///
+/// Pinned slots are skipped: writing one back is harmless, but it would not
+/// make room, so choosing one turns a table under pressure into a stream of
+/// writebacks that free nothing.
+fn flushable_slot() -> Option<usize> {
+    let guard = CACHE.lock();
+    let cache = guard.as_ref()?;
+    cache.table.dirty_slots().find(|slot| cache.table.pins_of(*slot) == Some(0))
+}
+
+/// Writes one dirty block back so its slot can be reused.
+///
+/// `Ok(false)` means there was nothing to write, and so nothing this can do
+/// about the pressure -- every slot is pinned or has I/O outstanding. A device
+/// error is propagated rather than folded into `Exhausted`, because "the disk
+/// refused the write" and "every buffer is busy" call for different answers
+/// from the caller, and reporting the second for the first hides a failing
+/// disk behind a capacity problem.
+///
+/// Allocation-free by construction: `flushable_slot` reads a bitmask, and
+/// `write_back` uses the slot's own reserved frame and the driver's concrete
+/// future. That is the constraint the whole design exists to satisfy -- this
+/// runs when memory is already gone.
+async fn make_room() -> Result<bool, BcacheError> {
+    let Some(slot) = flushable_slot() else { return Ok(false) };
+    match write_back(slot).await {
+        // Raced with another writer; the slot is no longer dirty, which is
+        // progress from this caller's point of view.
+        None => Ok(true),
+        Some(Ok(())) => Ok(true),
+        Some(Err(error)) => Err(BcacheError::Device(error)),
     }
 }
 
@@ -872,6 +955,184 @@ mod tests {
         // A second sync tries again rather than treating it as done.
         assert!(block_on(sync()).is_err(), "the second sync did not retry the block");
         assert_eq!(dirty_count(), 1, "the retry dropped the block");
+    }
+
+    /// Fills and pins every slot but one, returning the held references.
+    ///
+    /// Real pressure has to be constructed. Simply reading many distinct blocks
+    /// does not create it: `victim` prefers a clean slot, unpinned clean slots
+    /// keep being recycled, and a dirty slot is never even considered — so a
+    /// test that read `SLOTS + 1` blocks would assert nothing about eviction,
+    /// whether or not the flush existed.
+    fn pin_every_slot_but_one() -> alloc::vec::Vec<BlockRef> {
+        let mut held = alloc::vec::Vec::new();
+        for block in 100..100 + (SLOTS as u64 - 1) {
+            held.push(
+                block_on(read_block(BlockKey { dev: 0, block })).expect("filling the table"),
+            );
+        }
+        held
+    }
+
+    #[test_case]
+    fn evicting_a_dirty_slot_writes_it_back_first() {
+        // The failure this exists to prevent is silent: the slot is reused, the
+        // write is discarded, and the block reads as its old contents forever
+        // -- answered from the cache, so no later read reveals it.
+        ready();
+        let key = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 4 };
+        let original = read_through_the_device(key);
+        let payload = altered(&original);
+        block_on(write_block(key, &payload)).expect("the write was refused");
+
+        let held = pin_every_slot_but_one();
+        assert_eq!(resident(), SLOTS, "the table did not fill");
+        assert_eq!(dirty_count(), 1, "the written block is not the one dirty slot");
+
+        // One more distinct block. The only slot that can be reused is the
+        // dirty one, so serving this read at all requires writing it back.
+        let extra = block_on(read_block(BlockKey { dev: 0, block: 200 }))
+            .expect("a read under pressure was refused with a dirty slot available");
+        assert_eq!(dirty_count(), 0, "the dirty slot was reused without being written");
+        assert_eq!(
+            read_through_the_device(key),
+            payload,
+            "a dirty slot was evicted without being written back"
+        );
+        drop(extra);
+        drop(held);
+
+        block_on(write_block(key, &original)).expect("the restoring write was refused");
+        block_on(sync()).expect("the restoring sync failed");
+        assert_eq!(read_through_the_device(key), original, "the block was not restored");
+    }
+
+    #[test_case]
+    fn a_dirty_slot_the_device_refuses_is_not_evicted_anyway() {
+        // The refusal direction, and the one that loses data. When the
+        // writeback fails there is nowhere for the block to go, so the only
+        // answers are "report the failure" and "discard the block" -- and the
+        // second is invisible, because the caller was already told the write
+        // succeeded and the cache answers every later read from that slot.
+        ready();
+        // Past the end of the disk, so the device refuses the writeback. The
+        // block number is what makes this fail, not the payload.
+        let key = BlockKey { dev: 0, block: 4096 };
+        let payload = alloc::vec![0x5Au8; BLOCK_BYTES];
+        block_on(write_block(key, &payload)).expect("the write into the cache was refused");
+
+        let held = pin_every_slot_but_one();
+        assert_eq!(dirty_count(), 1, "the written block is not the one dirty slot");
+
+        let outcome = block_on(read_block(BlockKey { dev: 0, block: 201 }));
+        assert!(
+            matches!(outcome, Err(BcacheError::Device(_))),
+            "a read under pressure hid a failing disk behind a capacity answer"
+        );
+        assert_eq!(dirty_count(), 1, "the block the device refused was evicted anyway");
+        assert!(
+            matches!(state_of_for_test(key), Some(SlotState::Dirty)),
+            "the refused block is no longer dirty"
+        );
+        drop(held);
+    }
+
+    #[test_case]
+    fn a_pinned_dirty_slot_is_not_the_one_chosen_to_flush() {
+        // Writing back a pinned block frees nothing: the pin is what refuses
+        // the eviction, and the writeback does not remove it. Choosing one
+        // spends a disk write to make no room, and with enough of them the
+        // retry bound runs out and a table that had a reusable slot all along
+        // reports `Exhausted`.
+        //
+        // Mutation-testing found this: `flushable_slot` without its pin filter
+        // passed every other test here, because none of them ever had a slot
+        // that was dirty *and* pinned.
+        ready();
+        let pinned = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 6 };
+        let loose = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 7 };
+        let pinned_original = read_through_the_device(pinned);
+        let loose_original = read_through_the_device(loose);
+        let pinned_payload = altered(&pinned_original);
+        let loose_payload = altered(&loose_original);
+
+        block_on(write_block(pinned, &pinned_payload)).expect("the write was refused");
+        block_on(write_block(loose, &loose_payload)).expect("the write was refused");
+        // Pinning it *after* the write: `write_block` refuses a block a reader
+        // holds, so the order is not interchangeable.
+        let holding = block_on(read_block(pinned)).expect("the read of the dirty block failed");
+        assert_eq!(dirty_count(), 2, "both blocks should be dirty");
+
+        // Fill and pin the rest, so the only slot that can be freed is the
+        // unpinned dirty one.
+        let mut held = alloc::vec::Vec::new();
+        for block in 100..100 + (SLOTS as u64 - 2) {
+            held.push(block_on(read_block(BlockKey { dev: 0, block })).expect("filling the table"));
+        }
+        assert_eq!(resident(), SLOTS, "the table did not fill");
+
+        let extra = block_on(read_block(BlockKey { dev: 0, block: 202 }))
+            .expect("a read under pressure was refused with a flushable slot available");
+        // The pinned block is untouched: still dirty, still not on the disk.
+        assert!(
+            matches!(state_of_for_test(pinned), Some(SlotState::Dirty)),
+            "the pinned block was written back, which frees nothing"
+        );
+        assert_eq!(
+            read_through_the_device(pinned),
+            pinned_original,
+            "the pinned block reached the disk, so it was the one chosen to flush"
+        );
+        // And the unpinned one was.
+        assert_eq!(
+            read_through_the_device(loose),
+            loose_payload,
+            "the unpinned dirty block was not the one flushed"
+        );
+        drop(extra);
+        drop(holding);
+        drop(held);
+
+        reset_for_test();
+        block_on(write_block(loose, &loose_original)).expect("the restoring write was refused");
+        block_on(sync()).expect("the restoring sync failed");
+        assert_eq!(read_through_the_device(loose), loose_original, "the block was not restored");
+        assert_eq!(read_through_the_device(pinned), pinned_original, "the block was not restored");
+    }
+
+    #[test_case]
+    fn a_write_under_pressure_also_flushes_rather_than_refusing() {
+        // `write_block` claims a slot too, so it meets the same pressure and
+        // must answer it the same way. A version that only taught the read path
+        // to flush would leave writes failing with `Exhausted` while a dirty
+        // slot sat there waiting to be written.
+        ready();
+        let dirty = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 5 };
+        let original = read_through_the_device(dirty);
+        let payload = altered(&original);
+        block_on(write_block(dirty, &payload)).expect("the first write was refused");
+
+        let held = pin_every_slot_but_one();
+        assert_eq!(dirty_count(), 1, "the written block is not the one dirty slot");
+
+        // A different block, so this needs a slot of its own.
+        let second = BlockKey { dev: 0, block: WRITE_BLOCKS.start + 6 };
+        let second_original = read_through_the_device(second);
+        let second_payload = altered(&second_original);
+        block_on(write_block(second, &second_payload))
+            .expect("a write under pressure was refused with a dirty slot available");
+        assert_eq!(
+            read_through_the_device(dirty),
+            payload,
+            "the write under pressure discarded the dirty block"
+        );
+        drop(held);
+
+        block_on(write_block(dirty, &original)).expect("the restoring write was refused");
+        block_on(write_block(second, &second_original)).expect("the restoring write was refused");
+        block_on(sync()).expect("the restoring sync failed");
+        assert_eq!(read_through_the_device(dirty), original, "the block was not restored");
+        assert_eq!(read_through_the_device(second), second_original, "the block was not restored");
     }
 
     #[test_case]
