@@ -78,6 +78,33 @@ machine and uncovered on a 4-core CI runner, because with fewer cores
 the contention — hold the lock in another thread and wait until it is provably
 held — rather than relying on the scheduler to produce it.
 
+The same is true in the other direction, and it is the one that has cost most
+here: a test can assert that the machine is *slow* just as accidentally as that
+it is fast. `assert!(poll(..).is_pending())` says "the device had not completed
+by the first poll", which is a fact about the host. Several tests asserted
+something of that shape — that a completion had not landed yet, that a
+quarantined chain had not come back yet, that a request had parked — and every
+one of them passed locally and failed in CI. Where the property really is "this
+happens before the interrupt", mask interrupts across the window and the
+assertion becomes a fact about the code. Where it is "this settles eventually",
+wait for it rather than assuming it already has.
+
+**Reproduce a CI-only failure with `taskset -c 0,1 cargo xtask test`.** The
+guest runs `-smp 4`; pinning QEMU to two host cores makes the host deschedule
+vCPUs mid-critical-section, which is what CI does and a many-core workstation
+never does. That one line turned every "green here, red there" failure in this
+repository into something reproducible on demand — including the scheduler
+deadlock that a day of eliminating environments (QEMU versions, TCG, `-cpu`
+models, OVMF builds, a from-scratch toolchain) had failed to pin down. Under
+TCG alone it does not reproduce; the oversubscription is the ingredient.
+
+It also breaks tools that count. A spin bound is not a clock: a processor
+spinning while the lock's owner is not scheduled reaches any iteration count
+without anything being wrong, so `deadlock-panic` counts one owner holding a
+lock *without change* rather than counting spins, and refuses to report a lock
+whose owner reads `NO_OWNER`. Its first version reported a wedge against a lock
+that was free.
+
 ## Benchmarks
 
 `cargo xtask bench` covers `qunix-mm`, `qunix-sync` and the pure-logic part of
@@ -162,6 +189,21 @@ LeakSanitizer.
 
 ## Gotchas already paid for
 
+- **Never re-enable interrupts while holding an `IrqSpinLock`.** `park`'s
+  cancelled arm called `Irq::restore` from inside the block holding `SCHED`, so
+  the guard outlived the `sti` by one statement. A timer tick landing in that
+  window re-enters `schedule` on the same processor, which takes `SCHED` and
+  spins forever on a lock that processor already owns. That was the CI-only
+  hang: a window a few instructions wide, so it needed either an unlucky tick or
+  a host that deschedules vCPUs, and it produced a stopped machine rather than
+  anything that named itself. Compute under the lock, act outside it.
+  `Irq::restore` asserts this under `deadlock-panic`, and the assertion fires
+  deterministically where the bug itself needed a race — but the assertion only
+  exists because the rule was learned the expensive way.
+- **A wedged lock should name itself.** Symbolising a backtrace across builds
+  gives nonsense: the two boots and the two profiles each lay out differently.
+  Printing the lock's own address and resolving it with `nm` against the right
+  binary identified `sched::SCHED` in one step, after a day of guessing.
 - **`static mut` is gone as of M1 Task 1**, and is banned from here on. The GDT,
   TSS, IDT and double-fault stack it held are per-CPU state, and sharing them
   across CPUs is not a style question — two CPUs faulting onto one IST stack
