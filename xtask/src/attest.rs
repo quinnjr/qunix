@@ -230,6 +230,28 @@ fn range_for_before(before: Option<&str>, contains: &dyn Fn(&str) -> bool) -> Re
 /// contain is an **error**, not a skip: a force-push is the most likely way
 /// someone circumvents git-flow, and it used to land in the `None` arm, whose
 /// fallback then read an empty range and reported success.
+/// What `rev-list` is asked, to count what a push added to a protected branch.
+///
+/// `--first-parent` as well as `--no-merges`, and both are load-bearing.
+/// Without `--first-parent` the count includes every commit the push made
+/// *reachable* rather than the commits it added to this branch's own line of
+/// development -- so a git-flow merge of a feature branch reported one
+/// violation per commit on that branch (twenty-three, for the branch that found
+/// this), and the rule failed on the one operation git-flow requires while
+/// telling the author to `reset --hard` the merge away.
+///
+/// First-parent is exactly the distinction wanted: it walks what the protected
+/// branch itself did, and merging is one step along it. `--no-merges` then
+/// removes that step, leaving nothing for a merge and one commit for something
+/// somebody committed on the branch directly.
+///
+/// A separate function so a test can assert the flags rather than the outcome
+/// of a `rev-list` it also constructed -- a test that runs git itself proves
+/// how git behaves, not what this code asks it.
+fn protected_count_args(range: &str) -> [&str; 4] {
+    ["rev-list", "--no-merges", "--first-parent", range]
+}
+
 fn protected_range(root: &Path) -> Result<Option<String>> {
     let Ok(path) = std::env::var("GITHUB_EVENT_PATH") else { return Ok(None) };
     let payload = std::fs::read_to_string(&path)
@@ -319,7 +341,7 @@ pub fn check(root: &Path, range: Option<&str>) -> Result<()> {
     let protected = protected_candidate(&named);
     if protected_fires(event.as_deref(), &protected) {
         let pushed = protected_range(root)?
-            .map(|r| git(root, &["rev-list", "--no-merges", &r]))
+            .map(|r| git(root, &protected_count_args(&r)))
             .transpose()?
             .map(|out| out.lines().filter(|l| !l.is_empty()).count())
             .unwrap_or(hashes.len());
@@ -535,6 +557,69 @@ mod tests {
                  so the protected-branch gate checks nothing"
             );
         }
+    }
+
+    /// The rule must count what a push added to the branch's own line, not
+    /// everything it made reachable.
+    ///
+    /// Asserted against the flags this code passes, and separately against what
+    /// git does with them. The first version of this test built a repository
+    /// and ran `rev-list` itself, which proved how git behaves and would have
+    /// passed with the fix deleted from the code under test.
+    #[test]
+    fn the_protected_count_walks_the_first_parent_line() {
+        let args = super::protected_count_args("base..HEAD");
+        assert!(
+            args.contains(&"--first-parent"),
+            "without --first-parent a git-flow merge counts every commit it brought in, and the              rule fails on the one operation it exists to permit: {args:?}"
+        );
+        assert!(args.contains(&"--no-merges"), "the merge commit itself must not count: {args:?}");
+        assert_eq!(args[0], "rev-list");
+        assert_eq!(args[3], "base..HEAD", "the range must be the last argument");
+    }
+
+    /// And what git does with those flags, on the three shapes that reach it.
+    #[test]
+    fn a_merge_adds_nothing_to_the_protected_branch_but_a_direct_commit_does() {
+        let dir = std::env::temp_dir().join(format!("qunix-attest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating the probe repository");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("running git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "-b", "develop"]);
+        run(&["config", "user.email", "probe@example.invalid"]);
+        run(&["config", "user.name", "probe"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = run(&["rev-parse", "HEAD"]);
+
+        // More than one commit on the branch, so a rule that counts
+        // reachability reports more than one.
+        run(&["switch", "-q", "-c", "feature/probe"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        run(&["switch", "-q", "develop"]);
+        run(&["merge", "--no-ff", "--no-edit", "-q", "feature/probe"]);
+
+        let count = |range: &str| {
+            run(&super::protected_count_args(range)).lines().filter(|l| !l.is_empty()).count()
+        };
+        assert_eq!(count(&format!("{base}..HEAD")), 0, "a git-flow merge was reported as a direct commit");
+
+        let after_merge = run(&["rev-parse", "HEAD"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "straight onto develop"]);
+        assert_eq!(
+            count(&format!("{after_merge}..HEAD")),
+            1,
+            "a commit made directly on the protected branch was not counted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
