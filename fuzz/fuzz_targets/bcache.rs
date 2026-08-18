@@ -227,6 +227,7 @@ fn check(cache: &Cache<SLOTS>, model: &HashMap<usize, Occupant>) {
     for slot in 0..SLOTS {
         let Some(key) = cache.key_of(slot) else {
             assert!(!model.contains_key(&slot), "slot {slot} lost the block the model put there");
+            assert_eq!(cache.pins_of(slot), Some(0), "a free slot reports pins");
             continue;
         };
         if let Some(other) = seen.insert(key, slot) {
@@ -235,6 +236,15 @@ fn check(cache: &Cache<SLOTS>, model: &HashMap<usize, Occupant>) {
         let occupant = model.get(&slot).unwrap_or_else(|| panic!("slot {slot} holds {key:?}, which the model never put there"));
         assert_eq!(occupant.key, key, "slot {slot} holds the wrong block");
         assert_eq!(cache.state_of(slot), Some(occupant.state), "slot {slot} is in the wrong state");
+        // The count `kernel::bcache::store` reads to decide whether a live
+        // `&[u8]` exists over this slot's frame. A wrong one there is a write
+        // through a raw pointer aliasing a live shared reference, so it is
+        // asserted directly rather than inferred from an `evict` outcome.
+        assert_eq!(
+            cache.pins_of(slot),
+            Some(occupant.pins),
+            "slot {slot} reports the wrong pin count"
+        );
     }
 
     // The three refusals, checked against the model rather than against the

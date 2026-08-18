@@ -25,7 +25,9 @@ use core::task::{Context, Poll};
 use qunix_hal_x86_64::pci;
 use qunix_sched::ThreadId;
 use qunix_sync::IrqSpinLock;
-use qunix_virtio::blk::{BlkStatus, RequestHeader, SECTOR_BYTES, status_from_byte};
+use qunix_virtio::blk::{
+    BlkStatus, RequestHeader, SECTOR_BYTES, status_from_byte, transfer_satisfied,
+};
 use qunix_virtio::{Descriptor, QUEUE_SIZE, RING_HEADER, SplitQueue, ring_layout};
 
 use crate::virtio::{Transport, VIRTIO_BLK_MODERN, VIRTIO_F_VERSION_1};
@@ -67,6 +69,15 @@ pub enum BlockError {
     /// device write past the end of the buffer, and nothing between this
     /// function and the DMA engine would object.
     Unaligned,
+    /// The device reported fewer bytes transferred than were asked for.
+    ///
+    /// Refused rather than copied. The bounce buffer holds whatever the
+    /// *previous* request through this slot left there, so copying the full
+    /// request out of a short transfer returns another block's bytes -- and
+    /// the buffer cache above would then serve that answer on every later hit.
+    /// A device that reports a short transfer is either failing or lying;
+    /// either way its answer is not the caller's data.
+    Short,
     /// The buffer is larger than one slot's bounce buffer.
     TooLarge,
     /// Every descriptor is in flight.
@@ -109,6 +120,15 @@ struct Slot {
     done: bool,
     /// The status byte the device wrote.
     status: u8,
+    /// Bytes the device says it actually transferred.
+    ///
+    /// Device-supplied, and checked rather than trusted. A device that
+    /// completes a 4096-byte read with `status = OK` and `len = 0` writes
+    /// nothing into the bounce buffer -- and an unchecked `finish` then copies
+    /// the full request out of it anyway, which is whatever the *previous*
+    /// request through that slot left there. Another block's bytes, returned
+    /// as this one's, and the buffer cache above makes that answer persistent.
+    len: u32,
     /// The submitter gave up waiting, but the device was never told.
     ///
     /// The chain stays allocated while this is set. A timeout means the driver
@@ -520,7 +540,7 @@ fn submit(lba: u64, len: usize, out: Option<&[u8]>) -> Result<u16, BlockError> {
     blk.queue.describe(status, status_phys, 1, true);
 
     blk.slots[head as usize] =
-        Some(Slot { thread: crate::sched::current_id(), done: false, status: 0xff, abandoned: false });
+        Some(Slot { thread: crate::sched::current_id(), done: false, status: 0xff, len: 0, abandoned: false });
 
     blk.queue.publish(head);
     write_rings(blk, head);
@@ -682,6 +702,23 @@ fn finish(head: u16, status: u8, into: Option<&mut [u8]>) -> Result<(), BlockErr
         return Err(BlockError::Timeout);
     }
     if let Some(buf) = into {
+        // The device says how much it transferred, and it is checked before the
+        // copy rather than after. `len` is device-supplied: a device completing
+        // a 4096-byte read with `OK` and `len = 0` writes nothing, and copying
+        // the full request out anyway hands back the previous request through
+        // this slot -- another block's bytes, reported as a successful read.
+        let reported = blk.slots[head as usize].map(|slot| slot.len).unwrap_or(0);
+        // The predicate lives in `qunix-virtio` because it is testable there
+        // and not here: QEMU's virtio-blk always reports the full transfer, so
+        // no in-QEMU test can reach this branch without a fault-injecting
+        // device model. The *decision* is covered by
+        // `blk::tests::a_short_transfer_is_not_satisfied_and_a_full_one_is`.
+        if !transfer_satisfied(reported, buf.len()) {
+            blk.queue.free_chain(head);
+            blk.slots[head as usize] = None;
+            DEVICE_FAULTS.fetch_add(1, Ordering::AcqRel);
+            return Err(BlockError::Short);
+        }
         let data_virt = blk.data_virt + head as u64 * SLOT_BYTES as u64;
         // SAFETY: the bounce buffer is `SLOT_BYTES` and `buf.len()` was bounded
         // by it at submission.
@@ -769,7 +806,7 @@ pub fn handle_completion() {
                 DEVICE_FAULTS.fetch_add(1, Ordering::AcqRel);
                 return;
             }
-            if let Some((head, _len)) = blk.queue.take_used(slot) {
+            if let Some((head, len)) = blk.queue.take_used(slot) {
                 let status_virt =
                     blk.meta_virt + head as u64 * META_STRIDE + RequestHeader::BYTES as u64;
                 // SAFETY: inside the metadata frame this module allocated.
@@ -786,6 +823,7 @@ pub fn handle_completion() {
                     } else {
                         entry.done = true;
                         entry.status = status;
+                        entry.len = len;
                         woken[count] = Some(entry.thread);
                         count += 1;
                     }

@@ -88,26 +88,22 @@ fn host_crate_args() -> Vec<String> {
 /// host-buildable crates appear: criterion needs `std`, and the kernel is
 /// `no_std` running in QEMU, so it cannot be linked against at all.
 fn bench_args(extra: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "bench",
-        "--target",
-        "x86_64-unknown-linux-musl",
-        "-p",
-        "qunix-sync",
-        "-p",
-        "qunix-mm",
-        "-p",
-        "qunix-hal-x86_64",
-        "-p",
-        "qunix-bcache",
-        "-p",
-        "qunix-virtio",
-        "--features",
-        "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-bcache/std,qunix-virtio/std",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect();
+    // Derived, not restated. This used to hand-write both the `-p` pairs and
+    // the joined feature string while `BENCHED_CRATES` existed only under
+    // `#[cfg(test)]` to assert the two agreed -- the same two-lists-that-drift
+    // shape `HOST_CRATES` was introduced to remove, one function away from it.
+    // A test that catches drift after the fact is worse than a list that
+    // cannot drift.
+    let mut args: Vec<String> = ["bench", "--target", "x86_64-unknown-linux-musl"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for name in BENCHED_CRATES {
+        args.push("-p".to_string());
+        args.push((*name).to_string());
+    }
+    args.push("--features".to_string());
+    args.push(BENCHED_CRATES.iter().map(|n| format!("{n}/std")).collect::<Vec<_>>().join(","));
     args.extend(extra.iter().cloned());
     args
 }
@@ -147,8 +143,8 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
 /// to `bench_args` is simply never benchmarked, and `cargo xtask bench` reports
 /// success without it -- the same silent omission the coverage ratchet had.
 /// `every_crate_with_benches_is_benched` fails when the two disagree.
-#[cfg(test)]
-const BENCHED_CRATES: &[&str] = &["qunix-sync", "qunix-mm", "qunix-hal-x86_64", "qunix-bcache", "qunix-virtio"];
+const BENCHED_CRATES: &[&str] =
+    &["qunix-sync", "qunix-mm", "qunix-hal-x86_64", "qunix-bcache", "qunix-virtio"];
 
 /// Fuzz targets run by a bare `xtask fuzz`.
 const FUZZ_TARGETS: &[&str] = &["buddy", "slab", "bcache", "virtio_queue"];
@@ -402,24 +398,51 @@ fn main() -> Result<()> {
 mod tests {
     use super::{BENCHED_CRATES, FUZZ_TARGETS, HOST_CRATES, bench_args, fuzz_args, fuzz_selection, host_crate_args, workspace_root};
 
-    /// A crate missing from the invocation is a suite that never runs, and the
-    /// run still prints success -- there is no line saying which crates were
-    /// not tested. `qunix-bcache` was absent for as long as it existed.
+    /// `--features` takes a single value, so a flag appended after it is
+    /// swallowed as part of that value rather than parsed.
+    ///
+    /// This is the load-bearing half of what used to be one test. The other
+    /// half asserted that `host_crate_args` emits a `-p` for every entry in
+    /// `HOST_CRATES` and a feature for every `Some` -- built by iterating that
+    /// same list, so it held for any contents and could not detect the omission
+    /// its own comment described.
     #[test]
-    fn the_host_invocation_names_every_host_crate_and_its_feature() {
+    fn the_features_value_is_the_last_argument() {
         let args = host_crate_args();
-        let features = args.last().expect("no --features value");
-        for (name, feature) in HOST_CRATES {
-            assert!(args.iter().any(|a| a == name), "missing -p {name}: {args:?}");
-            if let Some(feature) = feature {
-                assert!(features.contains(feature), "missing {feature} in {features}");
-            }
-        }
-        // `--features` is a single value, so anything after it is swallowed as
-        // part of that value rather than parsed as a flag.
         assert_eq!(args[args.len() - 2], "--features");
+        let bench = bench_args(&[]);
+        let features = bench.iter().position(|a| a == "--features").expect("no --features");
+        assert_eq!(features, bench.len() - 2, "a flag was appended after the features value");
     }
 
+    /// A crate's feature column must match what its manifest offers.
+    ///
+    /// This is what `HOST_CRATES` can get wrong that a test can see. The first
+    /// version of the membership check used "has a `std` feature" as its signal
+    /// and passed `qunix-abi`, which has none -- so naming a feature a crate
+    /// does not declare, or omitting one it does, is a demonstrated mistake.
+    #[test]
+    fn every_host_crate_declares_the_feature_it_is_tested_with() {
+        let root = workspace_root();
+        for (name, feature) in HOST_CRATES {
+            // The host tool, not a target crate: it has no `crates/` directory.
+            if *name == "xtask" {
+                continue;
+            }
+            let manifest =
+                std::fs::read_to_string(root.join("crates").join(name).join("Cargo.toml")).unwrap();
+            let declares_std = manifest.lines().any(|line| line.trim().starts_with("std = "));
+            match feature {
+                Some(feature) => {
+                    assert_eq!(*feature, format!("{name}/std"), "{name} is tested with {feature}");
+                    assert!(declares_std, "{name} is tested with {feature} but declares no std");
+                }
+                None => {
+                    assert!(!declares_std, "{name} declares a std feature but is tested without it")
+                }
+            }
+        }
+    }
 
     #[test]
     fn bench_selects_only_host_buildable_crates() {

@@ -79,9 +79,44 @@ pub const fn status_from_byte(b: u8) -> BlkStatus {
     }
 }
 
+
+/// Whether the device transferred everything the request asked for.
+///
+/// The used ring's `len` is written by the *device*, so it is input rather than
+/// bookkeeping. A device that completes a 4096-byte read with `VIRTIO_BLK_S_OK`
+/// and `len = 0` has written nothing into the buffer -- and a driver that
+/// copies the full request out anyway hands back whatever the previous request
+/// through that buffer left there. Another block's bytes, returned as this
+/// one's, which a buffer cache above then serves on every later hit.
+///
+/// A device reporting *more* than was asked for is not treated as a failure
+/// here: the driver bounds the copy by what it asked for, so the excess is
+/// unreachable, and refusing it would turn a device that pads its accounting
+/// into a device that cannot be used at all.
+pub fn transfer_satisfied(reported: u32, asked: usize) -> bool {
+    reported as usize >= asked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_transfer_is_not_satisfied_and_a_full_one_is() {
+        // The refusing direction is the one that matters. A device reporting
+        // fewer bytes than were asked for has left the rest of the buffer
+        // holding the previous request through it, and a driver that accepts
+        // the completion returns those bytes as this request's data.
+        assert!(!transfer_satisfied(0, 4096), "a device that transferred nothing was believed");
+        assert!(!transfer_satisfied(4095, 4096), "a transfer one byte short was accepted");
+        assert!(!transfer_satisfied(512, 4096), "a one-sector transfer satisfied an eight-sector read");
+        assert!(transfer_satisfied(4096, 4096), "an exact transfer was refused");
+        // More than asked for is not a failure: the driver bounds its copy by
+        // what it asked for, so the excess is unreachable, and refusing it
+        // would make a device that pads its accounting unusable.
+        assert!(transfer_satisfied(8192, 4096), "a device that over-reported was refused");
+        assert!(transfer_satisfied(0, 0), "an empty request was refused");
+    }
 
     #[test]
     fn the_request_header_has_the_layout_the_device_reads() {

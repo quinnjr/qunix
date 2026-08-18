@@ -45,9 +45,19 @@ fuzz_target!(|ops: Vec<Op>| {
     let mut queue = SplitQueue::new(SIZE);
     // head -> every descriptor in that chain, in order.
     let mut live: HashMap<u16, Vec<u16>> = HashMap::new();
-    // Heads the queue considers submitted but not yet completed. Distinct from
-    // `live`: `take_used` clears the flag without returning the descriptors.
-    let mut submitted: HashSet<u16> = HashSet::new();
+    // Chains the driver actually handed to the device. Deliberately *not* a
+    // mirror of `SplitQueue::in_flight`, which is set at `alloc_chain`: a model
+    // that restated the implementation could not fail for any implementation
+    // that kept the bit where it is. What the driver needs is that a completion
+    // names a chain that was *published*, so that is what is tracked here, and
+    // a device forging the id of an allocated-but-never-published chain is a
+    // finding rather than an accepted input.
+    let mut published: HashSet<u16> = HashSet::new();
+    // What each live descriptor was told to point at, so a `describe` that
+    // wrote to the wrong index is visible. Without it that arm asserts nothing
+    // at all, and clobbering a neighbouring live chain's address -- the exact
+    // failure this target's header names -- goes unreported.
+    let mut described: HashMap<u16, (u64, u32, bool)> = HashMap::new();
 
     // Anchors the run: a queue that refused everything would make every op a
     // no-op and the run would still pass.
@@ -88,7 +98,6 @@ fuzz_target!(|ops: Vec<Op>| {
                             assert!(!owned.contains(d), "descriptor {d} is in two live chains");
                         }
                         assert!(live.insert(head, chain).is_none(), "head {head} was handed out twice");
-                        submitted.insert(head);
                     }
                     None => assert!(
                         n == 0 || n > free_before,
@@ -103,6 +112,9 @@ fuzz_target!(|ops: Vec<Op>| {
                 }
                 let head = heads[which as usize % heads.len()];
                 let chain = live.remove(&head).unwrap();
+                for descriptor in &chain {
+                    described.remove(descriptor);
+                }
                 let free_before = queue.free_count();
                 queue.free_chain(head);
                 // Every descriptor, not just the head. Releasing only the head
@@ -113,7 +125,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     free_before + chain.len() as u16,
                     "free_chain({head}) returned the wrong number of descriptors"
                 );
-                submitted.remove(&head);
+                published.remove(&head);
             }
 
             Op::Describe { which, position, addr, len, writable } => {
@@ -124,6 +136,30 @@ fuzz_target!(|ops: Vec<Op>| {
                 let chain = &live[&head];
                 let idx = chain[position as usize % chain.len()];
                 queue.describe(idx, addr, len, writable);
+                described.insert(idx, (addr, len, writable));
+                // Every described descriptor, not just this one: writing to the
+                // wrong index shows up as somebody *else's* descriptor having
+                // changed, which asserting only `idx` cannot see.
+                for (&descriptor, &(addr, len, writable)) in &described {
+                    let bytes =
+                        queue.descriptor_bytes(descriptor).expect("a live descriptor has no bytes");
+                    assert_eq!(
+                        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                        addr,
+                        "descriptor {descriptor} names the wrong address"
+                    );
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                        len,
+                        "descriptor {descriptor} names the wrong length"
+                    );
+                    let flags = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+                    assert_eq!(
+                        flags & qunix_virtio::DESC_F_WRITE != 0,
+                        writable,
+                        "descriptor {descriptor} has the wrong direction"
+                    );
+                }
             }
 
             Op::Publish { which } => {
@@ -146,6 +182,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     Some(head.to_le_bytes()),
                     "the published slot does not name the chain"
                 );
+                published.insert(head);
             }
 
             Op::Ingest { slot, bytes } => {
@@ -160,8 +197,8 @@ fuzz_target!(|ops: Vec<Op>| {
                         // driver actually submitted, or freeing it walks `next`
                         // links belonging to a live request.
                         assert!(
-                            submitted.remove(&head),
-                            "take_used returned chain {head}, which was never submitted"
+                            published.remove(&head),
+                            "take_used returned chain {head}, which was never published to the device"
                         );
                         assert!(live.contains_key(&head), "take_used returned a chain that is not live");
                     }

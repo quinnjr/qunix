@@ -82,16 +82,29 @@ const _: () = assert!(BLOCK_BYTES == 4096, "a cached block must be exactly one f
 /// deadline is shorter, so under any fault the filling thread fails first and
 /// this is the backstop.
 const FILL_WAIT_TICKS: u64 = 1;
-const FILL_WAIT_LIMIT: u32 = 4096;
 
-/// How long a write waits for a block's readers to release it.
+/// How long a caller waits for another thread's fill, in ticks.
 ///
-/// Much shorter than [`FILL_WAIT_LIMIT`], because the thing being waited for is
-/// not I/O. A reader holds a pin only for as long as it walks the block, so a
-/// wait this long means the pin is not going away -- most likely because the
-/// caller is holding a [`BlockRef`] to the block it is trying to write, and is
-/// waiting for itself.
-const PIN_WAIT_LIMIT: u32 = 32;
+/// A *deadline*, not a spin count. `wait_a_tick` falls back to `yield_now`
+/// when the timer table is full -- and a full timer table is exactly the
+/// condition under load, which is exactly when waits are needed. An iteration
+/// count then elapses in microseconds and reports a stall that did not happen.
+///
+/// Sized just past the block driver's own `REQUEST_TIMEOUT_TICKS` (500, about
+/// five seconds), because the argument for this bound is that the driver's
+/// deadline fires first: the thread doing the fill gives up, resolves the slot,
+/// and this waiter finds it. A much larger figure only turns a lost completion
+/// into something an operator reads as a hang.
+const FILL_WAIT_TICKS_LIMIT: u64 = 600;
+
+/// How long a write waits for a block's readers to release it, in ticks.
+///
+/// Much shorter than [`FILL_WAIT_TICKS_LIMIT`], because the thing being waited
+/// for is not I/O. A reader holds a pin only for as long as it walks the block,
+/// so a wait this long means the pin is not going away -- most likely because
+/// the caller is holding a [`BlockRef`] to the block it is trying to write, and
+/// is waiting for itself.
+const PIN_WAIT_TICKS_LIMIT: u64 = 32;
 
 /// How many rounds `sync` waits on writebacks other processors own.
 ///
@@ -222,13 +235,24 @@ pub fn init() -> Result<(), BcacheError> {
         return Ok(());
     }
     let mut frames = [0u64; SLOTS];
-    for frame in frames.iter_mut() {
-        // Order 0: one frame, which is one block. Never freed -- see the module
-        // docs. A failure here leaves the frames already taken reserved too,
-        // deliberately: this runs once at boot, and a kernel that cannot afford
-        // 128 KiB of cache is not one that should proceed to mount a
-        // filesystem.
-        let phys = crate::frames::alloc(0).ok_or(BcacheError::NoFrames)?;
+    for (taken, frame) in frames.iter_mut().enumerate() {
+        // Order 0: one frame, which is one block. Never freed once init
+        // succeeds -- see the module docs.
+        let Some(phys) = crate::frames::alloc(0) else {
+            // The frames already taken are returned. Keeping them would lose up
+            // to 124 KiB per attempt in exactly the situation where memory is
+            // already short, and `init` is documented as idempotent, so a
+            // caller that retries would leak another set each time. A comment
+            // saying the leak is acceptable is not an enforcement mechanism.
+            let hhdm = crate::boot::hhdm_offset();
+            for done in &frames[..taken] {
+                // SAFETY: each of these came from `alloc(0)` in this loop and
+                // has been handed to nobody -- `guard` is still `None`, so no
+                // slot names any of them.
+                unsafe { crate::frames::free(done - hhdm, 0) };
+            }
+            return Err(BcacheError::NoFrames);
+        };
         *frame = crate::boot::hhdm_offset() + phys;
     }
     *guard = Some(Bcache {
@@ -368,7 +392,7 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
         return Err(BcacheError::UnknownDevice);
     }
     lba_of(key)?;
-    let mut waited = 0u32;
+    let started = now_ticks();
     let mut flushed = 0usize;
     loop {
         let claimed = match claim(key) {
@@ -397,8 +421,7 @@ pub async fn read_block(key: BlockKey) -> Result<BlockRef, BcacheError> {
                 // for is a disk read -- so a tick of latency is small beside
                 // it. The bound is what stops a lost completion becoming a
                 // machine that stops rather than a request that fails.
-                waited += 1;
-                if waited > FILL_WAIT_LIMIT {
+                if past_deadline(started, FILL_WAIT_TICKS_LIMIT) {
                     return Err(BcacheError::FillStalled);
                 }
                 wait_a_tick().await;
@@ -455,8 +478,15 @@ impl Drop for Writeback {
 /// Why a store could not proceed yet.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Blocked {
-    /// The device or another thread owns the buffer.
-    Io,
+    /// Another thread is reading the block into this slot.
+    ///
+    /// Distinct from [`Self::WritingBack`] because the two point at different
+    /// faults: a stuck fill means a lost *read* completion, while a stuck
+    /// writeback means the caller's own earlier write has not left the cache.
+    /// Reported as one error, an operator cannot tell which.
+    Filling,
+    /// The device is reading this slot's buffer for a writeback.
+    WritingBack,
     /// A reader holds a reference into it.
     Reader,
 }
@@ -477,7 +507,11 @@ fn store(key: BlockKey, data: &[u8]) -> Result<Result<(), Blocked>, BcacheError>
             // device a torn mixture of the block it was told to write and the
             // one written over it -- which lands on the disk successfully.
             if cache.table.state_of(slot) == Some(SlotState::InFlight) {
-                return Ok(Err(Blocked::Io));
+                return Ok(Err(if cache.filling[slot] {
+                    Blocked::Filling
+                } else {
+                    Blocked::WritingBack
+                }));
             }
             // A pin means a `BlockRef` is live, and a `BlockRef` hands out a
             // `&[u8]` over this very frame without holding the lock. Copying
@@ -553,7 +587,12 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
         return Err(BcacheError::PartialBlock);
     }
     lba_of(key)?;
-    let mut waited = 0u32;
+    // One deadline per reason. Shared, a reader arriving after a long wait on
+    // io is refused on its *first* tick against a bound already spent waiting
+    // for something else -- and `Pinned`'s own documentation then misdiagnoses
+    // it as a caller holding a reference to the block it is writing.
+    let mut io_started = None;
+    let mut pin_started = None;
     let mut flushed = 0usize;
     loop {
         let blocked = match store(key, data) {
@@ -568,16 +607,16 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
             }
             Err(error) => return Err(error),
         };
-        waited += 1;
-        let limit = match blocked {
-            Blocked::Io => FILL_WAIT_LIMIT,
-            Blocked::Reader => PIN_WAIT_LIMIT,
+        let (started, limit, stalled) = match blocked {
+            Blocked::Filling => (&mut io_started, FILL_WAIT_TICKS_LIMIT, BcacheError::FillStalled),
+            Blocked::WritingBack => {
+                (&mut io_started, FILL_WAIT_TICKS_LIMIT, BcacheError::WritebackStalled)
+            }
+            Blocked::Reader => (&mut pin_started, PIN_WAIT_TICKS_LIMIT, BcacheError::Pinned),
         };
-        if waited > limit {
-            return Err(match blocked {
-                Blocked::Io => BcacheError::FillStalled,
-                Blocked::Reader => BcacheError::Pinned,
-            });
+        let began = *started.get_or_insert_with(now_ticks);
+        if past_deadline(began, limit) {
+            return Err(stalled);
         }
         wait_a_tick().await;
     }
@@ -588,6 +627,16 @@ pub async fn write_block(key: BlockKey, data: &[u8]) -> Result<(), BcacheError> 
 /// The infallible `sleep_ticks` panics when the timer table is full, and a full
 /// timer table is a transient condition rather than a reason to stop the
 /// machine -- several threads waiting at once is exactly when it happens.
+/// Ticks since boot.
+fn now_ticks() -> u64 {
+    crate::TICKS.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether `started` is more than `limit` ticks ago.
+fn past_deadline(started: u64, limit: u64) -> bool {
+    now_ticks().saturating_sub(started) > limit
+}
+
 async fn wait_a_tick() {
     match crate::task::try_sleep_ticks(FILL_WAIT_TICKS) {
         Ok(sleep) => sleep.await,
@@ -665,17 +714,6 @@ fn finish_writeback(slot: usize, ok: bool) {
     cache.writeback_failed[slot] = !ok;
 }
 
-/// Writes every block that was dirty when this was called.
-///
-/// A block dirtied *while* this runs is not covered: `end_io` leaves such a
-/// slot dirty and the next `sync` writes it. The alternative -- looping until
-/// nothing is dirty -- lets a steady writer keep `sync` from ever returning,
-/// which is a hang rather than a stronger guarantee.
-///
-/// One failing block does not abandon the rest. Stopping at the first error
-/// would leave later blocks dirty for a reason that has nothing to do with
-/// them, so every slot in the snapshot is attempted and the first error is
-/// what is reported.
 /// Writes one slot back, or `None` if it is no longer dirty.
 ///
 /// Shared by [`sync`] and by the eviction path, so the two cannot drift about
@@ -1515,8 +1553,8 @@ mod tests {
         // A writer meets the same slot and is told to wait for the io.
         let payload = alloc::vec![0u8; BLOCK_BYTES];
         assert!(
-            matches!(store(key, &payload), Ok(Err(Blocked::Io))),
-            "a write during a fill was not blocked on the io"
+            matches!(store(key, &payload), Ok(Err(Blocked::Filling))),
+            "a write during a fill was not blocked on the fill"
         );
 
         let completions = block::completions();
@@ -1555,7 +1593,7 @@ mod tests {
 
         let other = altered(&payload);
         assert!(
-            matches!(store(key, &other), Ok(Err(Blocked::Io))),
+            matches!(store(key, &other), Ok(Err(Blocked::WritingBack))),
             "a write during a writeback was allowed to tear the buffer"
         );
         // A *reader* is not blocked: the device is only reading it too.
@@ -1689,6 +1727,21 @@ mod tests {
         );
         assert_eq!(block::completions(), before, "the refused read still went to a device");
         assert_eq!(resident(), 0, "the refused read claimed a slot");
+
+        // The write direction, which is the more dangerous one: a write to
+        // device 1 that was accepted would store the caller's bytes under key
+        // (1, N) and `sync` would put them on device *0*'s block N -- silently
+        // destroying an unrelated block on the only real disk, successfully.
+        let payload = alloc::vec![0u8; BLOCK_BYTES];
+        assert!(
+            matches!(
+                block_on(write_block(BlockKey { dev: 1, block: 1 }, &payload)),
+                Err(BcacheError::UnknownDevice)
+            ),
+            "a write to a device with no driver was accepted"
+        );
+        assert_eq!(resident(), 0, "the refused write claimed a slot");
+        assert_eq!(dirty_count(), 0, "the refused write dirtied a slot");
     }
 
     #[test_case]

@@ -636,3 +636,61 @@ runs out while a reusable slot was available all along — a table reporting
 `a_pinned_dirty_slot_is_not_the_one_chosen_to_flush` asserts the pinned block is
 still dirty and still not on the disk, which is what states the choice.
 
+### D13: `bcache::init` is not called from `kmain`, and that is deliberate
+
+The File Structure table promises `kernel/src/main.rs` gains "`mod bcache;` and
+its init call". Only the `mod` declaration landed, and this section is where
+that should have been recorded rather than left for a reviewer to find — which
+one did, three times.
+
+The decision itself stands. `block::init` is not called from `kmain` either:
+both the driver and the cache above it are reachable only from the test harness
+until a filesystem exists to consume them. Wiring `bcache::init` alone would
+reserve 128 KiB at every boot for a cache nothing can read through, since the
+device beneath it is still uninitialised. Both get wired together, in the task
+that first has a caller.
+
+What changed as a result of the review is the failure mode: using the cache
+before `init` reported a panic, which made an ordinary `NoFrames` on a small
+machine into a halt. It reports `BcacheError::Uninitialised` now, so the
+unwired state is a refusal rather than a stopped machine.
+
+### D14: the review found two defects the milestone's own tests could not
+
+A seven-agent review of the finished branch found 37 findings, two of them
+silent corruption that every test and every mutation check had passed:
+
+- `key.block * SECTORS_PER_BLOCK` was unchecked. `[profile.release]` sets no
+  `overflow-checks`, so it wraps in release into a *valid* sector: a block of
+  2^61 resolves to LBA 0, and a write lands on the boot sector successfully.
+  In a test build the same input panics, so no in-QEMU test could have reached
+  the release behaviour at all.
+- `sync` returned `Ok(())` for data still in the air. Its mask held only
+  `Dirty` slots, and a slot another processor is already writing back is
+  `InFlight` — absent from the mask entirely.
+
+Both were invisible to the tests because both need a *second processor* or a
+*release build*, and the suite is neither. The lesson recorded here is that the
+in-QEMU harness runs single-threaded on the boot CPU under `block_on`, so any
+invariant that only holds under concurrency is untested by construction. The
+fix was not only the two bugs: `Claim::Wait`, both halves of `Blocked::Io` and
+both drop guards are now reached by half-polling a future and dropping it,
+which produces the states a parked peer would without needing a second thread.
+
+### D15: the drop-guard tests found a leak in the layer below
+
+Adding those tests broke a `block.rs` assertion, which is how a finding rated
+*Low, medium confidence* turned out to be real. An abandoned request left its
+descriptor chain neither freed nor quarantined: one of 21 in-flight slots per
+abandonment, until the queue drained into `QueueFull` errors in code with
+nothing to do with the cause. The driver already had the machinery — the
+deadline path quarantines and `handle_completion` reclaims — it simply was not
+reachable from a dropped future. `block::Request` closes it.
+
+The same round hardened two things beneath the cache that it depends on:
+`SplitQueue` marks a chain in flight at `publish` rather than at `alloc_chain`,
+so a device cannot complete an id the driver never handed it; and `finish`
+checks the device-reported transfer length before copying, so a device
+reporting `OK` with `len = 0` no longer yields the previous request's bounce
+buffer as this request's data.
+
