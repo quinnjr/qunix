@@ -875,6 +875,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qunix-vfs"
+version = "0.1.0"
+dependencies = [
+ "qunix-abi",
+]
+
+[[package]]
 name = "qunix-virtio"
 version = "0.1.0"
 dependencies = [

@@ -65,6 +65,7 @@ pub const HOST_CRATES: &[(&str, Option<&str>)] = &[
     ("qunix-elf", Some("qunix-elf/std")),
     ("qunix-virtio", Some("qunix-virtio/std")),
     ("qunix-bcache", Some("qunix-bcache/std")),
+    ("qunix-vfs", Some("qunix-vfs/std")),
     ("qunix-abi", None),
     ("xtask", None),
 ];

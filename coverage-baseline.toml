@@ -63,3 +63,11 @@ qunix-virtio = 98.37
 qunix-bcache = 100.00
 
 qunix-abi = 100.00
+
+# 97.40. Two lines uncovered, both inside `#[cfg(test)]` helpers: the `panic!`
+# arms of the closures in `a_path_decomposes_into_the_components_a_walker_visits`
+# and `repeated_and_trailing_separators_produce_no_components` that assert every
+# yielded component is a `Name`. They run only when `components()` yields a
+# `Current` or `Parent` where the test does not expect one -- i.e. only on a
+# failing run, the same shape as `qunix-sync`'s note above.
+qunix-vfs = 97.40
