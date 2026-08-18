@@ -114,6 +114,80 @@ impl<const N: usize> Cache<N> {
     pub fn state_of(&self, slot: usize) -> Option<SlotState> {
         self.slots.get(slot).map(|s| s.state)
     }
+
+    /// Records that a slot's contents no longer match the device.
+    pub fn mark_dirty(&mut self, slot: usize) {
+        self.slots[slot].state = SlotState::Dirty;
+    }
+
+    /// Records that a slot's contents match the device again.
+    pub fn mark_clean(&mut self, slot: usize) {
+        self.slots[slot].state = SlotState::Clean;
+    }
+
+    /// Marks an I/O outstanding against a slot, returning what it was before.
+    ///
+    /// The previous state is returned rather than discarded because the flush
+    /// path needs it: a write that fails must leave the slot `Dirty`, not
+    /// `Clean`, or the data is dropped and the caller has already been told the
+    /// write succeeded.
+    pub fn begin_io(&mut self, slot: usize) -> SlotState {
+        let was = self.slots[slot].state;
+        self.slots[slot].state = SlotState::InFlight;
+        was
+    }
+
+    /// Ends an outstanding I/O, putting the slot into `state`.
+    pub fn end_io(&mut self, slot: usize, state: SlotState) {
+        self.slots[slot].state = state;
+    }
+
+    /// Takes a reference to a slot's buffer, so it cannot be reused.
+    pub fn pin(&mut self, slot: usize) {
+        self.slots[slot].pins += 1;
+    }
+
+    /// Releases a reference taken by [`Self::pin`].
+    pub fn unpin(&mut self, slot: usize) {
+        self.slots[slot].pins = self.slots[slot].pins.saturating_sub(1);
+    }
+
+    /// A slot that may be reused, if any.
+    ///
+    /// Three separate refusals, and they are not interchangeable -- each is a
+    /// different corruption:
+    ///
+    /// - **Dirty**: reusing it discards a write the caller was told succeeded,
+    ///   and the block reads as its old contents forever after.
+    /// - **InFlight**: the device owns the buffer until it completes. Reusing
+    ///   it makes the device write one block's data into another block's
+    ///   buffer, with every operation returning success.
+    /// - **Pinned**: somebody holds a reference to the buffer and is reading
+    ///   through it.
+    ///
+    /// `Free` slots first, so an untouched table is filled before anything is
+    /// evicted.
+    pub fn victim(&self) -> Option<usize> {
+        if let Some(free) = self.slots.iter().position(|s| s.state == SlotState::Free) {
+            return Some(free);
+        }
+        self.slots
+            .iter()
+            .position(|s| s.state == SlotState::Clean && s.pins == 0)
+    }
+
+    /// Every slot holding a block that must be written back.
+    ///
+    /// What `sync` writes. A dirty slot missing from this is a write that was
+    /// acknowledged and never reached the disk -- which no later read through
+    /// the cache can reveal, because the cache answers it from the same slot.
+    pub fn dirty_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.state == SlotState::Dirty)
+            .map(|(i, _)| i)
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +216,91 @@ mod tests {
     }
 
     #[test]
+    fn a_dirty_slot_is_never_chosen_as_a_victim() {
+        // Evicting a dirty slot discards a write the caller was told
+        // succeeded, and the block reads as its old contents forever after.
+        // Nothing downstream is in a position to notice.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+        cache.mark_dirty(a);
+        cache.mark_dirty(b);
+        assert_eq!(cache.victim(), None, "a dirty slot was offered for reuse");
+    }
+
+    #[test]
+    fn a_slot_with_io_outstanding_is_never_chosen_as_a_victim() {
+        // The device owns the buffer until it completes. Reusing it is the
+        // driver's own bug one layer up: the device writes one block's data
+        // into another block's buffer and every operation returns success.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+        cache.begin_io(a);
+        assert_eq!(cache.victim(), Some(b), "the one reusable slot was not offered");
+        cache.begin_io(b);
+        assert_eq!(cache.victim(), None, "a slot with io outstanding was offered for reuse");
+    }
+
+    #[test]
+    fn a_pinned_slot_is_never_chosen_as_a_victim() {
+        // A pin means somebody is reading through the buffer right now.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+        cache.pin(a);
+        cache.pin(b);
+        assert_eq!(cache.victim(), None, "a pinned slot was offered for reuse");
+        cache.unpin(b);
+        assert_eq!(cache.victim(), Some(b), "unpinning did not release the slot");
+    }
+
+    #[test]
+    fn a_free_slot_is_taken_before_a_clean_one_is_evicted() {
+        // Filling before evicting. The other order throws away a cached block
+        // while a frame the kernel reserved sits unused, which is invisible --
+        // it costs hit rate, not correctness, and so nothing else would catch
+        // it.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        let free = cache.victim().expect("a half-empty table offered no slot");
+        assert_ne!(free, a, "an occupied slot was evicted while one was free");
+    }
+
+    #[test]
+    fn begin_io_reports_the_state_it_replaced() {
+        // The flush path needs it: a write that fails must leave the slot
+        // `Dirty`, not `Clean`, or the data is dropped after the caller has
+        // been told the write succeeded.
+        let mut cache = Cache::<2>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        cache.mark_dirty(a);
+        assert_eq!(cache.begin_io(a), SlotState::Dirty, "the replaced state was lost");
+        cache.end_io(a, SlotState::Dirty);
+        assert_eq!(cache.state_of(a), Some(SlotState::Dirty));
+    }
+
+    #[test]
+    fn every_dirty_slot_is_reported_for_writeback() {
+        // `sync` writes what this reports. A dirty slot missing from it is a
+        // write that was acknowledged and never reached the disk -- and no
+        // later read through the cache can reveal that, because the cache
+        // answers it from the same slot.
+        let mut cache = Cache::<4>::new();
+        let a = cache.insert(BlockKey { dev: 0, block: 1 }).unwrap();
+        let b = cache.insert(BlockKey { dev: 0, block: 2 }).unwrap();
+        cache.insert(BlockKey { dev: 0, block: 3 }).unwrap();
+        cache.mark_dirty(a);
+        cache.mark_dirty(b);
+        // Compared as an iterator rather than collected: `Vec` is the one
+        // thing in this file that would need an allocator, and the crate has
+        // no business acquiring one for a test.
+        assert!(cache.dirty_slots().eq([a, b]), "the dirty set does not match what was dirtied");
+        cache.mark_clean(a);
+        assert!(cache.dirty_slots().eq([b]), "a cleaned slot was still reported dirty");
+    }
+
+    #[test]
     fn a_free_slot_is_not_a_hit_even_when_its_leftover_key_matches() {
         // `Free` means the memory holds nothing; the key still in the slot is
         // the previous occupant's. Matching on the key alone would return a
@@ -152,6 +311,23 @@ mod tests {
         let slot = cache.insert(key).expect("a fresh cache has slots");
         cache.release_for_test(slot);
         assert_eq!(cache.lookup(key), None, "a freed slot was reported as a hit");
+    }
+
+    #[test]
+    fn a_freed_slot_reports_no_key_and_a_slot_past_the_end_reports_nothing() {
+        // The same hazard as `lookup`, reached from the other side. `key_of`
+        // is how a caller learns which block a slot it already holds is for --
+        // writeback asks it before issuing the write. A freed slot answering
+        // with its previous occupant's key sends that slot's bytes to the
+        // wrong block number, and the write succeeds.
+        let mut cache = Cache::<2>::default();
+        let key = BlockKey { dev: 3, block: 11 };
+        let slot = cache.insert(key).expect("a fresh cache has slots");
+        assert_eq!(cache.key_of(slot), Some(key));
+        cache.release_for_test(slot);
+        assert_eq!(cache.key_of(slot), None, "a freed slot named its old block");
+        assert_eq!(cache.key_of(Cache::<2>::CAPACITY), None, "a slot past the end named a block");
+        assert_eq!(cache.state_of(Cache::<2>::CAPACITY), None);
     }
 
     #[test]
