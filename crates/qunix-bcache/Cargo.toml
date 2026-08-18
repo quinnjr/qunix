@@ -11,3 +11,10 @@ publish.workspace = true
 [features]
 default = []
 std = []
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "cache"
+harness = false
