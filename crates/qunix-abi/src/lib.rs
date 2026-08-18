@@ -280,6 +280,20 @@ mod syscall_tests {
     }
 
     #[test]
+    fn is_writable_agrees_with_the_bit_it_reads() {
+        // `is_readable` and `is_writable` read different bits of the same word;
+        // asserting both directions on the same three values is what would catch
+        // one accessor silently testing the other's bit.
+        assert!(OpenFlags::WRITE.is_writable());
+        assert!(!OpenFlags::WRITE.is_readable());
+        assert!(OpenFlags::READ.is_readable());
+        assert!(!OpenFlags::READ.is_writable());
+        let neither = OpenFlags::from_bits(0).unwrap();
+        assert!(!neither.is_readable());
+        assert!(!neither.is_writable());
+    }
+
+    #[test]
     fn a_whence_is_parsed_rather_than_transmuted() {
         assert_eq!(Whence::from_raw(0), Some(Whence::Set));
         assert_eq!(Whence::from_raw(1), Some(Whence::Current));
