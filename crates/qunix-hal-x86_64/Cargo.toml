@@ -18,6 +18,10 @@ x86_64.workspace = true
 [features]
 default = []
 std = []
+# Asserts that interrupts are never re-enabled while this processor holds an
+# `IrqSpinLock`. Paired with `qunix-sync/deadlock-panic`, which bounds the wait
+# that such a mistake produces.
+deadlock-panic = []
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

@@ -25,6 +25,26 @@ impl qunix_sync::IrqControl for Irq {
     }
 
     fn restore(was_enabled: bool) {
+        // Re-enabling interrupts while this processor holds an `IrqSpinLock` is
+        // always a bug, and a specific one: a tick landing in that window
+        // re-enters the holder's own critical section, and whatever it calls
+        // that takes the same lock spins forever on a lock this processor
+        // already owns. It presents as a machine that stops, from a window too
+        // small to find by reading.
+        //
+        // `park`'s cancelled arm did exactly this -- restored inside the block
+        // that held `SCHED`, so the guard outlived the `sti` by one statement.
+        // It survived every local run and wedged CI.
+        //
+        // The guard's own `Drop` clears its depth *before* it restores, so a
+        // legitimate release never trips this; a nested guard restores `false`,
+        // which is not a re-enable at all.
+        #[cfg(feature = "deadlock-panic")]
+        assert!(
+            !was_enabled || crate::tlb::lock_depth() == 0,
+            "interrupts re-enabled while holding {} irq spinlock(s)",
+            crate::tlb::lock_depth()
+        );
         if was_enabled {
             x86_64::instructions::interrupts::enable();
         }

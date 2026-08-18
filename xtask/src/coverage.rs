@@ -19,15 +19,10 @@ use std::process::Command;
 
 const BASELINE: &str = "coverage-baseline.toml";
 
-/// Crates measured, and the feature each needs to build for the host.
-const MEASURED: &[(&str, Option<&str>)] = &[
-    ("qunix-sync", Some("qunix-sync/std")),
-    ("qunix-mm", Some("qunix-mm/std")),
-    ("qunix-hal-x86_64", Some("qunix-hal-x86_64/std")),
-    ("qunix-sched", Some("qunix-sched/std")),
-    ("qunix-elf", Some("qunix-elf/std")),
-    ("xtask", None),
-];
+/// Crates measured. The same list `xtask test` runs, because a crate that is
+/// tested but not ratcheted loses its floor silently and a crate that is
+/// ratcheted but not tested measures zero.
+use crate::HOST_CRATES as MEASURED;
 
 /// Absorbs the sub-percent drift a pure refactor can cause when lines move
 /// between counted and uncounted forms. Wide enough not to churn, far too
@@ -682,6 +677,48 @@ pub fn check(root: &Path, update: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A crate under `crates/` that is not in `MEASURED` is not ratcheted, and
+    /// nothing says so -- the run prints success for the crates it did measure
+    /// and never mentions the one it skipped. `qunix-virtio` sat outside the
+    /// ratchet for a whole milestone that way.
+    ///
+    /// Membership is the directory, not a `std` feature. The first version of
+    /// this used the feature as the signal for "host-testable" and passed
+    /// `qunix-abi`, which is unconditionally `#![no_std]`, has no such feature,
+    /// and runs three host tests -- reproducing, inside the check written to
+    /// close the gap, exactly the gap it was written for.
+    ///
+    /// A crate that genuinely cannot be measured on the host gets no exception
+    /// here. It goes in `MEASURED` with a low floor and a note saying which
+    /// lines are unreachable and why, as `qunix-hal-x86_64` does.
+    #[test]
+    fn every_crate_in_the_workspace_is_measured() {
+        let root = crate::workspace_root();
+        for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+            let dir = entry.unwrap().path();
+            // A stray file or editor directory under `crates/` is not a crate,
+            // and failing on it would turn unrelated filesystem state into a
+            // test failure.
+            let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+                continue;
+            };
+            // The package name, not the directory name: cargo dispatches `-p`
+            // on the former, so a crate whose two names differ would be
+            // measured under a name no invocation ever uses.
+            let name = manifest
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("name = "))
+                .expect("a crate manifest with no package name")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            assert!(
+                MEASURED.iter().any(|(measured, _)| *measured == name),
+                "{name} is a workspace crate but is not in MEASURED, so nothing ratchets it"
+            );
+        }
+    }
     use super::*;
     use std::path::PathBuf;
 

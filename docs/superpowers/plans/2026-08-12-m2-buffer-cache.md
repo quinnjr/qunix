@@ -454,4 +454,243 @@ git commit -m "feat(bcache): write a dirty slot back before reusing it"
 Recorded during execution. A plan written before the code is a hypothesis; the
 deviations are the result.
 
-*(none yet)*
+### D1: the capacity is a const parameter, not a constructor argument
+
+The plan writes `Cache::new(capacity)` with a runtime capacity. That needs
+storage sized at runtime, which means a `Vec`, which means the flush path can
+allocate -- and the whole reason the table is fixed is that memory pressure
+triggers writeback, writeback needs I/O, and I/O needs the allocation already
+waiting.
+
+`Cache<const N: usize>` removes the possibility rather than documenting it.
+There is no `Vec` to grow and nowhere for one to appear later without the type
+changing. `Cache::CAPACITY` replaces the `capacity()` accessor the plan
+assumed.
+
+### D2: two crates were outside the coverage ratchet
+
+Not a change to the plan, but found while adding `qunix-bcache` to it:
+`xtask`'s `MEASURED` list is hand-written and `qunix-virtio` was never added
+after M2 T4, so the crate had no floor for a whole milestone. Nothing reported
+it -- the run prints success for the crates it measured and is silent about the
+one it skipped.
+
+`every_host_testable_crate_is_measured` now fails when a crate with a `std`
+feature is missing from the list. Floors: `qunix-bcache` 100.00%,
+`qunix-virtio` 98.37%.
+
+Separately, `qunix-elf` measures 99.76% against a committed floor of 100.00%.
+`TOLERANCE_PP` absorbs that on *read*, so the ratchet passes, but
+`--update` refuses to write the lower figure without a stated reason -- which
+is why the two new floors above were written by hand rather than by
+`--update`. The elf gap is pre-existing and untouched here.
+
+### D3: the review found the claimed slot was marked clean
+
+`/code-review` on Task 2 found that `insert` marked a freshly claimed slot
+`Clean` — "these contents match the device" — before anything had been read
+into it. The plan's Task 3 read path is `lookup` miss → `insert` → `await`, so
+a second caller looking the key up across that await took the hit and read a
+buffer holding whatever the frame held before, with every operation returning
+success. That is the exact failure the crate's module doc is written against,
+and Task 2's tests did not catch it because they only ever inserted and then
+used the slot from the same thread.
+
+A claimed slot is now `InFlight` and `end_io` is what makes it readable.
+Seven further findings from the same review are fixed in the same commit;
+`evict` is new, because `victim` named a slot and nothing public could act on
+the name, so as written the cache could not evict at all.
+
+### D4: two hand-written crate lists, both stale
+
+`qunix-bcache` was in neither `xtask test`'s crate list nor the coverage
+ratchet's, so its tests never ran under `cargo xtask test` and it had no
+floor — and the run reported success either way, because nothing in the
+output names a suite that did not run. `qunix-abi` was missing from both too.
+
+There is now one `HOST_CRATES` list read by both, and two tests that fail when
+a crate is missing from it. The first attempt at that check used "has a `std`
+feature" as the signal and passed `qunix-abi`, reproducing the gap inside the
+check written to close it; membership is the workspace directory now.
+
+### D5: `read_block` returns a pin, not `&'static [u8]`
+
+The plan has `read_block` return `&'static [u8]`. Task 5 adds eviction under
+pressure, and a bare reference into a slot stays valid-*looking* after that slot
+is evicted and refilled: the read succeeds and the bytes are another block's,
+which is the failure this whole crate is written against.
+
+It returns a `BlockRef` instead — a guard that pins its slot on creation and
+unpins on drop. That is also what gives `pin`/`unpin` a caller; without it they
+were an API nothing used.
+`a_pinned_block_is_not_evicted_out_from_under_its_reader` fails when eviction
+ignores pins, and `a_table_of_pinned_blocks_reports_exhaustion_rather_than_evicting_one`
+asserts the refusal rather than the success.
+
+### D6: a hit on a slot with I/O outstanding is not always a wait
+
+The plan's read path treats `InFlight` as one state. It is two: a slot being
+*filled* holds nothing yet and a reader must wait, while a slot being *written
+back* holds the caller's own data and the device is only reading it, so a reader
+may proceed. Collapsing them either serves an unfilled buffer or stalls every
+reader behind every flush, and the second is invisible — it costs latency, not
+correctness. `Bcache::filling` carries the distinction, which Task 4's writeback
+needs before it exists.
+
+A second reader that does have to wait retries on a bounded timer rather than
+joining a waiter list. A per-slot waiter list is unbounded state in a table
+whose fixed size is the reason the flush path cannot allocate, and the thing
+being waited for is a disk read. The bound (`FILL_WAIT_LIMIT`) is what stops a
+lost completion becoming a stopped machine instead of a failed request.
+
+### D7: the test disk persists, so the plan's writeback test cannot work
+
+Task 4's test as written asserts `assert_ne!(&before[0..8], &payload[0..8], "the
+write reached the disk before sync")` against a fixed payload. But
+`xtask::image::build_test_disk` writes the image *only when absent*, deliberately
+— its own doc says regenerating per run "would erase whatever a write test had
+just put there". So the first boot leaves `0xfeed_face` on block 3 and the second
+boot's copy of the same test finds it already there and fails the `assert_ne`.
+`cargo xtask test` runs the suite twice, so this would have failed on its first
+green run.
+
+The test derives its payload from whatever the disk currently holds (every byte
+inverted), asserts both halves against that, and then restores the original and
+asserts the restore. It is repeatable from any starting state and leaves the
+image as it found it. The write tests own blocks 240..248 so a payload left
+behind by a failure cannot change what another test reads.
+
+### D8: `write_block` refuses a partial block, and issues no read
+
+A full-block write has no need to read the block it replaces, so `write_block`
+does no I/O at all: it copies under the lock and marks the slot dirty. Which
+means a write that does *not* cover the block cannot be served — padding invents
+bytes the caller never supplied and puts them on the disk, and merging is a
+read-modify-write, a different operation with a different failure mode.
+`BcacheError::PartialBlock` refuses it, with a test.
+
+`store` waits on *any* outstanding I/O, not just a fill. Task 3's read path
+proceeds through a writeback because the device is only reading the buffer; a
+writer must not, because it would hand the device a torn mixture of the block it
+was told to write and the one written over it — successfully.
+
+### D9: the whole-block assertion was not whole-block
+
+Mutation-testing the writeback length found the test suite passing with `sync`
+sending one sector instead of eight. The payload helper inverted only the first
+sector, so the remaining seven equalled what was already on the disk and the
+`assert_eq!(read_through_the_device(key), payload)` comparison was satisfied by a
+one-sector write. It inverts every byte now.
+
+This is the failure mode `CLAUDE.md` warns about — an assertion that reads as
+comprehensive and is not — and it was invisible to every other check. The only
+thing that surfaced it was mutating the length and finding the suite still green.
+
+### D10: a pin excludes overwriting the buffer, not only evicting the slot
+
+Review found `write_block` copying 4096 bytes over a frame while a `BlockRef`
+handed out a `&[u8]` over the same bytes. `BlockRef::deref` deliberately does
+*not* hold the lock — holding it would mask interrupts for as long as a caller
+chose to look at a block — so the pin is the entire exclusion, and `store`
+consulted only the slot's state. A reader walking a directory block would see a
+mixture of two blocks, successfully, and it is also a write through a raw
+pointer aliasing a live shared reference.
+
+`Cache::pins_of` is new so the kernel can ask. A write now waits a short bound
+for readers to leave and reports `BcacheError::Pinned` if they do not — short
+because the thing being waited for is not I/O, and because the most likely cause
+is a caller holding a `BlockRef` to the block it is writing and so waiting for
+itself. `sync` is exempt: the device only reads the buffer, so it may share it.
+
+`a_write_is_refused_while_a_reader_holds_the_block` asserts the reader's bytes
+are unchanged, not merely that the call failed.
+
+### D11: Task 5's test could not observe eviction at all
+
+The plan's test writes one block, reads `CAPACITY + 1` distinct blocks to "force
+every slot to turn over", and asserts the written block reached the disk. It
+cannot: `victim` prefers a *clean* slot, and unpinned clean slots keep being
+recycled, so the dirty one is never considered. Reading a thousand blocks would
+leave it exactly where it was — the test would fail identically with and without
+the feature, and for a reason unrelated to it.
+
+Real pressure has to be constructed. `pin_every_slot_but_one` fills the table
+and holds a `BlockRef` to every slot but the dirty one, so serving one more
+distinct block *requires* writing that block back. That is also what the two
+refusal tests need: `a_dirty_slot_the_device_refuses_is_not_evicted_anyway`
+requires the read to report the device's error rather than hide a failing disk
+behind `Exhausted`, and `a_write_under_pressure_also_flushes_rather_than_refusing`
+requires the write path to answer pressure the same way the read path does.
+
+### D12: the pin filter on the flush candidate is load-bearing
+
+`flushable_slot` skips pinned slots. Mutation testing found that removing the
+filter passed every test, because no test had a slot that was dirty *and*
+pinned — the writes all happened to unpinned slots.
+
+It is not cosmetic. Writing back a pinned block frees nothing: the pin is what
+refuses the eviction and the writeback does not remove it. So each such choice
+spends a disk write to make no room, and the retry bound (`SLOTS` attempts) then
+runs out while a reusable slot was available all along — a table reporting
+`Exhausted` with room in it.
+`a_pinned_dirty_slot_is_not_the_one_chosen_to_flush` asserts the pinned block is
+still dirty and still not on the disk, which is what states the choice.
+
+### D13: `bcache::init` is not called from `kmain`, and that is deliberate
+
+The File Structure table promises `kernel/src/main.rs` gains "`mod bcache;` and
+its init call". Only the `mod` declaration landed, and this section is where
+that should have been recorded rather than left for a reviewer to find — which
+one did, three times.
+
+The decision itself stands. `block::init` is not called from `kmain` either:
+both the driver and the cache above it are reachable only from the test harness
+until a filesystem exists to consume them. Wiring `bcache::init` alone would
+reserve 128 KiB at every boot for a cache nothing can read through, since the
+device beneath it is still uninitialised. Both get wired together, in the task
+that first has a caller.
+
+What changed as a result of the review is the failure mode: using the cache
+before `init` reported a panic, which made an ordinary `NoFrames` on a small
+machine into a halt. It reports `BcacheError::Uninitialised` now, so the
+unwired state is a refusal rather than a stopped machine.
+
+### D14: the review found two defects the milestone's own tests could not
+
+A seven-agent review of the finished branch found 37 findings, two of them
+silent corruption that every test and every mutation check had passed:
+
+- `key.block * SECTORS_PER_BLOCK` was unchecked. `[profile.release]` sets no
+  `overflow-checks`, so it wraps in release into a *valid* sector: a block of
+  2^61 resolves to LBA 0, and a write lands on the boot sector successfully.
+  In a test build the same input panics, so no in-QEMU test could have reached
+  the release behaviour at all.
+- `sync` returned `Ok(())` for data still in the air. Its mask held only
+  `Dirty` slots, and a slot another processor is already writing back is
+  `InFlight` — absent from the mask entirely.
+
+Both were invisible to the tests because both need a *second processor* or a
+*release build*, and the suite is neither. The lesson recorded here is that the
+in-QEMU harness runs single-threaded on the boot CPU under `block_on`, so any
+invariant that only holds under concurrency is untested by construction. The
+fix was not only the two bugs: `Claim::Wait`, both halves of `Blocked::Io` and
+both drop guards are now reached by half-polling a future and dropping it,
+which produces the states a parked peer would without needing a second thread.
+
+### D15: the drop-guard tests found a leak in the layer below
+
+Adding those tests broke a `block.rs` assertion, which is how a finding rated
+*Low, medium confidence* turned out to be real. An abandoned request left its
+descriptor chain neither freed nor quarantined: one of 21 in-flight slots per
+abandonment, until the queue drained into `QueueFull` errors in code with
+nothing to do with the cause. The driver already had the machinery — the
+deadline path quarantines and `handle_completion` reclaims — it simply was not
+reachable from a dropped future. `block::Request` closes it.
+
+The same round hardened two things beneath the cache that it depends on:
+`SplitQueue` marks a chain in flight at `publish` rather than at `alloc_chain`,
+so a device cannot complete an id the driver never handed it; and `finish`
+checks the device-reported transfer length before copying, so a device
+reporting `OK` with `len = 0` no longer yields the previous request's bounce
+buffer as this request's data.
+

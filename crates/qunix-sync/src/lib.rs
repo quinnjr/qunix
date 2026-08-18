@@ -68,14 +68,23 @@ impl<T: ?Sized> SpinLock<T> {
             if let Some(guard) = self.try_lock() {
                 return guard;
             }
+            // Reset on every observation that the lock is free. Without this
+            // the count accumulates across acquisitions by other processors and
+            // measures how long this one has been *unlucky* rather than how
+            // long the lock has been held -- which on a host that multiplexes
+            // the guest's processors is a routine amount.
+            #[cfg(feature = "deadlock-panic")]
+            {
+                spins = 0;
+            }
             while self.locked.load(Ordering::Relaxed) {
                 #[cfg(feature = "deadlock-panic")]
                 {
                     spins += 1;
                     assert!(
                         spins < DEADLOCK_SPINS,
-                        "spinlock still held after {DEADLOCK_SPINS} spins; nothing is going to \
-                         release it. Either this processor already holds it, or its word was \
+                        "spinlock held continuously for {DEADLOCK_SPINS} spins; nothing is going \
+                         to release it. Either this processor already holds it, or its word was \
                          overwritten."
                     );
                 }
@@ -234,6 +243,18 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
         // for; see `IrqControl::service_while_waiting`.
         #[cfg(feature = "deadlock-panic")]
         let mut spins: u64 = 0;
+        // The owner this wait has been watching. A spin count alone cannot tell
+        // a wedge from starvation: on a host with fewer processors than the
+        // guest has, a spinning processor burns its whole timeslice while the
+        // owner is not scheduled at all, and reaches any iteration bound while
+        // the lock is being acquired and released normally by everybody else.
+        // That is what this detector did on CI -- it fired once with the owner
+        // reading `NO_OWNER`, i.e. against a lock that was free.
+        //
+        // So the count measures *one owner holding it without change*, which is
+        // the wedge condition, and any change of hands resets it.
+        #[cfg(feature = "deadlock-panic")]
+        let mut watched: u32 = NO_OWNER;
         let guard = loop {
             if let Some(guard) = self.inner.try_lock() {
                 break guard;
@@ -241,10 +262,21 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
             I::service_while_waiting();
             #[cfg(feature = "deadlock-panic")]
             {
+                let owner = self.owner.load(Ordering::Relaxed);
+                if owner != watched {
+                    // Changed hands, or was released: the lock is moving, so
+                    // this is contention rather than a wedge.
+                    watched = owner;
+                    spins = 0;
+                }
                 spins += 1;
-                if spins >= DEADLOCK_SPINS {
-                    let owner = self.owner.load(Ordering::Relaxed);
+                if spins >= DEADLOCK_SPINS && owner != NO_OWNER {
                     let me = I::cpu_index();
+                    // The lock's own address, so the report names *which* lock
+                    // rather than leaving the reader to guess from a backtrace
+                    // that optimisation has rearranged. Resolve it against the
+                    // kernel's symbol table.
+                    let which = core::ptr::from_ref(self).cast::<()>() as usize;
                     // Reported rather than merely detected. "Held by this same
                     // processor" is a recursive acquisition; "held by another"
                     // with every processor spinning means the holder is not
@@ -252,10 +284,10 @@ impl<T: ?Sized, I: IrqControl> IrqSpinLock<T, I> {
                     // switch. Those are different bugs and the message has to
                     // say which.
                     panic!(
-                        "irq spinlock wedged after {DEADLOCK_SPINS} spins: cpu {me} is waiting, \
-                         owner is cpu {owner}. Same cpu means a recursive acquisition; a \
-                         different one, with every processor here, means the owner is not on any \
-                         processor -- the lock was held across a context switch."
+                        "irq spinlock at {which:#x} wedged: cpu {me} waited {DEADLOCK_SPINS} \
+                         spins while cpu {owner} held it without ever releasing it. Same cpu \
+                         means a recursive acquisition; a different one means the owner is not \
+                         on any processor -- the lock was held across a context switch."
                     );
                 }
             }

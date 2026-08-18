@@ -541,7 +541,14 @@ pub fn park() {
         // `disable`, not `disable_and_save`: the caller's state is already
         // held in `irq` above, and re-saving here is precisely the bug.
         x86_64::instructions::interrupts::disable();
-        {
+        // The outcome is computed under the lock and acted on *outside* it.
+        // The `Cancelled` arm used to restore interrupts and return from inside
+        // this block, with the guard still alive -- so interrupts came back on
+        // while `SCHED` was still held, and a timer tick landing in that window
+        // re-entered `schedule` on this same processor, which takes `SCHED` and
+        // spins forever on a lock this processor owns. A rare window, reached
+        // often enough once something parks on every cached read.
+        let outcome = {
             let mut sched = SCHED.lock();
             // Panics rather than returning. Returning looks like the gentler
             // option and is the worse one: `block_on`'s loop is poll-then-park,
@@ -553,7 +560,8 @@ pub fn park() {
             let thread = sched.threads.get_mut(&me).unwrap_or_else(|| {
                 panic!("park called on {me:?}, which is not a scheduled thread")
             });
-            match thread.park.park() {
+            let outcome = thread.park.park();
+            match outcome {
                 // A wakeup was already waiting, so this is the park that must
                 // not happen.
                 //
@@ -565,12 +573,16 @@ pub fn park() {
                 // mutating this arm to fall through fails no test, and the next
                 // reader deserves to know that is correct rather than a hole:
                 // the correctness lives in `schedule`'s re-check.
-                ParkOutcome::Cancelled => {
-                    qunix_hal_x86_64::Irq::restore(irq);
-                    return;
-                }
                 ParkOutcome::Parked => thread.state = ThreadState::Blocked,
+                ParkOutcome::Cancelled => {}
             }
+            outcome
+        };
+        if matches!(outcome, ParkOutcome::Cancelled) {
+            // The guard above is gone by now, so this restores interrupts with
+            // no lock held.
+            qunix_hal_x86_64::Irq::restore(irq);
+            return;
         }
 
         // The window this test hook widens is the one `unpark`'s

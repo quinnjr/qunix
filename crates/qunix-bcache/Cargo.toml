@@ -1,5 +1,5 @@
 [package]
-name = "qunix-virtio"
+name = "qunix-bcache"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,5 +16,5 @@ std = []
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
-name = "queue"
+name = "cache"
 harness = false

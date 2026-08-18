@@ -45,28 +45,65 @@ fn build_kernel(release: bool) -> Result<PathBuf> {
     Ok(target_dir().join("x86_64-qunix-kernel").join(profile).join("qunix-kernel"))
 }
 
+/// Every crate that builds for the host, and the feature each needs to do it.
+///
+/// One list, read by `xtask test` and by the coverage ratchet. They were two
+/// hand-written lists and both went stale: `qunix-virtio` was absent from the
+/// ratchet for a milestone, and `qunix-bcache` was absent from the test
+/// invocation for as long as it existed -- its tests passed when run by hand
+/// and were simply never run by `cargo xtask test`, which reported success
+/// without them. Neither omission is visible in the output, because what is
+/// missing is a suite nobody sees not running.
+///
+/// `qpkg` is not here: it links C (zstd) and so tests on the host triple
+/// rather than musl, which needs its own invocation.
+pub const HOST_CRATES: &[(&str, Option<&str>)] = &[
+    ("qunix-sync", Some("qunix-sync/std")),
+    ("qunix-mm", Some("qunix-mm/std")),
+    ("qunix-hal-x86_64", Some("qunix-hal-x86_64/std")),
+    ("qunix-sched", Some("qunix-sched/std")),
+    ("qunix-elf", Some("qunix-elf/std")),
+    ("qunix-virtio", Some("qunix-virtio/std")),
+    ("qunix-bcache", Some("qunix-bcache/std")),
+    ("qunix-abi", None),
+    ("xtask", None),
+];
+
+/// `-p <name>` for every host crate, then `--features` naming each one's.
+fn host_crate_args() -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    for (name, _) in HOST_CRATES {
+        args.push("-p".to_string());
+        args.push((*name).to_string());
+    }
+    let features: Vec<&str> = HOST_CRATES.iter().filter_map(|(_, f)| *f).collect();
+    args.push("--features".to_string());
+    args.push(features.join(","));
+    args
+}
+
 /// Cargo arguments for `xtask bench`, with any extra flags appended.
 ///
 /// Split out from the spawn so the crate/feature selection is testable. Only
 /// host-buildable crates appear: criterion needs `std`, and the kernel is
 /// `no_std` running in QEMU, so it cannot be linked against at all.
 fn bench_args(extra: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "bench",
-        "--target",
-        "x86_64-unknown-linux-musl",
-        "-p",
-        "qunix-sync",
-        "-p",
-        "qunix-mm",
-        "-p",
-        "qunix-hal-x86_64",
-        "--features",
-        "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect();
+    // Derived, not restated. This used to hand-write both the `-p` pairs and
+    // the joined feature string while `BENCHED_CRATES` existed only under
+    // `#[cfg(test)]` to assert the two agreed -- the same two-lists-that-drift
+    // shape `HOST_CRATES` was introduced to remove, one function away from it.
+    // A test that catches drift after the fact is worse than a list that
+    // cannot drift.
+    let mut args: Vec<String> = ["bench", "--target", "x86_64-unknown-linux-musl"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for name in BENCHED_CRATES {
+        args.push("-p".to_string());
+        args.push((*name).to_string());
+    }
+    args.push("--features".to_string());
+    args.push(BENCHED_CRATES.iter().map(|n| format!("{n}/std")).collect::<Vec<_>>().join(","));
     args.extend(extra.iter().cloned());
     args
 }
@@ -102,8 +139,15 @@ fn fuzz_args(target: &str, seconds: u32, extra: &[String]) -> Vec<String> {
     args
 }
 
+/// Crates with a `benches/` directory. A crate that grows one and is not added
+/// to `bench_args` is simply never benchmarked, and `cargo xtask bench` reports
+/// success without it -- the same silent omission the coverage ratchet had.
+/// `every_crate_with_benches_is_benched` fails when the two disagree.
+const BENCHED_CRATES: &[&str] =
+    &["qunix-sync", "qunix-mm", "qunix-hal-x86_64", "qunix-bcache", "qunix-virtio"];
+
 /// Fuzz targets run by a bare `xtask fuzz`.
-const FUZZ_TARGETS: &[&str] = &["buddy", "slab"];
+const FUZZ_TARGETS: &[&str] = &["buddy", "slab", "bcache", "virtio_queue"];
 
 /// Resolves `xtask fuzz` arguments into (targets, seconds, libFuzzer passthrough).
 ///
@@ -280,27 +324,8 @@ fn main() -> Result<()> {
             // a multi-package selection able to enable per-package features.
             let mut host = Command::new(env!("CARGO"));
             host.current_dir(&root);
-            host.args([
-                "test",
-                "--target",
-                "x86_64-unknown-linux-musl",
-                "-p",
-                "qunix-virtio",
-                "-p",
-                "qunix-sync",
-                "-p",
-                "qunix-mm",
-                "-p",
-                "qunix-hal-x86_64",
-                "-p",
-                "qunix-sched",
-                "-p",
-                "qunix-elf",
-                "-p",
-                "xtask",
-                "--features",
-                "qunix-sync/std,qunix-mm/std,qunix-hal-x86_64/std,qunix-sched/std,qunix-elf/std,qunix-virtio/std",
-            ]);
+            host.args(["test", "--target", "x86_64-unknown-linux-musl"]);
+            host.args(host_crate_args());
             if release {
                 host.arg("--release");
             }
@@ -371,12 +396,58 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FUZZ_TARGETS, bench_args, fuzz_args, fuzz_selection, workspace_root};
+    use super::{BENCHED_CRATES, FUZZ_TARGETS, HOST_CRATES, bench_args, fuzz_args, fuzz_selection, host_crate_args, workspace_root};
+
+    /// `--features` takes a single value, so a flag appended after it is
+    /// swallowed as part of that value rather than parsed.
+    ///
+    /// This is the load-bearing half of what used to be one test. The other
+    /// half asserted that `host_crate_args` emits a `-p` for every entry in
+    /// `HOST_CRATES` and a feature for every `Some` -- built by iterating that
+    /// same list, so it held for any contents and could not detect the omission
+    /// its own comment described.
+    #[test]
+    fn the_features_value_is_the_last_argument() {
+        let args = host_crate_args();
+        assert_eq!(args[args.len() - 2], "--features");
+        let bench = bench_args(&[]);
+        let features = bench.iter().position(|a| a == "--features").expect("no --features");
+        assert_eq!(features, bench.len() - 2, "a flag was appended after the features value");
+    }
+
+    /// A crate's feature column must match what its manifest offers.
+    ///
+    /// This is what `HOST_CRATES` can get wrong that a test can see. The first
+    /// version of the membership check used "has a `std` feature" as its signal
+    /// and passed `qunix-abi`, which has none -- so naming a feature a crate
+    /// does not declare, or omitting one it does, is a demonstrated mistake.
+    #[test]
+    fn every_host_crate_declares_the_feature_it_is_tested_with() {
+        let root = workspace_root();
+        for (name, feature) in HOST_CRATES {
+            // The host tool, not a target crate: it has no `crates/` directory.
+            if *name == "xtask" {
+                continue;
+            }
+            let manifest =
+                std::fs::read_to_string(root.join("crates").join(name).join("Cargo.toml")).unwrap();
+            let declares_std = manifest.lines().any(|line| line.trim().starts_with("std = "));
+            match feature {
+                Some(feature) => {
+                    assert_eq!(*feature, format!("{name}/std"), "{name} is tested with {feature}");
+                    assert!(declares_std, "{name} is tested with {feature} but declares no std");
+                }
+                None => {
+                    assert!(!declares_std, "{name} declares a std feature but is tested without it")
+                }
+            }
+        }
+    }
 
     #[test]
     fn bench_selects_only_host_buildable_crates() {
         let args = bench_args(&[]);
-        for name in ["qunix-sync", "qunix-mm", "qunix-hal-x86_64"] {
+        for name in BENCHED_CRATES {
             assert!(args.iter().any(|a| a == name), "missing {name}: {args:?}");
         }
         // criterion needs std; the kernel is no_std running in QEMU.
@@ -387,7 +458,7 @@ mod tests {
     fn bench_enables_the_std_feature_of_every_selected_crate() {
         let args = bench_args(&[]);
         let features = args.iter().find(|a| a.contains("/std")).expect("no --features value");
-        for name in ["qunix-sync", "qunix-mm", "qunix-hal-x86_64"] {
+        for name in BENCHED_CRATES {
             assert!(features.contains(&format!("{name}/std")), "missing {name}/std in {features}");
         }
     }
@@ -472,6 +543,50 @@ mod tests {
         let sep = args.iter().position(|a| a == "--").expect("no -- separator");
         // Anything before `--` is consumed by cargo-fuzz, never by libFuzzer.
         assert!(args[sep + 1..].iter().any(|a| a == "-runs=1"));
+    }
+
+    #[test]
+    fn every_crate_with_benches_is_benched() {
+        // A crate that grows a `benches/` directory and is not added to
+        // `bench_args` is never benchmarked, and the run still prints success.
+        // Criterion's change detection is the only thing that caught a
+        // plausible optimisation being a 9-17% regression, so a benchmark that
+        // does not run is a regression that ships.
+        let root = workspace_root();
+        // Package name -> directory, built once and used in both directions.
+        // The reverse check used to re-derive a path from the package name,
+        // assuming the two are the same -- inside the very test that parses the
+        // package name precisely because they need not be.
+        let mut directories = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+            let dir = entry.unwrap().path();
+            let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+                continue;
+            };
+            let name = manifest
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("name = "))
+                .expect("a crate manifest with no package name")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            directories.insert(name, dir);
+        }
+        for (name, dir) in &directories {
+            if !dir.join("benches").is_dir() {
+                continue;
+            }
+            assert!(
+                BENCHED_CRATES.contains(&name.as_str()),
+                "{name} has benches/ but is not in bench_args, so nothing runs them"
+            );
+        }
+        let args = bench_args(&[]);
+        for name in BENCHED_CRATES {
+            let dir = directories.get(*name).unwrap_or_else(|| panic!("{name} is not a crate"));
+            assert!(dir.join("benches").is_dir(), "{name} is benched but has no benches/");
+            assert!(args.iter().any(|a| a == name), "{name} is missing from bench_args");
+        }
     }
 
     #[test]

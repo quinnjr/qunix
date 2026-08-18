@@ -93,16 +93,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "qunix-bcache"
+version = "0.1.0"
+
+[[package]]
 name = "qunix-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
+ "qunix-bcache",
  "qunix-mm",
+ "qunix-virtio",
 ]
 
 [[package]]
 name = "qunix-mm"
+version = "0.1.0"
+
+[[package]]
+name = "qunix-virtio"
 version = "0.1.0"
 
 [[package]]

@@ -120,7 +120,6 @@ impl SplitQueue {
         // device walking into a descriptor belonging to someone else.
         self.desc[prev as usize].flags &= !DESC_F_NEXT;
         self.desc[prev as usize].next = 0;
-        self.in_flight[head as usize] = true;
         Some(head)
     }
 
@@ -172,6 +171,13 @@ impl SplitQueue {
     /// Writing at `avail_idx` itself would land outside a 64-entry ring on the
     /// 64th publish and stay outside forever after.
     pub fn publish(&mut self, head: u16) -> u16 {
+        // In flight from *here*, not from `alloc_chain`. A chain the driver has
+        // allocated but not yet handed to the device cannot legitimately
+        // complete, and the used ring is device-written: marking it in flight at
+        // allocation makes `take_used` accept a forged completion for an id the
+        // device was never told about, and the submitter then reads a bounce
+        // buffer holding the previous request through that slot.
+        self.in_flight[head as usize] = true;
         let slot = self.avail_idx % self.size;
         self.avail_ring[slot as usize] = head;
         // Wrapping, not saturating: the index is defined to wrap, and the
@@ -199,7 +205,10 @@ impl SplitQueue {
     /// - an id past the end of the descriptor table would index out of bounds;
     /// - an id naming a descriptor that is not in flight means the device
     ///   completed something never submitted, and freeing that "chain" would
-    ///   walk `next` links belonging to a live request.
+    ///   walk `next` links belonging to a live request. "Submitted" means
+    ///   *published*: a chain the driver has allocated and not yet handed over
+    ///   cannot have completed, and accepting one lets a device report a
+    ///   request the driver never made.
     ///
     /// Clearing `in_flight` here is what makes a completion consumable exactly
     /// once. Taking one twice frees its chain twice, which puts one descriptor
@@ -333,6 +342,31 @@ impl SplitQueue {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_completion_for_a_chain_that_was_never_published_is_refused() {
+        // The used ring is device-written, so an id in it is device-supplied.
+        // A chain the driver has allocated but not yet handed over cannot have
+        // completed -- the device has not been told it exists. Accepting one
+        // lets a device report a request the driver never made, and the
+        // submitter then reads the bounce buffer as if it held its own data.
+        let mut queue = SplitQueue::new(8);
+        let head = queue.alloc_chain(2).expect("a fresh queue refused a chain");
+        let mut used = [0u8; 8];
+        used[..4].copy_from_slice(&(head as u32).to_le_bytes());
+        used[4..].copy_from_slice(&512u32.to_le_bytes());
+        assert!(queue.ingest_used_slot(0, used));
+        assert_eq!(
+            queue.take_used(0),
+            None,
+            "a completion for an unpublished chain was accepted"
+        );
+        // Once published, the same completion is legitimate.
+        queue.publish(head);
+        assert_eq!(queue.take_used(0), Some((head, 512)));
+        // And exactly once.
+        assert_eq!(queue.take_used(0), None, "the completion was consumable twice");
+    }
     use super::*;
     use crate::QUEUE_SIZE;
 
@@ -515,6 +549,10 @@ mod tests {
         // and carry the device's bytes verbatim, little-endian.
         let mut q = SplitQueue::new(QUEUE_SIZE);
         let head = q.alloc_chain(1).expect("a fresh queue has descriptors");
+        // Published, because a completion only names a chain the device was
+        // actually handed -- see
+        // `a_completion_for_a_chain_that_was_never_published_is_refused`.
+        q.publish(head);
         let mut bytes = [0u8; 8];
         bytes[0..4].copy_from_slice(&(head as u32).to_le_bytes());
         bytes[4..8].copy_from_slice(&512u32.to_le_bytes());

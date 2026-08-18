@@ -819,6 +819,13 @@ name = "qunix-abi"
 version = "0.1.0"
 
 [[package]]
+name = "qunix-bcache"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
 name = "qunix-elf"
 version = "0.1.0"
 
@@ -839,6 +846,7 @@ version = "0.1.0"
 dependencies = [
  "limine",
  "qunix-abi",
+ "qunix-bcache",
  "qunix-elf",
  "qunix-hal-x86_64",
  "qunix-mm",
@@ -869,6 +877,9 @@ dependencies = [
 [[package]]
 name = "qunix-virtio"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+]
 
 [[package]]
 name = "quote"
