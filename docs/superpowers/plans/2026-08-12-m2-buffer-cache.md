@@ -484,3 +484,32 @@ Separately, `qunix-elf` measures 99.76% against a committed floor of 100.00%.
 `--update` refuses to write the lower figure without a stated reason -- which
 is why the two new floors above were written by hand rather than by
 `--update`. The elf gap is pre-existing and untouched here.
+
+### D3: the review found the claimed slot was marked clean
+
+`/code-review` on Task 2 found that `insert` marked a freshly claimed slot
+`Clean` — "these contents match the device" — before anything had been read
+into it. The plan's Task 3 read path is `lookup` miss → `insert` → `await`, so
+a second caller looking the key up across that await took the hit and read a
+buffer holding whatever the frame held before, with every operation returning
+success. That is the exact failure the crate's module doc is written against,
+and Task 2's tests did not catch it because they only ever inserted and then
+used the slot from the same thread.
+
+A claimed slot is now `InFlight` and `end_io` is what makes it readable.
+Seven further findings from the same review are fixed in the same commit;
+`evict` is new, because `victim` named a slot and nothing public could act on
+the name, so as written the cache could not evict at all.
+
+### D4: two hand-written crate lists, both stale
+
+`qunix-bcache` was in neither `xtask test`'s crate list nor the coverage
+ratchet's, so its tests never ran under `cargo xtask test` and it had no
+floor — and the run reported success either way, because nothing in the
+output names a suite that did not run. `qunix-abi` was missing from both too.
+
+There is now one `HOST_CRATES` list read by both, and two tests that fail when
+a crate is missing from it. The first attempt at that check used "has a `std`
+feature" as the signal and passed `qunix-abi`, reproducing the gap inside the
+check written to close it; membership is the workspace directory now.
+
