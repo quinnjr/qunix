@@ -104,6 +104,26 @@ extern "C" fn handle(nr: u64, a0: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64) ->
             Errno::Ok as i64
         }
         Sys::GetPid => crate::sched::current_id().0 as i64,
+        // Explicit arms, not a wildcard, even though every one of these
+        // returns the same value today. A `_ => Errno::NotSupported as i64`
+        // here would make adding the next syscall (M2 T7's Mkdir and friends)
+        // compile silently and dispatch to "not supported" forever -- exactly
+        // the failure mode this codebase's rules single out: a required
+        // future change should be a compile error, not a note. Listing them
+        // means the VFS syscalls landing in a later task turns this match
+        // non-exhaustive again, and the compiler is what notices.
+        //
+        // `NotSupported` rather than `BadSyscall`: `Sys::from_raw` recognises
+        // these numbers -- that's what `every_declared_syscall_round_trips`
+        // asserts -- so claiming "no such syscall" would be false. The kernel
+        // knows the syscall and has not implemented it yet, which is exactly
+        // what `NotSupported` means.
+        Sys::Open
+        | Sys::Read
+        | Sys::Close
+        | Sys::Lseek
+        | Sys::Readdir
+        | Sys::Stat => Errno::NotSupported as i64,
     }
 }
 

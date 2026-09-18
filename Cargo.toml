@@ -20,6 +20,7 @@ qunix-virtio = { path = "crates/qunix-virtio" }
 qunix-sync = { path = "crates/qunix-sync" }
 qunix-mm = { path = "crates/qunix-mm" }
 qunix-hal-x86_64 = { path = "crates/qunix-hal-x86_64" }
+qunix-vfs = { path = "crates/qunix-vfs" }
 
 [profile.dev]
 panic = "abort"
